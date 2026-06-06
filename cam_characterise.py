@@ -889,6 +889,7 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
     deep_drops = 0
     radial = None
     fpn = hot = None
+    hot_coords = None
 
     # Warm-up: the FIRST v4l2-ctl capture of a run pays one-time costs (gadget
     # streaming spin-up, ISP pipeline init, cold-start) that drag its effective
@@ -989,7 +990,11 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
                 # exactly the temporal std we already computed per-pixel:
                 residual_std = temporal
                 fpn = float(master.std())        # spatial FPN spread
-                hot = int((master > master.mean() + 6*master.std()).sum())
+                _threshold = master.mean() + 6 * master.std()
+                _hot_mask = master > _threshold
+                hot = int(_hot_mask.sum())
+                _yx = np.argwhere(_hot_mask)
+                hot_coords = _yx.tolist()        # [[y, x], ...] numpy row-major convention
                 if clipped:
                     radial = {"shape": "N/A - output clipped", "clipped": True}
                     if verbose:
@@ -1102,10 +1107,13 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
 
     result = {
         "exposure_max_units": exposure_max,
+        "exposure_max_ms": round(exposure_max * 0.1, 1),
+        "pixel_depth": 8,
         "deep_stack_frames": dark_frames,
         "deep_stack_drops": deep_drops,
         "master_dark_fpn_adu": fpn if master is not None else None,
         "hot_pixels_6sigma": hot if master is not None else None,
+        "hot_pixel_coords": hot_coords,  # [[y, x], ...] — x y when writing PHD2 defect file
         "irreducible_temporal_dark_noise_adu": residual_std,
         "radial_profile": radial if master is not None else None,
         "dark_current_fit": linfit,
@@ -1186,7 +1194,11 @@ def main():
                     "begins; points below only set the bias and are excluded "
                     "from the dark-current slope fit. Default 2048.")
     ap.add_argument("--save-master", default=None,
-                    help="write master dark to this .npy")
+                    help="write master dark as uint16 .npy (scaled 0-65535 for PHD2)")
+    ap.add_argument("--save-defects", default=None,
+                    help="write hot pixel coordinates in PHD2 defect map format (x y per line)")
+    ap.add_argument("--save-dark-model", default=None,
+                    help="write dark current model JSON for PHD2 auto-import at camera connect")
     ap.add_argument("--report", default=None, help="write json report here")
     ap.add_argument("--report-dir", default=None,
                     help="directory to auto-write a timestamped JSON report into "
@@ -1311,8 +1323,34 @@ def main():
             cap.close()
         report["dark"] = dark
         if args.save_master and master is not None:
-            np.save(args.save_master, master)
-            print(f"   master dark written to {args.save_master}")
+            # Scale float64 luma (0-255) to uint16 (0-65535) for direct PHD2 import.
+            # 257 * 255 = 65535 exactly; np.round preserves sub-ADU precision.
+            master_u16 = np.clip(np.round(master * 257.0), 0, 65535).astype(np.uint16)
+            np.save(args.save_master, master_u16)
+            print(f"   master dark (uint16) written to {args.save_master}")
+        if args.save_defects and master is not None:
+            coords = dark.get("hot_pixel_coords") or []
+            with open(args.save_defects, "w") as fh:
+                fh.write("# PHD2 Defect Map v1\n")
+                fh.write(f"# cam_characterise.py {args.device} "
+                         f"{args.width}x{args.height}\n")
+                fh.write(f"# Exposure: {args.exposure_max} units "
+                         f"({dark['exposure_max_ms']}ms)\n")
+                fh.write(f"# Defect count: {len(coords)}\n")
+                for y, x in coords:  # PHD2 format is x y (screen coords)
+                    fh.write(f"{x} {y}\n")
+            print(f"   defect map written to {args.save_defects} "
+                  f"({len(coords)} hot pixels)")
+        if args.save_dark_model and master is not None:
+            dcf = dark.get("dark_current_fit") or {}
+            model = {
+                "exposure_max_units": args.exposure_max,
+                "exposure_max_ms": dark["exposure_max_ms"],
+                "pixel_depth": 8,
+                "dark_current_fit": dcf,
+            }
+            json.dump(model, open(args.save_dark_model, "w"), indent=2)
+            print(f"   dark current model written to {args.save_dark_model}")
         if args.save_calib:
             calib = build_fps_calibration(dark.get("ladder", []))
             if calib:

@@ -181,8 +181,10 @@ def plan(device, formats, ctrls, args):
                f"{small['w']}x{small['h']} (highest bandwidth ceiling, best "
                f"chance fps tracks integration). exposure range {exp_min}..{exp_max}.",
         "argv_tail": ["--dark"] + common + lad + neutral_proc()
-                     + ["--save-calib", f"calib_{small['w']}x{small['h']}.json",
-                        "--save-master", f"master_{small['w']}x{small['h']}.npy"]})
+                     + ["--save-calib",      f"calib_{small['w']}x{small['h']}.json",
+                        "--save-master",     f"master_{small['w']}x{small['h']}.npy",
+                        "--save-defects",    f"defects_{small['w']}x{small['h']}.txt",
+                        "--save-dark-model", f"dark_model_{small['w']}x{small['h']}.json"]})
 
     # 2. full-resolution dark (defects + shading at native array)
     if large is not large or large != small:
@@ -195,7 +197,8 @@ def plan(device, formats, ctrls, args):
             "why": f"native {large['w']}x{large['h']} dark: true hot-pixel count "
                    f"and shading map (lower-res modes bin/scale and hide both).",
             "argv_tail": ["--dark"] + common_large + lad + neutral_proc()
-                         + ["--save-master", f"master_{large['w']}x{large['h']}.npy"]})
+                         + ["--save-master",  f"master_{large['w']}x{large['h']}.npy",
+                            "--save-defects", f"defects_{large['w']}x{large['h']}.txt"]})
 
     # 3. gamma sweep (LSC-vs-gamma pipeline ordering, reverse-vignette depth)
     if has_gamma:
