@@ -197,8 +197,9 @@ def plan(device, formats, ctrls, args):
             "why": f"native {large['w']}x{large['h']} dark: true hot-pixel count "
                    f"and shading map (lower-res modes bin/scale and hide both).",
             "argv_tail": ["--dark"] + common_large + lad + neutral_proc()
-                         + ["--save-master",  f"master_{large['w']}x{large['h']}.npy",
-                            "--save-defects", f"defects_{large['w']}x{large['h']}.txt"]})
+                         + ["--save-master",     f"master_{large['w']}x{large['h']}.npy",
+                            "--save-defects",    f"defects_{large['w']}x{large['h']}.txt",
+                            "--save-dark-model", f"dark_model_{large['w']}x{large['h']}.json"]})
 
     # 3. gamma sweep (LSC-vs-gamma pipeline ordering, reverse-vignette depth)
     if has_gamma:
