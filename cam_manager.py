@@ -42,6 +42,35 @@ def _run(cmd):
         return ""
 
 
+def usb_device_tag(device):
+    """Return a stable identifier string for a /dev/videoN device: vid+pid[_serial].
+    Reads USB VID, PID and serial number from sysfs. Returns '' on failure or
+    non-Linux platforms so callers can fall back to resolution-only naming."""
+    name = os.path.basename(device)
+    try:
+        # /sys/class/video4linux/videoN/device -> UVC interface symlink
+        # one level up is the USB device node with idVendor/idProduct/serial
+        iface = os.path.realpath(f"/sys/class/video4linux/{name}/device")
+        usb_dev = os.path.dirname(iface)
+
+        def _read(fname):
+            try:
+                return open(os.path.join(usb_dev, fname)).read().strip()
+            except OSError:
+                return ""
+
+        vid, pid, sn = _read("idVendor"), _read("idProduct"), _read("serial")
+        if not vid or not pid:
+            return ""
+        tag = vid + pid                              # e.g. "046d0825"
+        if sn:
+            sn = re.sub(r"[^a-zA-Z0-9\-]", "_", sn)
+            tag += "_" + sn
+        return tag
+    except Exception:
+        return ""
+
+
 def query_formats(device):
     """Parse `v4l2-ctl --list-formats-ext` into a structured list:
     [{fourcc, compressed, sizes:[{w,h,fps:[...]}, ...]}, ...]."""
@@ -157,6 +186,11 @@ def plan(device, formats, ctrls, args):
     g_lo, g_hi = g.get("min", 100), g.get("max", 300)
     g_mid = (g_lo + g_hi) // 2
 
+    # Device tag: vid+pid[_serial] from sysfs, used as output subdirectory so
+    # files from different cameras never collide even at the same resolution.
+    dev_tag = usb_device_tag(device)
+    p = (dev_tag + "/") if dev_tag else ""  # file path prefix
+
     def neutral_proc():
         t = []
         if has_gamma:
@@ -174,32 +208,35 @@ def plan(device, formats, ctrls, args):
               "--knee", str(knee)]
     lad = ["--ladder", ",".join(str(x) for x in ladder_for(exp_min, exp_max))]
 
+    sw, sh = small["w"], small["h"]
+    lw, lh = large["w"], large["h"]
+
     # 1. baseline dark + calibration at the smallest resolution (instrument res)
     runs.append({
         "label": "dark_baseline_smallres",
-        "why": f"clean dark + fps<->exposure calibration at "
-               f"{small['w']}x{small['h']} (highest bandwidth ceiling, best "
-               f"chance fps tracks integration). exposure range {exp_min}..{exp_max}.",
+        "why": f"clean dark + fps<->exposure calibration at {sw}x{sh} "
+               f"(highest bandwidth ceiling, best chance fps tracks integration). "
+               f"exposure range {exp_min}..{exp_max}.",
         "argv_tail": ["--dark"] + common + lad + neutral_proc()
-                     + ["--save-calib",      f"calib_{small['w']}x{small['h']}.json",
-                        "--save-master",     f"master_{small['w']}x{small['h']}.npy",
-                        "--save-defects",    f"defects_{small['w']}x{small['h']}.txt",
-                        "--save-dark-model", f"dark_model_{small['w']}x{small['h']}.json"]})
+                     + ["--save-calib",      f"{p}calib_{sw}x{sh}.json",
+                        "--save-master",     f"{p}master_{sw}x{sh}.npy",
+                        "--save-defects",    f"{p}defects_{sw}x{sh}.txt",
+                        "--save-dark-model", f"{p}dark_model_{sw}x{sh}.json"]})
 
     # 2. full-resolution dark (defects + shading at native array)
-    if large is not large or large != small:
-        common_large = ["--width", str(large["w"]), "--height", str(large["h"]),
+    if large != small:
+        common_large = ["--width", str(lw), "--height", str(lh),
                         "--discard", str(args.discard), "--ladder-frames",
                         str(args.ladder_frames), "--exposure-max", str(exp_max),
                         "--knee", str(knee)]
         runs.append({
             "label": "dark_fullres",
-            "why": f"native {large['w']}x{large['h']} dark: true hot-pixel count "
-                   f"and shading map (lower-res modes bin/scale and hide both).",
+            "why": f"native {lw}x{lh} dark: true hot-pixel count and shading map "
+                   f"(lower-res modes bin/scale and hide both).",
             "argv_tail": ["--dark"] + common_large + lad + neutral_proc()
-                         + ["--save-master",     f"master_{large['w']}x{large['h']}.npy",
-                            "--save-defects",    f"defects_{large['w']}x{large['h']}.txt",
-                            "--save-dark-model", f"dark_model_{large['w']}x{large['h']}.json"]})
+                         + ["--save-master",     f"{p}master_{lw}x{lh}.npy",
+                            "--save-defects",    f"{p}defects_{lw}x{lh}.txt",
+                            "--save-dark-model", f"{p}dark_model_{lw}x{lh}.json"]})
 
     # 3. gamma sweep (LSC-vs-gamma pipeline ordering, reverse-vignette depth)
     if has_gamma:
@@ -211,7 +248,7 @@ def plan(device, formats, ctrls, args):
                     tail += [f"--{c}", "0"]
             if "sharpness" in ctrls:
                 tail += ["--sharpness", str(ctrls["sharpness"].get("min", 1))]
-            tail += ["--save-master", f"master_g{gv}.npy"]
+            tail += ["--save-master", f"{p}master_g{gv}.npy"]
             runs.append({
                 "label": f"gamma_{gv}",
                 "why": f"gamma={gv} at max exposure, all else neutral: isolates "
@@ -225,12 +262,12 @@ def plan(device, formats, ctrls, args):
         "why": "auto-exposure in the dark: where AE parks exposure, stability, "
                "and whether exposure_time_absolute readback agrees with the "
                "framerate-implied exposure (control-honesty check).",
-        "argv_tail": ["--auto", "--width", str(small["w"]), "--height",
-                      str(small["h"]), "--auto-iters", str(args.auto_iters),
+        "argv_tail": ["--auto", "--width", str(sw), "--height", str(sh),
+                      "--auto-iters", str(args.auto_iters),
                       "--auto-frames", str(args.auto_frames),
-                      "--calib", f"calib_{small['w']}x{small['h']}.json"]})
+                      "--calib", f"{p}calib_{sw}x{sh}.json"]})
 
-    return runs, fmt, (small, large, exp_min, exp_max)
+    return runs, fmt, (small, large, exp_min, exp_max, dev_tag)
 
 
 # ----------------------------------------------------------------------------
@@ -280,12 +317,18 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    small, large, exp_min, exp_max = meta
+    small, large, exp_min, exp_max, dev_tag = meta
     print(f"\n  measurement format: {fmt['fourcc']}")
     print(f"  instrument resolution (small): {small['w']}x{small['h']} "
           f"(max {max_advertised_fps(small)} fps)")
     print(f"  full resolution (large): {large['w']}x{large['h']} "
           f"(max {max_advertised_fps(large)} fps)")
+    if dev_tag:
+        print(f"  device tag: {dev_tag}  (output dir: {dev_tag}/)")
+        os.makedirs(dev_tag, exist_ok=True)
+    else:
+        print("  device tag: (not available — USB sysfs lookup failed; "
+              "files will be in the current directory)")
 
     base = [args.python, args.tool]
     lines = []
@@ -304,7 +347,11 @@ def main():
             fh.write("#!/bin/sh\n# generated by cam_manager.py "
                      f"{datetime.now(timezone.utc).isoformat()}\n")
             fh.write(f"# device {args.device}  format {fmt['fourcc']}  "
-                     f"exposure {exp_min}..{exp_max}\nset -e\n\n")
+                     f"exposure {exp_min}..{exp_max}\n")
+            if dev_tag:
+                fh.write(f"# device tag: {dev_tag}\n")
+                fh.write(f"mkdir -p {shlex.quote(dev_tag)}\n")
+            fh.write("set -e\n\n")
             for label, why, cmd in lines:
                 fh.write(f"# [{label}] {why}\n")
                 fh.write(" ".join(shlex.quote(c) for c in cmd) + "\n\n")
@@ -313,6 +360,7 @@ def main():
 
     if args.json:
         plan_doc = {"device": args.device, "identity": info,
+                    "device_tag": dev_tag,
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                     "formats": formats, "controls": ctrls,
                     "measurement_format": fmt["fourcc"],
