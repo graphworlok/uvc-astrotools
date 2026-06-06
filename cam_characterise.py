@@ -1348,6 +1348,8 @@ def main():
                 "exposure_max_ms": dark["exposure_max_ms"],
                 "pixel_depth": 8,
                 "dark_current_fit": dcf,
+                "exposure_fidelity_verdict": (
+                    dark.get("exposure_fidelity", {}).get("verdict", "")),
             }
             json.dump(model, open(args.save_dark_model, "w"), indent=2)
             print(f"   dark current model written to {args.save_dark_model}")
