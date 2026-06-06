@@ -187,8 +187,37 @@ range does not give you:
 
 For the PHD2 fork this means: pin exposure to a measured value inside the usable
 window rather than using AE, and treat each module's window as a per-device
-calibration constant derived from a dark run here. The `--save-calib` /
-`--report-dir` JSON output is intended to be the handoff format for that.
+calibration constant derived from a dark run here.
+
+### Handoff format
+
+`cam_manager.py` writes a per-device directory named by USB identity
+(`{idVendor}{idProduct}[_{serial}]`, read from sysfs) containing, per resolution:
+
+| File | Built by | Consumed by PHD2 for |
+|------|----------|----------------------|
+| `calib_WxH.json`      | `--save-calib`      | fps↔exposure inversion; the real integration window |
+| `master_WxH.npy`      | `--save-master`     | master dark, uint16 (luma ×257) ready for `usImage` |
+| `defects_WxH.txt`     | `--save-defects`    | hot-pixel defect map (`x y` per line, PHD2 v1 format) |
+| `dark_model_WxH.json` | `--save-dark-model` | dark-current slope + bias, exposure tag, fidelity verdict |
+
+Drop that directory into the PHD2 data dir (e.g.
+`~/.local/share/PHD2/{idVendor}{idProduct}_{serial}/`). On camera connect PHD2
+matches the directory by USB ID and the file by frame size, then:
+
+- **Scales the master dark to each guide exposure.** Because the dark-current
+  fit gives the per-pixel slope, the single deep master at `exposure_max` is
+  scaled down to every exposure in PHD2's list — `dark(E) = bias +
+  (master − bias)·(E / max)` — so a short guide frame is matched to a short dark
+  instead of having an over-long master over-subtract its hot pixels. Scaling is
+  applied **only when the dark-current fit is linear** (r² > 0.97); otherwise the
+  native master is kept and longer-than-max exposures always fall back to it.
+- **Cross-checks exposure honesty per frame** using the fps calibration: a guide
+  frame's capture time implies an effective exposure, and a disagreement with the
+  commanded value is logged (the firmware is not integrating as told).
+- **Surfaces the verdict, not enforces it.** The derived real-integration window,
+  the REAL/SYNTHETIC/PARTIAL fidelity verdict, and the dark-fit r² are shown in
+  the status bar at connect and logged — advisory only; nothing is clamped.
 
 ## Status
 
