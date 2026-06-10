@@ -117,6 +117,12 @@ FORMAT_FIDELITY = {
     "BA81": (0, "raw bayer 8"),  "pBAA": (0, "raw bayer packed"),
     "RG10": (0, "raw bayer 10"), "RG12": (0, "raw bayer 12"),
     "BG10": (0, "raw bayer 10"), "BYR2": (0, "raw bayer"),
+    # true mono: purer than YUV (no chroma path at all) -- the ideal
+    # measurement format on mono guide-camera gadgets
+    "GREY": (0, "uncompressed 8-bit mono"),
+    "Y800": (0, "uncompressed 8-bit mono"),
+    "Y8  ": (0, "uncompressed 8-bit mono"),
+    "Y16 ": (0, "uncompressed 16-bit mono"),
     # uncompressed YUV: full-res luma, this is what we want
     "YUYV": (1, "uncompressed 4:2:2, 16bpp"),
     "UYVY": (1, "uncompressed 4:2:2, 16bpp"),
@@ -234,7 +240,6 @@ def xioctl(fd, req, arg):
 # ----------------------------------------------------------------------------
 
 def v4l2ctl(device, args):
-    import subprocess
     return subprocess.run(["v4l2-ctl", "-d", device, *args],
                           capture_output=True, text=True)
 
@@ -362,13 +367,21 @@ class Capture:
     def __init__(self, device, width, height, pixfmt_str, nbuf=4):
         self.device = device
         self.w, self.h = width, height
-        self.pixfmt_str = pixfmt_str
-        if pixfmt_str in ("YUYV", "YUY2", "UYVY"):
+        # fourcc may carry trailing spaces ("Y16 "); strip once so comparisons
+        # and the v4l2-ctl pixelformat argument are uniform
+        self.pixfmt_str = pixfmt_str.strip()
+        if self.pixfmt_str in ("YUYV", "YUY2", "UYVY"):
             self.frame_bytes = width * height * 2
             self.bytesperline = width * 2
-        elif pixfmt_str in ("NV12", "NV21", "I420"):
+        elif self.pixfmt_str in ("NV12", "NV21", "I420"):
             self.frame_bytes = width * height * 3 // 2
             self.bytesperline = width
+        elif self.pixfmt_str in ("GREY", "Y800", "Y8"):
+            self.frame_bytes = width * height
+            self.bytesperline = width
+        elif self.pixfmt_str == "Y16":
+            self.frame_bytes = width * height * 2
+            self.bytesperline = width * 2
         else:
             raise RuntimeError(f"{pixfmt_str} is not an uncompressed format; "
                                "refusing to measure noise on it")
@@ -386,13 +399,21 @@ class Capture:
             arr = np.frombuffer(raw[: self.w * self.h * 2], dtype=np.uint8)
             y = arr[1::2] if self.pixfmt_str == "UYVY" else arr[0::2]
             return y.reshape(self.h, self.w).astype(np.float64)
-        else:  # NV12 / NV21 / I420 — luma plane is first w*h bytes
+        elif self.pixfmt_str == "Y16":
+            # normalise 16-bit mono into the same 0-255 float domain as the
+            # 8-bit paths (65535/257 = 255 exactly), so every downstream
+            # threshold/fit/export works unchanged at sub-ADU precision
+            y = np.frombuffer(raw[: self.w * self.h * 2], dtype="<u2")
+            return y.reshape(self.h, self.w).astype(np.float64) / 257.0
+        else:  # NV12 / NV21 / I420 / GREY — luma plane is first w*h bytes
             y = np.frombuffer(raw[: self.w * self.h], dtype=np.uint8)
             return y.reshape(self.h, self.w).astype(np.float64)
 
     def _capture_to_file(self, count, timeout):
         """Run v4l2-ctl once: set fmt (+ exposure if set) and stream `count`
-        frames to a temp file. Returns the file path. Raises on failure."""
+        frames to a temp file. Returns (path, stderr). Raises on failure.
+        --verbose makes v4l2-ctl print a dqbuf line per frame with the buffer
+        timestamp, which is the only overhead-free framerate measurement."""
         out = os.path.join(self._tmp, f"cap_{count}.raw")
         cmd = ["v4l2-ctl", "-d", self.device,
                f"--set-fmt-video=width={self.w},height={self.h},"
@@ -401,7 +422,7 @@ class Capture:
             # set exposure in the SAME invocation -> single open, no race
             cmd += ["--set-ctrl", f"exposure_time_absolute={self.exposure}"]
         cmd += ["--stream-mmap", f"--stream-count={count}",
-                f"--stream-to={out}"]
+                f"--stream-to={out}", "--verbose"]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=timeout)
@@ -410,19 +431,39 @@ class Capture:
                                "(bandwidth/firmware stall?)")
         if not os.path.exists(out) or os.path.getsize(out) == 0:
             raise RuntimeError(f"v4l2-ctl produced no data. stderr:\n{r.stderr}")
-        return out
+        # dqbuf lines land on stderr in current v4l2-ctl, but join both streams
+        # so a version that logs to stdout still yields timestamps
+        return out, (r.stderr or "") + (r.stdout or "")
 
     def capture_run(self, n, discard=3, timeout=20.0, verbose=True):
         """Capture discard+n frames in one v4l2-ctl run. Returns
         (path, total, full_frames). Does NOT decode — caller iterates."""
         total = n + discard
+        # Timeout must scale with frames x integration time, or any device
+        # whose exposure exceeds ~1.5s/frame has its deep stack guaranteed to
+        # time out. 2x margin on the commanded exposure, 1.5s/frame floor for
+        # the bandwidth-limited regime, plus fixed startup overhead.
+        per_frame_s = max(1.5, (self.exposure or 0) * 1e-4 * 2.0)
         t0 = time.monotonic()
-        path = self._capture_to_file(total, timeout=max(timeout, total * 1.5 + 5))
+        path, errtxt = self._capture_to_file(
+            total, timeout=max(timeout, total * per_frame_s + 10))
         t_cap = time.monotonic() - t0
         size = os.path.getsize(path)
         full = size // self.frame_bytes
+        if size % self.frame_bytes and full > 0:
+            print(f"      !! capture size {size} is not a multiple of "
+                  f"{self.frame_bytes}B/frame -- driver stride padding? "
+                  "frame parsing may be misaligned")
         self.last_capture_s = t_cap
-        self.last_fps = (total / t_cap) if t_cap > 0 else 0.0
+        # fps from the kernel's per-buffer timestamps (frame intervals only;
+        # excludes process spawn / S_FMT / STREAMON overhead, which otherwise
+        # biases short captures low and long captures less -- distorting any
+        # fps<->exposure calibration built from mixed-length runs).
+        ts = [float(m) for m in re.findall(r"\bts:\s*([0-9]+\.[0-9]+)", errtxt)]
+        if len(ts) >= 2 and ts[-1] > ts[0]:
+            self.last_fps = (len(ts) - 1) / (ts[-1] - ts[0])
+        else:
+            self.last_fps = (total / t_cap) if t_cap > 0 else 0.0
         self.last_whole_frames = full
         if verbose:
             print(f"      [capture {total} frames in {t_cap:.2f}s "
@@ -438,9 +479,9 @@ class Capture:
             for i in range(n):
                 raw = fh.read(self.frame_bytes)
                 if len(raw) < self.frame_bytes:
-                    if len(raw) == 0:
-                        return
-                    raw = raw + b"\x00" * (self.frame_bytes - len(raw))
+                    # a truncated final frame is not data; zero-padding it
+                    # would drag the mean down and inflate the variance
+                    return
                 yield self._luma_from_frame(raw)
 
     def grab_n(self, n, discard=3, timeout=20.0, verbose=True):
@@ -628,6 +669,35 @@ def radial_profile(master, n_bins=12):
             "corner_centre_ratio": round(ratio, 4), "shape": shape}
 
 
+def _med3(a, b, c):
+    """Elementwise median of three arrays without stacking (memory-friendly)."""
+    return np.maximum(np.minimum(a, b), np.minimum(np.maximum(a, b), c))
+
+
+def hot_pixel_mask(master, nsigma=6.0):
+    """Single-pixel outliers above a locally-smoothed master.
+
+    Thresholding the RAW master at mean+6*std fails at native resolution: the
+    std includes the shading/FPN structure (the LSC gradient), which inflates
+    the threshold and hides genuine hot pixels -- or, with a tilted pedestal,
+    flags whole corners. So: remove structure with a separable median-of-3
+    smooth (kills single-pixel spikes, follows gradients), then threshold the
+    residual against a robust MAD sigma (so the hot pixels themselves cannot
+    inflate the noise estimate they are tested against)."""
+    m = master.astype(np.float32, copy=False)
+    pl = np.pad(m, ((0, 0), (1, 1)), mode="edge")
+    hsm = _med3(pl[:, :-2], pl[:, 1:-1], pl[:, 2:])
+    pv = np.pad(hsm, ((1, 1), (0, 0)), mode="edge")
+    smooth = _med3(pv[:-2, :], pv[1:-1, :], pv[2:, :])
+    resid = m - smooth
+    med = float(np.median(resid))
+    mad = float(np.median(np.abs(resid - med)))
+    sigma = 1.4826 * mad
+    if sigma <= 0:  # exactly flat residual (synthetic/clamped data)
+        sigma = float(resid.std()) or 1e-6
+    return resid > (med + nsigma * sigma)
+
+
 def build_fps_calibration(ladder_data):
     """From a dark run's per-exposure (exposure, eff_fps) pairs, build a
     monotonic fps->exposure inverse over the INTEGRATION-LIMITED region only.
@@ -692,6 +762,26 @@ def run_auto_dark(cap, device, iterations=20, frames=30, settle_s=1.0,
     print("\n=== AUTO-EXPOSURE DARK BEHAVIOUR ===")
     print("CAP THE LENS. Auto-exposure is LEFT ON; we observe what it does.")
     print(f"{iterations} iterations x {frames} frames. Reading back AE choices.\n")
+
+    # UVC controls are STICKY across processes: if a dark/manual run came
+    # before this one (the cam_manager plan always sequences it that way),
+    # auto_exposure is still 1 (manual) and we would "observe" a frozen manual
+    # exposure and call it a stable AE. Explicitly hand control back to AE.
+    # UVC menu: 0=Auto, 1=Manual, 2=Shutter Priority, 3=Aperture Priority;
+    # webcam firmwares implement 3 (and sometimes only 1/3).
+    ae_note = "auto_exposure control absent"
+    if "auto_exposure" in list_controls(device):
+        for mode in (3, 0, 2):
+            ok, err = set_ctrl(device, "auto_exposure", mode)
+            if ok:
+                break
+        rb = get_ctrl(device, "auto_exposure")
+        ae_note = (f"auto_exposure->{mode}: {'ok' if ok else 'FAILED ' + err} "
+                   f"(readback={rb})")
+        if rb == 1:
+            ae_note += " -- WARNING: device still reads back MANUAL; the " \
+                       "series below observes manual mode, not AE"
+        print(f"   {ae_note}")
 
     # real device exposure range, so the verdict scales to THIS camera rather
     # than any hard-coded assumption (exposure max varies: 2047, 8192, ...).
@@ -759,7 +849,8 @@ def run_auto_dark(cap, device, iterations=20, frames=30, settle_s=1.0,
         time.sleep(settle_s)
 
     # summary: where did AE park, did it hunt, what framerate
-    out = {"iterations": len(series), "series": series}
+    out = {"iterations": len(series), "series": series,
+           "auto_exposure_restore": ae_note}
     if series:
         exps = [s["exp_after"] for s in series if s["exp_after"] is not None]
         gains = [s["gain_after"] for s in series if s["gain_after"] is not None]
@@ -887,6 +978,7 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
     master = None
     residual_std = None
     deep_drops = 0
+    deep_clipped = False
     radial = None
     fpn = hot = None
     hot_coords = None
@@ -985,13 +1077,13 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
                       + clip_note)
             if is_deep:
                 deep_drops = drops
+                deep_clipped = clipped
                 master = mean_px                 # FIXED-PATTERN part (per-pixel)
                 # irreducible temporal noise after master-dark subtraction is
                 # exactly the temporal std we already computed per-pixel:
                 residual_std = temporal
                 fpn = float(master.std())        # spatial FPN spread
-                _threshold = master.mean() + 6 * master.std()
-                _hot_mask = master > _threshold
+                _hot_mask = hot_pixel_mask(master)
                 hot = int(_hot_mask.sum())
                 _yx = np.argwhere(_hot_mask)
                 hot_coords = _yx.tolist()        # [[y, x], ...] numpy row-major convention
@@ -1111,6 +1203,7 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
         "pixel_depth": 8,
         "deep_stack_frames": dark_frames,
         "deep_stack_drops": deep_drops,
+        "deep_stack_clipped": deep_clipped,
         "master_dark_fpn_adu": fpn if master is not None else None,
         "hot_pixels_6sigma": hot if master is not None else None,
         "hot_pixel_coords": hot_coords,  # [[y, x], ...] — x y when writing PHD2 defect file
@@ -1128,6 +1221,15 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
+
+def _ensure_dir(path):
+    """Create the parent directory of an output file. Save targets may carry a
+    device-tag prefix (046d0825_SN123/master_640x480.npy); failing on a missing
+    directory AFTER an hours-long capture run loses the whole stack."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
 
 def main():
     ap = argparse.ArgumentParser(description="UVC camera noise/codec characteriser")
@@ -1214,7 +1316,9 @@ def main():
         """Write the report to --report (explicit path) and/or --report-dir
         (timestamped auto-name). Safe to call at any exit point."""
         if args.report:
-            json.dump(report, open(args.report, "w"), indent=2)
+            _ensure_dir(args.report)
+            with open(args.report, "w") as fh:
+                json.dump(report, fh, indent=2)
             print(f"\nreport written to {args.report}")
         if args.report_dir:
             os.makedirs(args.report_dir, exist_ok=True)
@@ -1322,14 +1426,25 @@ def main():
         finally:
             cap.close()
         report["dark"] = dark
-        if args.save_master and master is not None:
+        # A clipped deep stack is not a measurement: the master, hot-pixel list
+        # and dark-current fit are all meaningless, and writing them anyway
+        # means PHD2 silently auto-loads garbage at every camera connect.
+        deep_clipped = bool(dark.get("deep_stack_clipped"))
+        if deep_clipped and (args.save_master or args.save_defects
+                             or args.save_dark_model):
+            print("   !! deep stack CLIPPED -- refusing to write master/defects/"
+                  "dark-model (fix the processing path: reduce brightness/"
+                  "contrast/gamma, then rerun)")
+        if args.save_master and master is not None and not deep_clipped:
             # Scale float64 luma (0-255) to uint16 (0-65535) for direct PHD2 import.
             # 257 * 255 = 65535 exactly; np.round preserves sub-ADU precision.
             master_u16 = np.clip(np.round(master * 257.0), 0, 65535).astype(np.uint16)
+            _ensure_dir(args.save_master)
             np.save(args.save_master, master_u16)
             print(f"   master dark (uint16) written to {args.save_master}")
-        if args.save_defects and master is not None:
+        if args.save_defects and master is not None and not deep_clipped:
             coords = dark.get("hot_pixel_coords") or []
+            _ensure_dir(args.save_defects)
             with open(args.save_defects, "w") as fh:
                 fh.write("# PHD2 Defect Map v1\n")
                 fh.write(f"# cam_characterise.py {args.device} "
@@ -1341,7 +1456,7 @@ def main():
                     fh.write(f"{x} {y}\n")
             print(f"   defect map written to {args.save_defects} "
                   f"({len(coords)} hot pixels)")
-        if args.save_dark_model and master is not None:
+        if args.save_dark_model and master is not None and not deep_clipped:
             dcf = dark.get("dark_current_fit") or {}
             model = {
                 "exposure_max_units": args.exposure_max,
@@ -1351,12 +1466,16 @@ def main():
                 "exposure_fidelity_verdict": (
                     dark.get("exposure_fidelity", {}).get("verdict", "")),
             }
-            json.dump(model, open(args.save_dark_model, "w"), indent=2)
+            _ensure_dir(args.save_dark_model)
+            with open(args.save_dark_model, "w") as fh:
+                json.dump(model, fh, indent=2)
             print(f"   dark current model written to {args.save_dark_model}")
         if args.save_calib:
             calib = build_fps_calibration(dark.get("ladder", []))
             if calib:
-                json.dump(calib, open(args.save_calib, "w"), indent=2)
+                _ensure_dir(args.save_calib)
+                with open(args.save_calib, "w") as fh:
+                    json.dump(calib, fh, indent=2)
                 print(f"   fps<->exposure calibration written to {args.save_calib} "
                       f"(valid fps {calib['valid_fps_range']}, "
                       f"{len(calib['anchors_fps'])} anchors)")

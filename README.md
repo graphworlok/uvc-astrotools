@@ -83,9 +83,12 @@ python3 cam_characterise.py --auto \
 ## What it measures
 
 ### Format ranking
-Enumerates formats and ranks them for measurement fidelity: uncompressed YUYV /
-YUV preferred, lossy MJPG / H264 / HEVC refused (they destroy the noise you are
-trying to measure). The tool picks the best uncompressed format automatically.
+Enumerates formats and ranks them for measurement fidelity: true mono
+(GREY / Y800 / Y16 — no chroma path at all, the ideal on mono guide-camera
+gadgets) best, then uncompressed YUYV / YUV; lossy MJPG / H264 / HEVC refused
+(they destroy the noise you are trying to measure). Y16 is normalised into the
+same 0–255 luma domain at sub-ADU precision so every threshold and fit works
+unchanged. The tool picks the best format automatically.
 
 ### Dark characterisation (`--dark`)
 Captures a deep stack at maximum exposure plus a ladder of shorter exposures,
@@ -99,8 +102,13 @@ Welford accumulator (so a 256-frame 4K stack costs ~tens of MB, not gigabytes):
 - **Fixed-pattern noise (FPN)** — spatial spread of the master dark; subtractable.
 - **Irreducible temporal dark noise** — per-pixel temporal std after master-dark
   subtraction; the single-frame floor.
-- **Hot pixels** — count above 6σ. Note this scales strongly with resolution:
-  downscaled modes bin/average and hide hot pixels that the native array exposes.
+- **Hot pixels** — single-pixel outliers above 6 robust sigma of the residual
+  after a local median smooth. (Thresholding the raw master at mean+6σ fails at
+  native resolution: the LSC shading gradient inflates the global σ and hides
+  real hot pixels; a MAD-based σ on the structure-removed residual is immune to
+  both the gradient and the hot pixels themselves.) Note the count scales
+  strongly with resolution: downscaled modes bin/average and hide hot pixels
+  that the native array exposes.
 - **Radial profile** — mean ADU binned by distance from frame centre, to expose
   shading structure. With the lens capped there is no optical vignetting, so any
   radial gradient is the bridge's lens-shading-correction (LSC) gain map showing
@@ -127,8 +135,15 @@ limited region. In auto-exposure mode this converts the measured framerate into
 an effective exposure, independent of the (possibly lying) `exposure_time_absolute`
 readback. The calibration is resolution-specific — rebuild it per resolution.
 
+The framerate itself is measured from the kernel's per-buffer timestamps
+(v4l2-ctl `--verbose` dqbuf lines), not wall-clock over the whole capture —
+process spawn / STREAMON overhead would otherwise bias short ladder captures
+low and the long deep stack less, bending the calibration curve.
+
 ### Auto-exposure observation (`--auto`)
-Leaves AE enabled (does **not** force manual), caps the lens, and logs the
+Hands control back to AE first — UVC controls are sticky across processes, so
+after a manual dark run the device is still in manual mode and would otherwise
+be "observed" as a perfectly stable AE. The mode then caps the lens and logs the
 AE-chosen exposure and gain, the framerate, and the resulting mean/noise over
 many iterations. Reports where AE parked (as a fraction of the device's real
 exposure range, and in seconds — UVC exposure is in 100µs units), whether it is
@@ -146,7 +161,9 @@ path cannot disambiguate a genuinely low-noise sensor from a denoised one at
 ISP processing controls (for clean measurement: gamma linear, sharpness min,
 brightness/contrast neutral). A **clip guard** flags any capture driven to the
 floor (0) or ceiling (255) by aggressive settings and marks the measurement
-invalid rather than reporting clipped zeros as data.
+invalid rather than reporting clipped zeros as data. If the deep stack itself
+is clipped, the master / defects / dark-model exports are **refused** — writing
+them would hand PHD2 meaningless calibration to auto-load at every connect.
 
 ## Output
 
@@ -192,7 +209,10 @@ calibration constant derived from a dark run here.
 ### Handoff format
 
 `cam_manager.py` writes a per-device directory named by USB identity
-(`{idVendor}{idProduct}[_{serial}]`, read from sysfs) containing, per resolution:
+(`{idVendor}{idProduct}[_{serial}]`, read from sysfs). The plan includes a dark
+run at **every discrete resolution** the chosen format offers — not just
+smallest and native — so PHD2 finds matching artefacts for whatever frame size
+it connects at. Each run produces:
 
 | File | Built by | Consumed by PHD2 for |
 |------|----------|----------------------|

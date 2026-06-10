@@ -209,34 +209,36 @@ def plan(device, formats, ctrls, args):
     lad = ["--ladder", ",".join(str(x) for x in ladder_for(exp_min, exp_max))]
 
     sw, sh = small["w"], small["h"]
-    lw, lh = large["w"], large["h"]
 
-    # 1. baseline dark + calibration at the smallest resolution (instrument res)
-    runs.append({
-        "label": "dark_baseline_smallres",
-        "why": f"clean dark + fps<->exposure calibration at {sw}x{sh} "
-               f"(highest bandwidth ceiling, best chance fps tracks integration). "
-               f"exposure range {exp_min}..{exp_max}.",
-        "argv_tail": ["--dark"] + common + lad + neutral_proc()
-                     + ["--save-calib",      f"{p}calib_{sw}x{sh}.json",
-                        "--save-master",     f"{p}master_{sw}x{sh}.npy",
-                        "--save-defects",    f"{p}defects_{sw}x{sh}.txt",
-                        "--save-dark-model", f"{p}dark_model_{sw}x{sh}.json"]})
-
-    # 2. full-resolution dark (defects + shading at native array)
-    if large != small:
-        common_large = ["--width", str(lw), "--height", str(lh),
-                        "--discard", str(args.discard), "--ladder-frames",
-                        str(args.ladder_frames), "--exposure-max", str(exp_max),
-                        "--knee", str(knee)]
+    # 1..N: a full dark run at EVERY discrete resolution, so PHD2 finds
+    # matching master/defects/dark-model for whatever frame size the user
+    # guides at. Calibration is saved everywhere too: where the bandwidth
+    # ceiling pins fps it simply fails to build (engine prints a note) and
+    # PHD2 falls back gracefully — zero cost, full coverage when it works.
+    for size in sizes:
+        w, h = size["w"], size["h"]
+        com = ["--width", str(w), "--height", str(h),
+               "--discard", str(args.discard), "--ladder-frames",
+               str(args.ladder_frames), "--exposure-max", str(exp_max),
+               "--knee", str(knee)]
+        if size is small:
+            why = (f"clean dark + fps<->exposure calibration at {w}x{h} "
+                   f"(highest bandwidth ceiling, best chance fps tracks "
+                   f"integration). exposure range {exp_min}..{exp_max}.")
+        elif size is large:
+            why = (f"native {w}x{h} dark: true hot-pixel count and shading "
+                   f"map (lower-res modes bin/scale and hide both).")
+        else:
+            why = (f"{w}x{h} dark: master/defects/dark-model so PHD2 has "
+                   f"matching artefacts if guiding at this frame size.")
         runs.append({
-            "label": "dark_fullres",
-            "why": f"native {lw}x{lh} dark: true hot-pixel count and shading map "
-                   f"(lower-res modes bin/scale and hide both).",
-            "argv_tail": ["--dark"] + common_large + lad + neutral_proc()
-                         + ["--save-master",     f"{p}master_{lw}x{lh}.npy",
-                            "--save-defects",    f"{p}defects_{lw}x{lh}.txt",
-                            "--save-dark-model", f"{p}dark_model_{lw}x{lh}.json"]})
+            "label": f"dark_{w}x{h}",
+            "why": why,
+            "argv_tail": ["--dark"] + com + lad + neutral_proc()
+                         + ["--save-calib",      f"{p}calib_{w}x{h}.json",
+                            "--save-master",     f"{p}master_{w}x{h}.npy",
+                            "--save-defects",    f"{p}defects_{w}x{h}.txt",
+                            "--save-dark-model", f"{p}dark_model_{w}x{h}.json"]})
 
     # 3. gamma sweep (LSC-vs-gamma pipeline ordering, reverse-vignette depth)
     if has_gamma:
@@ -325,7 +327,8 @@ def main():
           f"(max {max_advertised_fps(large)} fps)")
     if dev_tag:
         print(f"  device tag: {dev_tag}  (output dir: {dev_tag}/)")
-        os.makedirs(dev_tag, exist_ok=True)
+        if args.run:  # print-only / script modes must not touch the fs
+            os.makedirs(dev_tag, exist_ok=True)
     else:
         print("  device tag: (not available — USB sysfs lookup failed; "
               "files will be in the current directory)")
