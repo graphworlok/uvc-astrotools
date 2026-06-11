@@ -67,7 +67,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.3"
+TOOL_VERSION = "0.4"
 
 
 # ----------------------------------------------------------------------------
@@ -101,6 +101,24 @@ def downsample_to_fit(img, max_w, max_h):
     h, w = img.shape
     f = max(1, (w + max_w - 1) // max_w, (h + max_h - 1) // max_h)
     return img[::f, ::f], f
+
+
+def aspect_str(w, h):
+    """Human aspect ratio: exact when the reduced form is sane (4:3, 16:9),
+    nearest common ratio for marketing pixel counts (1366x768 -> ~16:9),
+    decimal otherwise."""
+    g = math.gcd(w, h)
+    a, b = w // g, h // g
+    if (a, b) == (8, 5):
+        a, b = 16, 10
+    if max(a, b) <= 21:
+        return f"{a}:{b}"
+    r = w / h
+    common = [(4, 3), (16, 9), (3, 2), (16, 10), (5, 4), (1, 1), (21, 9)]
+    best = min(common, key=lambda ab: abs(ab[0] / ab[1] - r))
+    if abs(best[0] / best[1] - r) / r < 0.02:
+        return f"~{best[0]}:{best[1]}"
+    return f"{r:.2f}:1"
 
 
 def frame_stats(img):
@@ -541,10 +559,15 @@ class App:
 
         self.solving = False
         self.last_solve_t = 0.0
+        self.status_base = "starting…"
+        self.last_evt_t = time.monotonic()
 
         self._build_ui()
         self._set_mode_banner()
         root.after(100, self._poll)
+        # probe the default device automatically -- a blank, disabled UI with
+        # no explanation was the worst possible first impression
+        root.after(300, self.on_probe)
 
     # ---------------- UI construction ----------------
 
@@ -553,18 +576,24 @@ class App:
                                pady=6)
         self.banner.pack(fill="x")
 
+        # activity line: always says what the tool is doing right now
+        self.lbl_status = tk.Label(self.root, text="starting…", anchor="w",
+                                   font=("TkDefaultFont", 10, "bold"),
+                                   bg="#202020", fg="#80c0ff", padx=8, pady=3)
+        self.lbl_status.pack(fill="x")
+
         disp = tk.Frame(self.root)
         disp.pack(fill="both", expand=True, padx=4, pady=4)
         self.lf_left = tk.LabelFrame(disp, text="Raw stream")
         self.lf_left.pack(side="left", padx=2)
         self.canvas_live = tk.Canvas(self.lf_left, width=CANVAS_W,
-                                     height=CANVAS_H, bg="black",
+                                     height=CANVAS_H, bg="#141414",
                                      highlightthickness=0)
         self.canvas_live.pack()
         self.lf_right = tk.LabelFrame(disp, text="Dark-corrected residual")
         self.lf_right.pack(side="left", padx=2)
         self.canvas_stack = tk.Canvas(self.lf_right, width=CANVAS_W,
-                                      height=CANVAS_H, bg="black",
+                                      height=CANVAS_H, bg="#141414",
                                       highlightthickness=0)
         self.canvas_stack.pack()
 
@@ -580,14 +609,17 @@ class App:
         self.cmb_dev = ttk.Combobox(r0, textvariable=self.var_dev,
                                     values=devs, width=14)
         self.cmb_dev.pack(side="left", padx=2)
+        self.cmb_dev.bind("<<ComboboxSelected>>", lambda e: self.on_probe())
         self.btn_probe = tk.Button(r0, text="Probe", command=self.on_probe)
         self.btn_probe.pack(side="left", padx=4)
         tk.Label(r0, text="Resolution:").pack(side="left")
         self.var_res = tk.StringVar()
-        self.cmb_res = ttk.Combobox(r0, textvariable=self.var_res, width=11,
+        self.cmb_res = ttk.Combobox(r0, textvariable=self.var_res, width=16,
                                     state="readonly")
         self.cmb_res.pack(side="left", padx=2)
         self.cmb_res.bind("<<ComboboxSelected>>", lambda e: self.on_res_change())
+        self.lbl_native = tk.Label(r0, text="")
+        self.lbl_native.pack(side="left", padx=4)
         tk.Label(r0, text="Exposure (100µs units):").pack(side="left")
         self.var_exp = tk.IntVar(value=self.exp_value)
         self.var_exp.trace_add("write", self._on_exp_change)
@@ -632,6 +664,10 @@ class App:
         self.prg.pack(side="left", padx=4)
         self.lbl_dark = tk.Label(r1, text="no master dark")
         self.lbl_dark.pack(side="left")
+        self.btn_viewdark = tk.Button(r1, text="View dark/defects",
+                                      command=self.on_view_dark,
+                                      state="disabled")
+        self.btn_viewdark.pack(side="left", padx=4)
 
         # row 2: integration controls
         r2 = tk.Frame(ctl); r2.pack(fill="x", pady=2)
@@ -717,6 +753,11 @@ class App:
         self.txt.see("end")
         self.txt.configure(state="disabled")
 
+    def set_status(self, text, fg="#80c0ff"):
+        self.status_base = text
+        self.last_evt_t = time.monotonic()
+        self.lbl_status.configure(text=text, fg=fg)
+
     def _on_exp_change(self, *a):
         try:
             self.exp_value = int(self.var_exp.get())
@@ -755,19 +796,43 @@ class App:
     def busy(self):
         return self.worker is not None and self.worker.is_alive()
 
+    @staticmethod
+    def _fit_scale(w, h, cw, ch):
+        """Best integer zoom/subsample pair (z, q) so the image FILLS as much
+        of the canvas as possible without cropping -- e.g. a 320x240 frame on
+        a 480x360 canvas gets 3/2. tk.PhotoImage only scales by integer
+        ratios, hence the rational search instead of a single factor."""
+        best, best_s = (1, 1), 0.0
+        for z in range(1, 5):
+            for q in range(1, 5):
+                s = z / q
+                if w * s <= cw + 0.5 and h * s <= ch + 0.5 and s > best_s:
+                    best_s, best = s, (z, q)
+        return best
+
     def _show(self, canvas, img8, which, stars=None, stride=1, vectors=None):
+        h, w = img8.shape
+        z, q = self._fit_scale(w, h, CANVAS_W, CANVAS_H)
         photo = tk.PhotoImage(data=pgm_bytes(img8))
+        if z > 1:
+            photo = photo.zoom(z, z)
+        if q > 1:
+            photo = photo.subsample(q, q)
+        ox = (CANVAS_W - photo.width()) // 2
+        oy = (CANVAS_H - photo.height()) // 2
         canvas.delete("all")
-        canvas.create_image(0, 0, image=photo, anchor="nw")
+        canvas.create_image(ox, oy, image=photo, anchor="nw")
+        s = z / q  # display px per img8 px; overlays use full-res coords
         if stars:
-            for s in stars[:50]:
-                x, y = s["x"] / stride, s["y"] / stride
+            for st in stars[:50]:
+                x = st["x"] / stride * s + ox
+                y = st["y"] / stride * s + oy
                 canvas.create_oval(x - 6, y - 6, x + 6, y + 6,
                                    outline="#00ff60")
         if vectors:
             for rx, ry, cx, cy in vectors[:50]:
-                canvas.create_line(rx / stride, ry / stride,
-                                   cx / stride, cy / stride,
+                canvas.create_line(rx / stride * s + ox, ry / stride * s + oy,
+                                   cx / stride * s + ox, cy / stride * s + oy,
                                    fill="#ffd000", width=2, arrow=tk.LAST)
         if which == "live":
             self._photo_live = photo
@@ -777,16 +842,26 @@ class App:
     # ---------------- device probing / calibration files ----------------
 
     def on_probe(self):
+        if self.busy():
+            self.log("stop the current capture before re-probing")
+            return
         dev = self.var_dev.get()
+        self.cmb_dev["values"] = sorted(glob.glob("/dev/video*")) or [dev]
+        self.set_status(f"probing {dev}…")
+        self.root.update_idletasks()
         try:
             ranked = cc.rank_formats(cc.enum_formats(dev))
         except OSError as e:
             self.log(f"cannot open {dev}: {e}")
+            self.set_status(f"cannot open {dev} — pick a device and press "
+                            "Probe", fg="#ff8060")
             return
         best = cc.best_measurement_format(ranked)
         if best is None:
             self.log(f"{dev}: no uncompressed format -- unusable for "
                      "measurement (only lossy codecs offered)")
+            self.set_status(f"{dev}: only lossy formats — unusable",
+                            fg="#ff8060")
             return
         self.fourcc = best["fourcc"].strip()
         fmts = query_formats(dev)
@@ -795,10 +870,27 @@ class App:
             if f["fourcc"] == self.fourcc:
                 sizes = [(s["w"], s["h"]) for s in f["sizes"]]
         if not sizes:
+            # fourcc bookkeeping mismatch or sparse descriptors: offer every
+            # discrete size any uncompressed format advertises
+            for f in fmts:
+                if not f.get("compressed"):
+                    sizes += [(s["w"], s["h"]) for s in f["sizes"]]
+            if sizes:
+                self.log(f"no size list for {self.fourcc}; offering all "
+                         "uncompressed sizes")
+        if not sizes:
             sizes = [(640, 480)]
-        self.sizes = sorted(set(sizes))
-        self.cmb_res["values"] = [f"{w}x{h}" for w, h in self.sizes]
-        self.var_res.set(f"{self.sizes[0][0]}x{self.sizes[0][1]}")
+            self.log("device advertises no discrete sizes; assuming 640x480")
+        self.sizes = sorted(set(sizes), key=lambda s: s[0] * s[1])
+        self.cmb_res["values"] = [f"{w}x{h} ({aspect_str(w, h)})"
+                                  for w, h in self.sizes]
+        sw, sh = self.sizes[0]
+        self.var_res.set(f"{sw}x{sh} ({aspect_str(sw, sh)})")
+        # native aspect, inferred from the largest advertised frame: smaller
+        # modes with a different ratio are cropped or anamorphic
+        nw, nh = self.sizes[-1]
+        self.lbl_native.configure(
+            text=f"native {nw}x{nh} ({aspect_str(nw, nh)})")
         self.exp_rng = cc.get_ctrl_range(dev, "exposure_time_absolute")
         if self.exp_rng:
             self.lbl_exp_rng.configure(
@@ -813,6 +905,8 @@ class App:
                      formats_ranked=[(f["fourcc"], f["fidelity_rank"])
                                      for f in ranked],
                      resolutions=self.sizes,
+                     native=list(self.sizes[-1]),
+                     native_aspect=aspect_str(*self.sizes[-1]),
                      exposure_range=self.exp_rng, dev_tag=self.dev_tag,
                      data_dir=self.data_dir())
         self.dbg.log("controls", device=dev, controls=query_controls(dev))
@@ -822,6 +916,11 @@ class App:
         self.on_res_change()
         self.btn_start.configure(state="normal")
         self.btn_dark.configure(state="normal")
+        nw, nh = self.sizes[-1]
+        self.set_status(
+            f"ready — {dev} {self.fourcc}, {len(self.sizes)} resolutions, "
+            f"native {nw}x{nh} ({aspect_str(nw, nh)}) — choose mode, "
+            "then Start", fg="#80ff80")
 
     def _build_uvc_panel(self, dev):
         """Populate the UVC controls row with the device's REAL processing
@@ -918,11 +1017,57 @@ class App:
     def _update_dark_label(self):
         if self.master_dark is None:
             self.lbl_dark.configure(text="no master dark")
+            self.btn_viewdark.configure(state="disabled")
         else:
             nd = 0 if self.defects is None else len(self.defects)
             exp = f" @ exp {self.master_exp}" if self.master_exp else ""
             self.lbl_dark.configure(
                 text=f"master dark ready{exp}, {nd} defects")
+            self.btn_viewdark.configure(state="normal")
+
+    def on_view_dark(self):
+        """Inspection window: the master dark auto-stretched, with every
+        defect-map pixel marked. The stretch makes the FPN structure and the
+        LSC shading visible; the marks confirm what will be repaired."""
+        if self.master_dark is None:
+            return
+        w, h = self.current_size()
+        nd = 0 if self.defects is None else len(self.defects)
+        top = tk.Toplevel(self.root)
+        top.title(f"Master dark {w}x{h} — {nd} defects")
+        cv = tk.Canvas(top, width=CANVAS_W, height=CANVAS_H, bg="#141414",
+                       highlightthickness=0)
+        cv.pack()
+        small, stride = downsample_to_fit(self.master_dark,
+                                          CANVAS_W, CANVAS_H)
+        img8 = stretch_to_u8(small)
+        z, q = self._fit_scale(img8.shape[1], img8.shape[0],
+                               CANVAS_W, CANVAS_H)
+        photo = tk.PhotoImage(data=pgm_bytes(img8))
+        if z > 1:
+            photo = photo.zoom(z, z)
+        if q > 1:
+            photo = photo.subsample(q, q)
+        ox = (CANVAS_W - photo.width()) // 2
+        oy = (CANVAS_H - photo.height()) // 2
+        cv.create_image(ox, oy, image=photo, anchor="nw")
+        top._photo = photo  # keep a reference or Tk drops the image
+        s = z / q
+        drawn = 0
+        if self.defects is not None:
+            for y, x in self.defects[:3000]:
+                px = x / stride * s + ox
+                py = y / stride * s + oy
+                cv.create_oval(px - 2, py - 2, px + 2, py + 2,
+                               outline="#ff4040")
+                drawn += 1
+        fpn = float(self.master_dark.std())
+        exp = f"{self.master_exp} units" if self.master_exp else "unknown"
+        info = (f"exposure {exp}  |  FPN σ {fpn:.2f} ADU  |  "
+                f"{nd} hot pixels"
+                + (f" (first {drawn} marked)" if nd > drawn else " marked")
+                + "  |  display auto-stretched")
+        tk.Label(top, text=info, anchor="w", padx=6, pady=4).pack(fill="x")
 
     # ---------------- mode / actions ----------------
 
@@ -951,6 +1096,7 @@ class App:
         if self.var_mode.get() == "dark":
             self.worker = threading.Thread(target=self._dark_preview_worker,
                                            daemon=True)
+            self.set_status("DARK PREVIEW — starting capture…")
             self.log("dark preview: raw vs dark-corrected residual "
                      "(fixed stretch x8 -- correction should look black)")
         else:
@@ -962,6 +1108,7 @@ class App:
                          f"{self.master_exp}, capturing at {exp} -- "
                          "subtraction will be biased")
             self.btn_pause.configure(state="normal")
+            self.set_status("INTEGRATING — starting capture…")
             self.worker = threading.Thread(target=self._light_worker,
                                            daemon=True)
         self.worker.start()
@@ -1006,6 +1153,7 @@ class App:
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.lf_right.configure(text="Master dark (accumulating)")
+        self.set_status(f"ACQUIRING MASTER DARK 0/{n} — capturing…")
         self.worker = threading.Thread(target=self._dark_worker, args=(n,),
                                        daemon=True)
         self.worker.start()
@@ -1310,6 +1458,14 @@ class App:
                 self._handle(msg)
         except queue.Empty:
             pass
+        # capture bursts take seconds with nothing to show; say so rather
+        # than sitting silent
+        if self.busy():
+            stale = time.monotonic() - self.last_evt_t
+            if stale > 2.5:
+                self.lbl_status.configure(
+                    text=f"{self.status_base}  …capturing "
+                         f"({stale:.0f}s since last frame)")
         self.root.after(100, self._poll)
 
     def _handle(self, msg):
@@ -1320,10 +1476,14 @@ class App:
             _, count, total, msmall, lsmall = msg
             self.prg["maximum"] = total
             self.prg["value"] = count
+            self.set_status(f"ACQUIRING MASTER DARK {count}/{total}")
             self._show(self.canvas_live, stretch_to_u8(lsmall), "live")
             self._show(self.canvas_stack, stretch_to_u8(msmall), "stack")
         elif kind == "dark_preview":
             _, raw8, resid8, stats, fps = msg
+            self.set_status(f"DARK PREVIEW @ {fps:.1f} fps"
+                            + ("" if resid8 is not None
+                               else " — no master dark yet"))
             self._show(self.canvas_live, raw8, "live")
             if resid8 is not None:
                 self._show(self.canvas_stack, resid8, "stack")
@@ -1346,8 +1506,12 @@ class App:
             self.log(f"master dark: {count} frames, "
                      f"{len(coords)} hot pixels")
             self.lf_right.configure(text="Dark-corrected residual")
+            self.set_status(f"master dark complete: {count} frames, "
+                            f"{len(coords)} hot pixels — saved", fg="#80ff80")
         elif kind == "pause_update":
             _, raw8, pairs, stride, summary, fps = msg
+            self.set_status(f"PAUSED — tracking star motion @ {fps:.1f} fps",
+                            fg="#ffd000")
             self._show(self.canvas_live, raw8, "live",
                        vectors=pairs, stride=stride)
             if summary:
@@ -1367,6 +1531,8 @@ class App:
                      f"(stack frozen at {self.stack_n} frames)")
         elif kind == "light_update":
             _, raw8, stack, stars, n, maxn, fps, bg, sigma = msg
+            self.set_status(f"INTEGRATING {n}/{maxn} @ {fps:.1f} fps — "
+                            f"{len(stars)} stars")
             self._show(self.canvas_live, raw8, "live")
             ssmall, stride = downsample_to_fit(stack, CANVAS_W, CANVAS_H)
             self._show(self.canvas_stack, stretch_to_u8(ssmall), "stack",
@@ -1423,6 +1589,7 @@ class App:
             self.pause_evt.clear()
             self.prg["value"] = 0
             self._set_mode_banner()  # restore right-canvas label
+            self.set_status("stopped — ready", fg="#80ff80")
 
     def _save_dark(self, mean, coords, exp, count):
         w, h = self.current_size()
