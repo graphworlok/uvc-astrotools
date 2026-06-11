@@ -7,7 +7,7 @@ and shading structure, hot pixels, and auto-exposure behaviour. Built for
 evaluating modules for astrophotography / autoguiding use, where the firmware's
 nominal exposure range is usually not the same as its usable one.
 
-Two tools:
+Three tools:
 
 - **`cam_characterise.py`** — the measurement engine. Runs dark-noise
   characterisation, an exposure ladder, a photon-transfer-curve scaffold, and an
@@ -15,6 +15,10 @@ Two tools:
 - **`cam_manager.py`** — a capability-aware planner. Introspects a camera's real
   formats, resolutions, frame intervals and control ranges, then generates a
   tailored set of `cam_characterise.py` runs for that specific device.
+- **`cam_observe.py`** — a standalone GUI observing tool built on the same
+  stack: generate or load a master dark + defect map (DARK mode, lens capped),
+  then live-stack calibrated frames (LIGHT mode), extract stars, and
+  plate-solve the stack with a local astrometry.net. See below.
 
 ## Why
 
@@ -185,6 +189,40 @@ and clean up, but a multi-hour native-resolution sweep writes a lot to disk and
 heats the sensor (which shifts the dark current and hot-pixel count across the
 run). Interleave or randomise exposure order if you need to separate thermal drift
 from exposure dependence.
+
+## GUI observing tool (`cam_observe.py`)
+
+A standalone tkinter GUI (numpy + stdlib only) around the same capture and
+analysis stack, with two explicitly user-declared modes — the tool cannot know
+whether the lens is capped, so the human says so via a banner toggle:
+
+- **DARK mode** — acquire a deep master dark (streaming per-pixel mean) and
+  derive a hot-pixel defect map, written in exactly the per-device layout the
+  other tools use (`{vid+pid[_serial]}/master_WxH.npy` ×257 uint16,
+  `defects_WxH.txt`, plus a `dark_meta_WxH.json` sidecar recording the
+  exposure). Existing files for the device + resolution load automatically.
+- **LIGHT mode** — continuous capture: dark-subtract → defect-repair →
+  optional translation alignment (phase correlation) → mean stack. Stars are
+  extracted from the stack (robust MAD background, connected components →
+  sub-pixel centroids, flux, FWHM) and overlaid on the display. A noise
+  readout shows the measured single-frame→stack noise reduction against the
+  theoretical √N — the figure of merit when mining the noise floor with no
+  stars at all.
+
+Plate solving runs a local astrometry.net (`solve-field`) on the stack
+(written as linear 16-bit FITS), manually or on an auto-solve timer once
+enough stars are present, and reports RA/Dec field centre, rotation, and the
+**angular offset from the celestial pole** — with the camera mounted in or
+coaxial to an equatorial's RA axis, that offset is the live polar-alignment
+number while adjusting the mount. (Fitting the mechanical rotation centre
+from solves at several RA-axis rotations is the planned refinement on top.)
+
+```sh
+python3 cam_observe.py --device /dev/video0 --data-dir ~/.local/share/PHD2
+```
+
+Point `--data-dir` at the PHD2 data dir and the darks/defect maps built here
+are the same files PHD2 auto-loads at camera connect.
 
 ## Relationship to the PHD2 V4L2 work
 
