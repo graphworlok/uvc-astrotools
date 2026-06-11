@@ -47,6 +47,7 @@ import glob
 import json
 import math
 import os
+import platform
 import queue
 import re
 import shutil
@@ -55,6 +56,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from collections import deque
 from datetime import datetime, timezone
 
@@ -63,7 +65,9 @@ import tkinter as tk
 from tkinter import ttk
 
 import cam_characterise as cc
-from cam_manager import usb_device_tag, query_formats, query_controls
+from cam_manager import usb_device_tag, query_formats, query_controls, identify
+
+TOOL_VERSION = "0.3"
 
 
 # ----------------------------------------------------------------------------
@@ -97,6 +101,17 @@ def downsample_to_fit(img, max_w, max_h):
     h, w = img.shape
     f = max(1, (w + max_w - 1) // max_w, (h + max_h - 1) // max_h)
     return img[::f, ::f], f
+
+
+def frame_stats(img):
+    """Compact, self-describing statistics of a frame for the debug log.
+    Values are in the 8-bit luma float domain (0-255 ADU)."""
+    med = float(np.median(img))
+    return {"min": round(float(img.min()), 2),
+            "max": round(float(img.max()), 2),
+            "mean": round(float(img.mean()), 3),
+            "median": round(med, 3),
+            "mad_sigma": round(1.4826 * float(np.median(np.abs(img - med))), 4)}
 
 
 def write_fits_u16(path, img):
@@ -264,16 +279,22 @@ def motion_summary(pairs):
 # Plate solving (local astrometry.net)
 # ----------------------------------------------------------------------------
 
-def solve_field(stack, solve_path, scale_low, scale_high, timeout=180):
+def solve_field(stack, solve_path, scale_low, scale_high, timeout=180,
+                dbg=None):
     """Write the stack to FITS in a temp dir and run solve-field on it.
     Returns (ok, message, info) where info carries parsed ra/dec/rotation
     in degrees when available. Blocking -- call from a worker thread."""
+    if dbg is None:
+        dbg = NullDebug()
     exe = shutil.which(solve_path)
     if not exe:
+        dbg.log("solve_end", ok=False, reason="solve-field not on PATH",
+                solver=solve_path)
         return False, f"solve-field not found at '{solve_path}' -- install " \
                       "astrometry.net (and index files) or fix the path", {}
     tmp = tempfile.mkdtemp(prefix="camobs_solve_")
     fits = os.path.join(tmp, "stack.fits")
+    t0 = time.monotonic()
     try:
         write_fits_u16(fits, stack)
         cmd = [exe, fits, "--overwrite", "--no-plots",
@@ -283,6 +304,8 @@ def solve_field(stack, solve_path, scale_low, scale_high, timeout=180):
             cmd += ["--scale-units", "arcsecperpix",
                     "--scale-low", str(scale_low),
                     "--scale-high", str(scale_high)]
+        dbg.log("solve_start", cmd=cmd, stack=frame_stats(stack),
+                shape=list(stack.shape))
         r = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=timeout)
         out = (r.stdout or "") + (r.stderr or "")
@@ -305,13 +328,22 @@ def solve_field(stack, solve_path, scale_low, scale_high, timeout=180):
             m = re.search(pat, out)
             if m:
                 lines.append(m.group(0))
+        dur = round(time.monotonic() - t0, 2)
         if solved and lines:
+            dbg.log("solve_end", ok=True, duration_s=dur, parsed=info,
+                    rc=r.returncode)
             return True, "\n".join(lines), info
         if solved:
+            dbg.log("solve_end", ok=True, duration_s=dur, parsed=info,
+                    rc=r.returncode, note="no centre line parsed")
             return True, "solved (no centre line found in output?)", info
+        dbg.log("solve_end", ok=False, duration_s=dur, rc=r.returncode,
+                output_tail=out[-1500:])
         return False, "did not solve -- need more stars, better scale " \
                       "hints, or matching index files", {}
     except subprocess.TimeoutExpired:
+        dbg.log("solve_end", ok=False, duration_s=round(
+            time.monotonic() - t0, 2), reason=f"timeout after {timeout}s")
         return False, f"solve-field timed out after {timeout}s", {}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -328,6 +360,131 @@ def pole_offset_text(ra, dec):
     if sep_deg < 1.0:
         return f"{sep_deg * 60.0:.1f} arcmin from {pole}"
     return f"{sep_deg:.3f} deg from {pole}"
+
+
+# ----------------------------------------------------------------------------
+# Debug / diagnostics (--debug): JSONL aimed at LLM consumption
+# ----------------------------------------------------------------------------
+
+DEBUG_SCHEMA = {
+    "session_start": "environment, versions, argv, and this schema",
+    "probe": "device identity, ranked formats, chosen fourcc, resolutions, "
+             "exposure range, USB device tag",
+    "controls": "full V4L2 control dump (name -> min/max/step/default/value) "
+                "at probe time",
+    "calibration_load": "master dark / defect map / metadata found (or not) "
+                        "for the selected resolution",
+    "ctrl_set": "a V4L2 control write and whether the device accepted it",
+    "worker_start": "capture worker launched: kind and all processing "
+                    "parameters in effect",
+    "worker_end": "capture worker exited",
+    "burst": "one capture burst: timing, fps, frame statistics before/after "
+             "calibration, alignment shift, integration depth, star count",
+    "dark_progress": "master-dark acquisition progress with accumulating "
+                     "master statistics",
+    "dark_done": "master dark finished: statistics and hot-pixel count",
+    "dark_saved": "calibration files written to disk",
+    "pause": "integration paused/resumed, and star-motion tracking summaries "
+             "while paused",
+    "solve_start": "plate solve launched: stack depth and full command line",
+    "solve_end": "plate solve result: parsed RA/Dec/rotation, or failure "
+                 "with the tail of solve-field's output",
+    "error": "exception with full traceback",
+    "ui": "a user action in the GUI",
+}
+
+
+class NullDebug:
+    """No-op stand-in so call sites never need a conditional."""
+    enabled = False
+
+    def log(self, ev, **fields):
+        pass
+
+    def exc(self, ev, **fields):
+        pass
+
+    def close(self):
+        pass
+
+
+class DebugLog:
+    """JSONL diagnostics designed for LLM consumption: one self-describing
+    event per line, schema documented in the first line, monotonic seq
+    across threads, numpy types coerced to JSON. Paste the file (or its
+    tail) into a model session and it can reconstruct what happened
+    without the source code."""
+    enabled = True
+
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._f = open(path, "a", encoding="utf-8")
+        self._seq = 0
+
+    @staticmethod
+    def _default(o):
+        if isinstance(o, np.floating):
+            return float(o)
+        if isinstance(o, np.integer):
+            return int(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return str(o)
+
+    def log(self, ev, **fields):
+        with self._lock:
+            self._seq += 1
+            rec = {"seq": self._seq,
+                   "t": datetime.now(timezone.utc).isoformat(
+                       timespec="milliseconds"),
+                   "ev": ev}
+            rec.update(fields)
+            self._f.write(json.dumps(rec, default=self._default) + "\n")
+            self._f.flush()
+
+    def exc(self, ev, **fields):
+        self.log(ev, traceback=traceback.format_exc(), **fields)
+
+    def close(self):
+        with self._lock:
+            self._f.close()
+
+
+def start_debug(args):
+    """Open the debug log and write the session header."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = args.debug_file or os.path.join(
+        args.data_dir, f"camobs_debug_{ts}.jsonl")
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    dbg = DebugLog(path)
+    try:
+        v4l2ver = subprocess.run(["v4l2-ctl", "--version"],
+                                 capture_output=True, text=True,
+                                 timeout=10).stdout.strip()
+    except Exception as e:
+        v4l2ver = f"unavailable: {e}"
+    dbg.log("session_start",
+            tool="cam_observe.py", tool_version=TOOL_VERSION,
+            argv=sys.argv[1:],
+            python=sys.version.split()[0], numpy=np.__version__,
+            tk=str(tk.TkVersion), platform=platform.platform(),
+            v4l2_ctl=v4l2ver,
+            schema=DEBUG_SCHEMA,
+            notes="One JSON object per line, chronological; 'seq' is "
+                  "monotonic across threads. Pixel statistics are in the "
+                  "8-bit luma float domain (0-255 ADU) regardless of the "
+                  "sensor's native depth (Y16 is normalised /257). "
+                  "Exposure values are UVC exposure_time_absolute units "
+                  "of 100 microseconds. 'burst' events are the heartbeat: "
+                  "one per v4l2-ctl capture invocation. A healthy dark "
+                  "preview has residual mad_sigma near the sensor's "
+                  "temporal noise and mean near 0; a healthy light burst "
+                  "shows raw mad_sigma > proc mad_sigma after calibration "
+                  "and ring growing to maxn.")
+    return dbg
 
 
 # ----------------------------------------------------------------------------
@@ -348,9 +505,10 @@ UVC_PANEL_CTRLS = ("gain", "gamma", "brightness", "contrast",
 
 
 class App:
-    def __init__(self, root, args):
+    def __init__(self, root, args, dbg=None):
         self.root = root
         self.args = args
+        self.dbg = dbg or NullDebug()
         root.title("cam_observe — UVC dark/defect + live stack + plate solve")
 
         self.q = queue.Queue()
@@ -650,6 +808,14 @@ class App:
                 self.var_exp.set(self.exp_rng["max"])
         self.dev_tag = usb_device_tag(dev)
         self._build_uvc_panel(dev)
+        self.dbg.log("probe", device=dev, identity=identify(dev),
+                     fourcc=self.fourcc,
+                     formats_ranked=[(f["fourcc"], f["fidelity_rank"])
+                                     for f in ranked],
+                     resolutions=self.sizes,
+                     exposure_range=self.exp_rng, dev_tag=self.dev_tag,
+                     data_dir=self.data_dir())
+        self.dbg.log("controls", device=dev, controls=query_controls(dev))
         self.log(f"{dev}: format {self.fourcc}, "
                  f"{len(self.sizes)} resolutions, "
                  f"device tag {self.dev_tag or '(none)'}")
@@ -684,6 +850,9 @@ class App:
                 except (tk.TclError, ValueError):
                     return
                 ok, err = cc.set_ctrl(dev, n, val)
+                rb = cc.get_ctrl(dev, n)
+                self.dbg.log("ctrl_set", name=n, value=val, ok=ok,
+                             readback=rb, error=err if not ok else "")
                 if not ok:
                     self.log(f"{n}={val} rejected: {err}")
 
@@ -734,6 +903,13 @@ class App:
                 self.master_exp = meta.get("exposure_units")
             except Exception:
                 pass
+        self.dbg.log(
+            "calibration_load", resolution=f"{w}x{h}", dir=d,
+            master_found=self.master_dark is not None,
+            master_stats=(frame_stats(self.master_dark)
+                          if self.master_dark is not None else None),
+            master_exposure_units=self.master_exp,
+            defects=0 if self.defects is None else len(self.defects))
         self._update_dark_label()
         if self.master_dark is not None:
             small, _ = downsample_to_fit(self.master_dark, CANVAS_W, CANVAS_H)
@@ -751,6 +927,7 @@ class App:
     # ---------------- mode / actions ----------------
 
     def on_mode_change(self):
+        self.dbg.log("ui", action="mode_change", mode=self.var_mode.get())
         if self.busy():
             self.on_stop()
         self._set_mode_banner()
@@ -790,6 +967,7 @@ class App:
         self.worker.start()
 
     def on_stop(self):
+        self.dbg.log("ui", action="stop")
         self.stop_evt.set()
         self.pause_evt.clear()
 
@@ -799,11 +977,16 @@ class App:
         if self.pause_evt.is_set():
             self.pause_evt.clear()
             self.btn_pause.configure(text="Pause integration")
+            self.dbg.log("pause", state="resumed",
+                         reset_stack=self.reset_on_resume)
             self.log("integration resumed"
                      + (" (stack reset)" if self.reset_on_resume else ""))
         else:
             self.pause_evt.set()
             self.btn_pause.configure(text="Resume integration")
+            self.dbg.log("pause", state="paused",
+                         stack_frames=self.stack_n,
+                         ref_stars=len(self.stars))
             self.log("integration PAUSED -- adjust the mount; star motion "
                      "arrows show where the field is going")
 
@@ -838,6 +1021,8 @@ class App:
         write_fits_u16(base + ".fits", stack)
         # float64 mean stack, unquantised, for offline noise-floor analysis
         np.save(base + ".npy", stack)
+        self.dbg.log("ui", action="save_stack", base=base,
+                     frames=self.stack_n, stack=frame_stats(stack))
         self.log(f"stack written to {base}.fits and .npy "
                  f"({self.stack_n} frames)")
 
@@ -859,7 +1044,8 @@ class App:
             target=lambda: self.q.put(
                 ("solved", solve_field(stack, self.var_solver.get(),
                                        float(self.var_sc_lo.get()),
-                                       float(self.var_sc_hi.get())))),
+                                       float(self.var_sc_hi.get()),
+                                       dbg=self.dbg))),
             daemon=True)
         t.start()
 
@@ -869,6 +1055,9 @@ class App:
         dev = self.var_dev.get()
         exp = self.exp_value
         cap = self.make_capture()
+        self.dbg.log("worker_start", kind="dark_acquire", device=dev,
+                     exposure_units=exp, frames_requested=total,
+                     resolution=self.var_res.get(), fourcc=self.fourcc)
         try:
             cc.set_ctrl(dev, "auto_exposure", 1)
             cc.set_ctrl(dev, "exposure_time_absolute", exp)
@@ -893,6 +1082,10 @@ class App:
                 # keeps mutating, and full-res frames are queue bloat anyway
                 msmall, _ = downsample_to_fit(mean, CANVAS_W, CANVAS_H)
                 lsmall, _ = downsample_to_fit(last, CANVAS_W, CANVAS_H)
+                self.dbg.log("dark_progress", frames=count, of=total,
+                             capture_s=round(cap.last_capture_s, 2),
+                             fps=round(cap.last_fps, 2),
+                             master=frame_stats(mean))
                 self.q.put(("progress", count, total,
                             msmall.copy(), lsmall.copy()))
             if mean is None:
@@ -900,11 +1093,15 @@ class App:
                 return
             hot = cc.hot_pixel_mask(mean)
             coords = np.argwhere(hot)
+            self.dbg.log("dark_done", frames=count, hot_pixels=len(coords),
+                         master=frame_stats(mean), exposure_units=exp)
             self.q.put(("dark_done", mean, coords, exp, count))
         except Exception as e:
+            self.dbg.exc("error", where="dark_worker")
             self.q.put(("log", f"dark acquisition failed: {e}"))
         finally:
             cap.close()
+            self.dbg.log("worker_end", kind="dark_acquire")
             self.q.put(("worker_done",))
 
     def _dark_preview_worker(self):
@@ -915,6 +1112,11 @@ class App:
         cap = self.make_capture()
         master = self.master_dark
         defects = self.defects
+        self.dbg.log("worker_start", kind="dark_preview", device=dev,
+                     exposure_units=self.exp_value,
+                     resolution=self.var_res.get(), fourcc=self.fourcc,
+                     master_loaded=master is not None,
+                     defects=0 if defects is None else len(defects))
         try:
             cc.set_ctrl(dev, "auto_exposure", 1)
             cc.set_ctrl(dev, "exposure_time_absolute", self.exp_value)
@@ -947,12 +1149,21 @@ class App:
                 else:
                     resid8 = None
                     stats = None
+                self.dbg.log(
+                    "burst", kind="dark_preview",
+                    exposure_units=cap.exposure,
+                    capture_s=round(cap.last_capture_s, 2),
+                    fps=round(cap.last_fps, 2), raw=frame_stats(last),
+                    residual=(frame_stats(resid) if master is not None
+                              else None))
                 self.q.put(("dark_preview", raw8, resid8, stats,
                             cap.last_fps))
         except Exception as e:
+            self.dbg.exc("error", where="dark_preview_worker")
             self.q.put(("log", f"dark preview failed: {e}"))
         finally:
             cap.close()
+            self.dbg.log("worker_end", kind="dark_preview")
             self.q.put(("worker_done",))
 
     def _light_worker(self):
@@ -972,6 +1183,13 @@ class App:
         align_ref = None
         pause_ref_stars = None
         was_paused = False
+        self.dbg.log("worker_start", kind="light", device=dev,
+                     exposure_units=self.exp_value,
+                     resolution=self.var_res.get(), fourcc=self.fourcc,
+                     subtract_dark=sub, repair_defects=fix, align=align,
+                     window_max=self.stack_max_value,
+                     master_exposure_units=self.master_exp,
+                     defects=0 if defects is None else len(defects))
         try:
             cc.set_ctrl(dev, "auto_exposure", 1)
             cc.set_ctrl(dev, "exposure_time_absolute", self.exp_value)
@@ -993,6 +1211,7 @@ class App:
 
                 last_raw = None
                 last_proc = None
+                last_shift = (0, 0)
                 for fr in cap.iter_luma(path, burst, discard=1):
                     if self.stop_evt.is_set():
                         break
@@ -1011,6 +1230,7 @@ class App:
                             align_ref = small.copy()
                         else:
                             dy, dx = phase_shift(align_ref, small)
+                            last_shift = (dy * f, dx * f)
                             if dy or dx:
                                 proc = np.roll(proc, (dy * f, dx * f),
                                                axis=(0, 1))
@@ -1036,10 +1256,16 @@ class App:
                     cur, _, _ = extract_stars(last_proc, nsigma=4.5,
                                               max_stars=40)
                     pairs = match_stars(pause_ref_stars or [], cur)
+                    summary = motion_summary(pairs)
                     _, stride = downsample_to_fit(last_raw,
                                                   CANVAS_W, CANVAS_H)
+                    self.dbg.log("pause", state="tracking",
+                                 detected=len(cur), matched=len(pairs),
+                                 motion=(dict(zip(
+                                     ("dx", "dy", "mag", "dir_deg"),
+                                     summary)) if summary else None))
                     self.q.put(("pause_update", raw8, pairs, stride,
-                                motion_summary(pairs), cap.last_fps))
+                                summary, cap.last_fps))
                     continue
 
                 if not ring:
@@ -1051,12 +1277,28 @@ class App:
                 self.stack_n = len(ring)
                 stars, bg, sigma = extract_stars(stack)
                 self.stars = stars
+                self.dbg.log(
+                    "burst", kind="light",
+                    exposure_units=cap.exposure,
+                    capture_s=round(cap.last_capture_s, 2),
+                    fps=round(cap.last_fps, 2),
+                    ring=len(ring), window_max=maxn,
+                    align_shift=list(last_shift),
+                    raw=frame_stats(last_raw), proc=frame_stats(last_proc),
+                    stack=frame_stats(stack),
+                    stars=len(stars), bg=round(bg, 3),
+                    sigma=round(sigma, 4),
+                    top_stars=[{k: s[k] for k in
+                                ("x", "y", "flux", "fwhm")}
+                               for s in stars[:3]])
                 self.q.put(("light_update", raw8, stack, stars,
                             len(ring), maxn, cap.last_fps, bg, sigma))
         except Exception as e:
+            self.dbg.exc("error", where="light_worker")
             self.q.put(("log", f"capture failed: {e}"))
         finally:
             cap.close()
+            self.dbg.log("worker_end", kind="light")
             self.q.put(("worker_done",))
 
     # ---------------- UI-thread event pump ----------------
@@ -1204,6 +1446,8 @@ class App:
                        "timestamp_utc":
                            datetime.now(timezone.utc).isoformat()}, fh,
                       indent=2)
+        self.dbg.log("dark_saved", master=mp, defects=dp, meta=jp,
+                     hot_pixels=int(len(coords)), exposure_units=exp)
         self.log(f"saved {mp}, {dp}, {jp}")
 
 
@@ -1217,11 +1461,24 @@ def main():
                          "cam_manager.py)")
     ap.add_argument("--solver", default="solve-field",
                     help="path to astrometry.net's solve-field")
+    ap.add_argument("--debug", action="store_true",
+                    help="write JSONL diagnostics suitable for LLM "
+                         "consumption (one self-describing event per line; "
+                         "schema in the first line)")
+    ap.add_argument("--debug-file", default=None,
+                    help="debug log path (default: "
+                         "{data-dir}/camobs_debug_<UTC>.jsonl)")
     args = ap.parse_args()
 
+    dbg = start_debug(args) if (args.debug or args.debug_file) else NullDebug()
+    if dbg.enabled:
+        print(f"debug log: {dbg.path}")
+
     root = tk.Tk()
-    App(root, args)
+    App(root, args, dbg)
     root.mainloop()
+    dbg.log("session_end")
+    dbg.close()
 
 
 if __name__ == "__main__":

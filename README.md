@@ -237,6 +237,13 @@ from solves at several RA-axis rotations is the planned refinement on top.)
 python3 cam_observe.py --device /dev/video0 --data-dir ~/.local/share/PHD2
 ```
 
+`--debug` writes JSONL diagnostics designed for LLM consumption: one
+self-describing event per line (probe results, control writes, a per-burst
+heartbeat with frame statistics before/after calibration, alignment shifts,
+pause-mode star tracking, solve command lines and output tails, tracebacks),
+with the schema and environment documented in the first line — paste the file
+into a model session and it can reconstruct what happened without the source.
+
 Point `--data-dir` at the PHD2 data dir and the darks/defect maps built here
 are the same files PHD2 auto-loads at camera connect.
 
