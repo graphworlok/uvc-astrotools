@@ -225,6 +225,11 @@ Drop that directory into the PHD2 data dir (e.g.
 `~/.local/share/PHD2/{idVendor}{idProduct}_{serial}/`). On camera connect PHD2
 matches the directory by USB ID and the file by frame size, then:
 
+- **Converts the master into the camera's live pixel domain.** The .npy is
+  stored at 16-bit full scale, but PHD2 does not normalise camera data by bit
+  depth — an 8-bit capture path delivers raw 0–255 values — so the import
+  rescales the master (and the model bias) by the connected camera's bit depth
+  before any subtraction.
 - **Scales the master dark to each guide exposure.** Because the dark-current
   fit gives the per-pixel slope, the single deep master at `exposure_max` is
   scaled down to every exposure in PHD2's list — `dark(E) = bias +
