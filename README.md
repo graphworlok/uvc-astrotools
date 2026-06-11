@@ -193,21 +193,37 @@ from exposure dependence.
 ## GUI observing tool (`cam_observe.py`)
 
 A standalone tkinter GUI (numpy + stdlib only) around the same capture and
-analysis stack, with two explicitly user-declared modes — the tool cannot know
-whether the lens is capped, so the human says so via a banner toggle:
+analysis stack. The raw stream is always shown; the second display window is
+mode-aware. Two explicitly user-declared modes — the tool cannot know whether
+the lens is capped, so the human says so via a banner toggle:
 
-- **DARK mode** — acquire a deep master dark (streaming per-pixel mean) and
-  derive a hot-pixel defect map, written in exactly the per-device layout the
-  other tools use (`{vid+pid[_serial]}/master_WxH.npy` ×257 uint16,
+- **DARK mode** — the raw stream beside the **dark-corrected residual** at a
+  fixed stretch (deliberately not auto-stretched: a perfect correction should
+  *look* black, with residual mean/σ/max stats saying how close it is).
+  Acquire a deep master dark (streaming per-pixel mean) and derive a
+  hot-pixel defect map, written in exactly the per-device layout the other
+  tools use (`{vid+pid[_serial]}/master_WxH.npy` ×257 uint16,
   `defects_WxH.txt`, plus a `dark_meta_WxH.json` sidecar recording the
   exposure). Existing files for the device + resolution load automatically.
-- **LIGHT mode** — continuous capture: dark-subtract → defect-repair →
-  optional translation alignment (phase correlation) → mean stack. Stars are
-  extracted from the stack (robust MAD background, connected components →
-  sub-pixel centroids, flux, FWHM) and overlaid on the display. A noise
-  readout shows the measured single-frame→stack noise reduction against the
-  theoretical √N — the figure of merit when mining the noise floor with no
-  stars at all.
+- **LIGHT mode** — the raw stream beside the **integrated stack**:
+  dark-subtract → defect-repair → optional translation alignment (phase
+  correlation) → a **rolling integration window of N frames**, with N visible
+  and changeable and the `k/N` count displayed live. Stars are extracted from
+  the stack (robust MAD background, connected components → sub-pixel
+  centroids, flux, FWHM) and overlaid on the display, with a noise readout —
+  the figure of merit when mining the noise floor with no stars at all.
+
+**Pause integration** freezes stacking while capture and display continue —
+for when the sensor is about to move, e.g. adjusting an equatorial mount's
+altitude/azimuth bolts. While paused, stars detected in the live frames are
+matched to their pre-pause stack positions and drawn as **motion arrows**,
+with a median displacement/direction readout: live feedback on where the
+field is going during polar alignment. Resume optionally resets the stack
+(the old integration is invalid once the sensor has moved).
+
+The UVC processing controls the device actually exposes (gain, gamma,
+brightness, contrast, sharpness, saturation) are presented with their real
+ranges after probing and applied live; exposure is adjustable mid-capture.
 
 Plate solving runs a local astrometry.net (`solve-field`) on the stack
 (written as linear 16-bit FITS), manually or on an auto-solve timer once

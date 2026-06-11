@@ -6,21 +6,34 @@ cam_characterise.py measurement stack.
 Two operating modes, switched explicitly by the user (the tool cannot know if
 the lens is capped, so the human says so):
 
-  DARK  -- the lens is capped. Acquire a deep master dark (streaming per-pixel
-           mean) and derive a hot-pixel defect map from it, in exactly the
+  DARK  -- the lens is capped. The raw stream is shown beside the
+           dark-corrected residual (frame minus master dark at a FIXED
+           stretch -- ideally complete blackness, and the residual stats say
+           how close to ideal it is). Acquire a deep master dark (streaming
+           per-pixel mean) and derive a hot-pixel defect map, in exactly the
            per-device format cam_manager.py plans and PHD2 auto-loads:
            {vid+pid[_serial]}/master_WxH.npy (uint16 x257) and defects_WxH.txt.
            Existing files for the device+resolution are loaded automatically.
 
-  LIGHT -- the camera can see photons. Frames are continuously captured,
-           dark-subtracted, defect-repaired, optionally aligned by phase
-           correlation, and stacked. Stars are extracted from the stack
-           (robust background + connected components -> centroid/flux/FWHM)
-           and the stack can be written to FITS and plate-solved with a local
-           astrometry.net installation (solve-field).
+  LIGHT -- the camera can see photons. The raw stream is shown beside the
+           integrated stack: frames are dark-subtracted, defect-repaired,
+           optionally aligned by phase correlation, and integrated over a
+           ROLLING window of N frames (N visible and changeable). Stars are
+           extracted from the stack (robust background + connected
+           components -> centroid/flux/FWHM) and the stack can be written to
+           FITS / npy and plate-solved with a local astrometry.net
+           installation (solve-field), manually or on an auto-solve timer.
 
-Display: live frame and stack side by side, auto-stretched, with extracted
-stars overlaid on the stack.
+           "Pause integration" freezes stacking (capture and display keep
+           running) for when the sensor is about to move -- e.g. adjusting an
+           equatorial mount's altitude/azimuth. While paused, stars detected
+           in the live frames are matched against their pre-pause positions
+           and drawn as motion arrows with a median displacement readout:
+           live feedback on where the field is going during polar alignment.
+
+The V4L2/UVC processing controls the device actually exposes (gain, gamma,
+brightness, contrast, sharpness, saturation) are presented with their real
+ranges and applied live.
 
 Requires: Linux, v4l2-ctl, numpy, tkinter. Plate solving needs solve-field
 (astrometry.net) plus index files on the local machine.
@@ -32,6 +45,7 @@ Usage:
 import argparse
 import glob
 import json
+import math
 import os
 import queue
 import re
@@ -41,6 +55,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 
 import numpy as np
@@ -48,7 +63,7 @@ import tkinter as tk
 from tkinter import ttk
 
 import cam_characterise as cc
-from cam_manager import usb_device_tag, query_formats
+from cam_manager import usb_device_tag, query_formats, query_controls
 
 
 # ----------------------------------------------------------------------------
@@ -62,6 +77,13 @@ def stretch_to_u8(img, lo_pct=0.5, hi_pct=99.7):
         hi = lo + 1.0
     out = (img - lo) * (255.0 / (hi - lo))
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def residual_to_u8(resid, gain=8.0):
+    """FIXED-stretch display for the dark-corrected residual: 0 ADU is black,
+    255/gain ADU is white. Deliberately NOT auto-stretched -- a perfect
+    correction should LOOK black, not have its nothingness amplified."""
+    return np.clip(resid * gain, 0, 255).astype(np.uint8)
 
 
 def pgm_bytes(img8):
@@ -201,6 +223,43 @@ def extract_stars(img, nsigma=5.0, min_pix=2, max_pix=500, max_stars=100):
     return stars[:max_stars], bg, sigma
 
 
+def match_stars(ref_stars, cur_stars, max_dist=80.0):
+    """Greedy nearest-neighbour matching of current star detections to a
+    reference list. Returns [(rx, ry, cx, cy), ...] for matched pairs --
+    the motion vectors drawn while integration is paused."""
+    pairs = []
+    used = set()
+    for r in ref_stars:
+        best_j = None
+        best_d = max_dist
+        for j, c in enumerate(cur_stars):
+            if j in used:
+                continue
+            d = math.hypot(c["x"] - r["x"], c["y"] - r["y"])
+            if d < best_d:
+                best_d = d
+                best_j = j
+        if best_j is not None:
+            used.add(best_j)
+            c = cur_stars[best_j]
+            pairs.append((r["x"], r["y"], c["x"], c["y"]))
+    return pairs
+
+
+def motion_summary(pairs):
+    """Median displacement of matched star pairs: (dx, dy, magnitude,
+    direction in degrees with 0=right(+x), 90=up)."""
+    if not pairs:
+        return None
+    dxs = np.array([p[2] - p[0] for p in pairs])
+    dys = np.array([p[3] - p[1] for p in pairs])
+    mdx = float(np.median(dxs))
+    mdy = float(np.median(dys))
+    mag = math.hypot(mdx, mdy)
+    ang = math.degrees(math.atan2(-mdy, mdx)) % 360.0  # screen y is down
+    return mdx, mdy, mag, ang
+
+
 # ----------------------------------------------------------------------------
 # Plate solving (local astrometry.net)
 # ----------------------------------------------------------------------------
@@ -277,10 +336,15 @@ def pole_offset_text(ra, dec):
 
 CANVAS_W, CANVAS_H = 480, 360
 
-DARK_BANNER = ("DARK MODE — lens capped: build / hold the master dark",
+DARK_BANNER = ("DARK MODE — lens capped: build / verify the master dark",
                "#1c1c1c", "#e0e0e0")
-LIGHT_BANNER = ("LIGHT MODE — capturing photons: stacking and extracting",
+LIGHT_BANNER = ("LIGHT MODE — capturing photons: integrating and extracting",
                 "#143a63", "#ffffff")
+
+# UVC processing controls surfaced in the settings panel (when the device
+# actually has them); exposure has its own dedicated control
+UVC_PANEL_CTRLS = ("gain", "gamma", "brightness", "contrast",
+                   "sharpness", "saturation")
 
 
 class App:
@@ -291,24 +355,27 @@ class App:
 
         self.q = queue.Queue()
         self.stop_evt = threading.Event()
-        self.worker = None          # the active capture thread (dark or light)
+        self.pause_evt = threading.Event()
+        self.worker = None          # the active capture thread (any kind)
 
         # camera state (set by Probe)
         self.fourcc = None
         self.sizes = []             # [(w, h), ...]
         self.exp_rng = {}
         self.dev_tag = ""
+        self.exp_value = 1024      # mirrored from the Tk var on the UI thread
+        self.stack_max_value = 32  # so workers never touch Tk variables
+        self.reset_on_resume = True
 
         # calibration state
         self.master_dark = None     # float64 luma 0-255 at current resolution
         self.master_exp = None      # exposure units the master was built at
         self.defects = None         # np.ndarray [[y, x], ...]
 
-        # stack state (touched only by the light worker + reset on UI thread
-        # while no worker is running)
+        # stack state (written by the light worker; UI reads snapshots
+        # passed through the queue)
         self.stack_sum = None
         self.stack_n = 0
-        self.align_ref = None
         self.stars = []
 
         self._photo_live = None     # keep references or Tk drops the images
@@ -330,15 +397,17 @@ class App:
 
         disp = tk.Frame(self.root)
         disp.pack(fill="both", expand=True, padx=4, pady=4)
-        lf = tk.LabelFrame(disp, text="Live frame")
-        lf.pack(side="left", padx=2)
-        self.canvas_live = tk.Canvas(lf, width=CANVAS_W, height=CANVAS_H,
-                                     bg="black", highlightthickness=0)
+        self.lf_left = tk.LabelFrame(disp, text="Raw stream")
+        self.lf_left.pack(side="left", padx=2)
+        self.canvas_live = tk.Canvas(self.lf_left, width=CANVAS_W,
+                                     height=CANVAS_H, bg="black",
+                                     highlightthickness=0)
         self.canvas_live.pack()
-        sf = tk.LabelFrame(disp, text="Stack / master dark")
-        sf.pack(side="left", padx=2)
-        self.canvas_stack = tk.Canvas(sf, width=CANVAS_W, height=CANVAS_H,
-                                      bg="black", highlightthickness=0)
+        self.lf_right = tk.LabelFrame(disp, text="Dark-corrected residual")
+        self.lf_right.pack(side="left", padx=2)
+        self.canvas_stack = tk.Canvas(self.lf_right, width=CANVAS_W,
+                                      height=CANVAS_H, bg="black",
+                                      highlightthickness=0)
         self.canvas_stack.pack()
 
         ctl = tk.Frame(self.root)
@@ -362,12 +431,20 @@ class App:
         self.cmb_res.pack(side="left", padx=2)
         self.cmb_res.bind("<<ComboboxSelected>>", lambda e: self.on_res_change())
         tk.Label(r0, text="Exposure (100µs units):").pack(side="left")
-        self.var_exp = tk.IntVar(value=1024)
+        self.var_exp = tk.IntVar(value=self.exp_value)
+        self.var_exp.trace_add("write", self._on_exp_change)
         self.spn_exp = tk.Spinbox(r0, from_=1, to=65535, width=7,
                                   textvariable=self.var_exp)
         self.spn_exp.pack(side="left", padx=2)
         self.lbl_exp_rng = tk.Label(r0, text="")
         self.lbl_exp_rng.pack(side="left")
+
+        # row 0b: UVC processing controls, populated after Probe with the
+        # device's REAL controls and ranges
+        self.frm_uvc = tk.Frame(ctl)
+        self.frm_uvc.pack(fill="x", pady=2)
+        tk.Label(self.frm_uvc, text="UVC controls: (probe a device)"
+                 ).pack(side="left")
 
         # row 1: mode + dark controls
         r1 = tk.Frame(ctl); r1.pack(fill="x", pady=2)
@@ -379,49 +456,67 @@ class App:
         tk.Radiobutton(r1, text="LIGHT (capturing photons)", value="light",
                        variable=self.var_mode,
                        command=self.on_mode_change).pack(side="left", padx=4)
+        self.btn_start = tk.Button(r1, text="Start", command=self.on_start,
+                                   state="disabled")
+        self.btn_start.pack(side="left", padx=8)
+        self.btn_stop = tk.Button(r1, text="Stop", command=self.on_stop,
+                                  state="disabled")
+        self.btn_stop.pack(side="left")
         tk.Label(r1, text="   Dark frames:").pack(side="left")
         self.var_dark_n = tk.IntVar(value=64)
         tk.Spinbox(r1, from_=8, to=1024, width=5,
                    textvariable=self.var_dark_n).pack(side="left")
         self.btn_dark = tk.Button(r1, text="Acquire master dark",
-                                  command=self.on_acquire_dark)
+                                  command=self.on_acquire_dark,
+                                  state="disabled")
         self.btn_dark.pack(side="left", padx=4)
-        self.prg = ttk.Progressbar(r1, length=140, mode="determinate")
+        self.prg = ttk.Progressbar(r1, length=120, mode="determinate")
         self.prg.pack(side="left", padx=4)
         self.lbl_dark = tk.Label(r1, text="no master dark")
         self.lbl_dark.pack(side="left")
 
-        # row 2: light controls
+        # row 2: integration controls
         r2 = tk.Frame(ctl); r2.pack(fill="x", pady=2)
-        self.btn_start = tk.Button(r2, text="Start capture",
-                                   command=self.on_start_light,
-                                   state="disabled")
-        self.btn_start.pack(side="left")
-        self.btn_stop = tk.Button(r2, text="Stop", command=self.on_stop,
-                                  state="disabled")
-        self.btn_stop.pack(side="left", padx=4)
+        tk.Label(r2, text="Integrate (rolling):").pack(side="left")
+        self.var_stack_max = tk.IntVar(value=self.stack_max_value)
+        self.var_stack_max.trace_add("write", self._on_stack_max_change)
+        tk.Spinbox(r2, from_=2, to=1024, width=5,
+                   textvariable=self.var_stack_max).pack(side="left")
+        tk.Label(r2, text="frames").pack(side="left")
         self.var_sub = tk.BooleanVar(value=True)
         self.var_fix = tk.BooleanVar(value=True)
         self.var_align = tk.BooleanVar(value=True)
         tk.Checkbutton(r2, text="subtract dark",
-                       variable=self.var_sub).pack(side="left")
+                       variable=self.var_sub).pack(side="left", padx=2)
         tk.Checkbutton(r2, text="repair defects",
                        variable=self.var_fix).pack(side="left")
         tk.Checkbutton(r2, text="align (phase corr.)",
                        variable=self.var_align).pack(side="left")
+        self.btn_pause = tk.Button(r2, text="Pause integration",
+                                   command=self.on_pause, state="disabled")
+        self.btn_pause.pack(side="left", padx=8)
+        self.var_reset_resume = tk.BooleanVar(value=True)
+        self.var_reset_resume.trace_add(
+            "write", lambda *a: setattr(self, "reset_on_resume",
+                                        bool(self.var_reset_resume.get())))
+        tk.Checkbutton(r2, text="reset stack on resume",
+                       variable=self.var_reset_resume).pack(side="left")
         self.btn_reset = tk.Button(r2, text="Reset stack",
                                    command=self.on_reset_stack)
         self.btn_reset.pack(side="left", padx=8)
-        self.lbl_stack = tk.Label(r2, text="stack: 0 frames")
+
+        # row 2b: integration status
+        r2b = tk.Frame(ctl); r2b.pack(fill="x", pady=1)
+        self.lbl_stack = tk.Label(r2b, text="integrating: 0 frames")
         self.lbl_stack.pack(side="left", padx=4)
-        self.lbl_stars = tk.Label(r2, text="stars: -")
-        self.lbl_stars.pack(side="left", padx=4)
+        self.lbl_stars = tk.Label(r2b, text="stars: -")
+        self.lbl_stars.pack(side="left", padx=8)
 
         # row 3: solving
         r3 = tk.Frame(ctl); r3.pack(fill="x", pady=2)
         tk.Label(r3, text="solve-field:").pack(side="left")
         self.var_solver = tk.StringVar(value=self.args.solver)
-        tk.Entry(r3, textvariable=self.var_solver, width=18).pack(side="left")
+        tk.Entry(r3, textvariable=self.var_solver, width=16).pack(side="left")
         tk.Label(r3, text="scale arcsec/px low/high:").pack(side="left")
         self.var_sc_lo = tk.DoubleVar(value=0.0)
         self.var_sc_hi = tk.DoubleVar(value=0.0)
@@ -452,11 +547,11 @@ class App:
         self.lbl_solve.pack(side="left", fill="x")
 
         # log
-        self.txt = tk.Text(self.root, height=8, state="disabled",
+        self.txt = tk.Text(self.root, height=7, state="disabled",
                            font=("TkFixedFont", 9))
         self.txt.pack(fill="x", padx=4, pady=4)
 
-    # ---------------- helpers ----------------
+    # ---------------- small helpers ----------------
 
     def log(self, msg):
         self.txt.configure(state="normal")
@@ -464,10 +559,24 @@ class App:
         self.txt.see("end")
         self.txt.configure(state="disabled")
 
+    def _on_exp_change(self, *a):
+        try:
+            self.exp_value = int(self.var_exp.get())
+        except (tk.TclError, ValueError):
+            pass
+
+    def _on_stack_max_change(self, *a):
+        try:
+            self.stack_max_value = max(2, int(self.var_stack_max.get()))
+        except (tk.TclError, ValueError):
+            pass
+
     def _set_mode_banner(self):
-        text, bg, fg = DARK_BANNER if self.var_mode.get() == "dark" \
-            else LIGHT_BANNER
+        dark = self.var_mode.get() == "dark"
+        text, bg, fg = DARK_BANNER if dark else LIGHT_BANNER
         self.banner.configure(text=text, bg=bg, fg=fg)
+        self.lf_right.configure(
+            text="Dark-corrected residual" if dark else "Integrated stack")
 
     def current_size(self):
         m = re.match(r"(\d+)x(\d+)", self.var_res.get() or "")
@@ -482,13 +591,13 @@ class App:
     def make_capture(self):
         w, h = self.current_size()
         cap = cc.Capture(self.var_dev.get(), w, h, self.fourcc)
-        cap.exposure = int(self.var_exp.get())
+        cap.exposure = self.exp_value
         return cap
 
     def busy(self):
         return self.worker is not None and self.worker.is_alive()
 
-    def _show(self, canvas, img8, which, stars=None, stride=1):
+    def _show(self, canvas, img8, which, stars=None, stride=1, vectors=None):
         photo = tk.PhotoImage(data=pgm_bytes(img8))
         canvas.delete("all")
         canvas.create_image(0, 0, image=photo, anchor="nw")
@@ -497,6 +606,11 @@ class App:
                 x, y = s["x"] / stride, s["y"] / stride
                 canvas.create_oval(x - 6, y - 6, x + 6, y + 6,
                                    outline="#00ff60")
+        if vectors:
+            for rx, ry, cx, cy in vectors[:50]:
+                canvas.create_line(rx / stride, ry / stride,
+                                   cx / stride, cy / stride,
+                                   fill="#ffd000", width=2, arrow=tk.LAST)
         if which == "live":
             self._photo_live = photo
         else:
@@ -523,8 +637,7 @@ class App:
             if f["fourcc"] == self.fourcc:
                 sizes = [(s["w"], s["h"]) for s in f["sizes"]]
         if not sizes:
-            w, h = 640, 480
-            sizes = [(w, h)]
+            sizes = [(640, 480)]
         self.sizes = sorted(set(sizes))
         self.cmb_res["values"] = [f"{w}x{h}" for w, h in self.sizes]
         self.var_res.set(f"{self.sizes[0][0]}x{self.sizes[0][1]}")
@@ -536,11 +649,48 @@ class App:
             if self.exp_rng.get("max"):
                 self.var_exp.set(self.exp_rng["max"])
         self.dev_tag = usb_device_tag(dev)
+        self._build_uvc_panel(dev)
         self.log(f"{dev}: format {self.fourcc}, "
                  f"{len(self.sizes)} resolutions, "
                  f"device tag {self.dev_tag or '(none)'}")
         self.on_res_change()
         self.btn_start.configure(state="normal")
+        self.btn_dark.configure(state="normal")
+
+    def _build_uvc_panel(self, dev):
+        """Populate the UVC controls row with the device's REAL processing
+        controls and ranges; values apply immediately via v4l2-ctl."""
+        for w in self.frm_uvc.winfo_children():
+            w.destroy()
+        ctrls = query_controls(dev)
+        present = [c for c in UVC_PANEL_CTRLS if c in ctrls]
+        if not present:
+            tk.Label(self.frm_uvc,
+                     text="UVC controls: none exposed by device"
+                     ).pack(side="left")
+            return
+        tk.Label(self.frm_uvc, text="UVC controls:").pack(side="left")
+        for name in present:
+            d = ctrls[name]
+            lo = d.get("min", 0)
+            hi = d.get("max", 255)
+            cur = d.get("value", d.get("default", lo))
+            tk.Label(self.frm_uvc, text=f"  {name}").pack(side="left")
+            var = tk.IntVar(value=cur)
+
+            def apply(n=name, v=var):
+                try:
+                    val = int(v.get())
+                except (tk.TclError, ValueError):
+                    return
+                ok, err = cc.set_ctrl(dev, n, val)
+                if not ok:
+                    self.log(f"{n}={val} rejected: {err}")
+
+            spn = tk.Spinbox(self.frm_uvc, from_=lo, to=hi, width=6,
+                             textvariable=var, command=apply)
+            spn.bind("<Return>", lambda e, fn=apply: fn())
+            spn.pack(side="left")
 
     def on_res_change(self):
         self.master_dark = None
@@ -601,59 +751,81 @@ class App:
     # ---------------- mode / actions ----------------
 
     def on_mode_change(self):
-        if self.var_mode.get() == "dark" and self.busy():
+        if self.busy():
             self.on_stop()
         self._set_mode_banner()
 
     def on_reset_stack(self):
-        if self.busy():
-            return
         self.stack_sum = None
         self.stack_n = 0
-        self.align_ref = None
         self.stars = []
-        self.lbl_stack.configure(text="stack: 0 frames")
+        self.lbl_stack.configure(text="integrating: 0 frames")
         self.lbl_stars.configure(text="stars: -")
         self.btn_solve.configure(state="disabled")
         self.btn_fits.configure(state="disabled")
 
-    def on_acquire_dark(self):
+    def on_start(self):
         if self.busy() or self.fourcc is None:
-            self.log("probe a device first / wait for the current task")
             return
-        if self.var_mode.get() != "dark":
-            self.log("switch to DARK mode (and cap the lens) first")
-            return
-        n = int(self.var_dark_n.get())
         self.stop_evt.clear()
-        self.btn_dark.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
-        self.worker = threading.Thread(target=self._dark_worker, args=(n,),
-                                       daemon=True)
-        self.worker.start()
-
-    def on_start_light(self):
-        if self.busy() or self.fourcc is None:
-            self.log("probe a device first / wait for the current task")
-            return
-        if self.var_mode.get() != "light":
-            self.var_mode.set("light")
-            self._set_mode_banner()
-        self.on_reset_stack()
-        exp = int(self.var_exp.get())
-        if self.master_dark is not None and self.master_exp \
-                and exp != self.master_exp and self.var_sub.get():
-            self.log(f"NOTE: master dark was built at exposure "
-                     f"{self.master_exp}, capturing at {exp} -- "
-                     "subtraction will be biased")
-        self.stop_evt.clear()
+        self.pause_evt.clear()
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        self.worker = threading.Thread(target=self._light_worker, daemon=True)
+        if self.var_mode.get() == "dark":
+            self.worker = threading.Thread(target=self._dark_preview_worker,
+                                           daemon=True)
+            self.log("dark preview: raw vs dark-corrected residual "
+                     "(fixed stretch x8 -- correction should look black)")
+        else:
+            self.on_reset_stack()
+            exp = self.exp_value
+            if self.master_dark is not None and self.master_exp \
+                    and exp != self.master_exp and self.var_sub.get():
+                self.log(f"NOTE: master dark was built at exposure "
+                         f"{self.master_exp}, capturing at {exp} -- "
+                         "subtraction will be biased")
+            self.btn_pause.configure(state="normal")
+            self.worker = threading.Thread(target=self._light_worker,
+                                           daemon=True)
         self.worker.start()
 
     def on_stop(self):
         self.stop_evt.set()
+        self.pause_evt.clear()
+
+    def on_pause(self):
+        if not self.busy():
+            return
+        if self.pause_evt.is_set():
+            self.pause_evt.clear()
+            self.btn_pause.configure(text="Pause integration")
+            self.log("integration resumed"
+                     + (" (stack reset)" if self.reset_on_resume else ""))
+        else:
+            self.pause_evt.set()
+            self.btn_pause.configure(text="Resume integration")
+            self.log("integration PAUSED -- adjust the mount; star motion "
+                     "arrows show where the field is going")
+
+    def on_acquire_dark(self):
+        if self.fourcc is None:
+            self.log("probe a device first")
+            return
+        if self.var_mode.get() != "dark":
+            self.log("switch to DARK mode (and cap the lens) first")
+            return
+        if self.busy():
+            self.on_stop()
+            self.worker.join(timeout=10)
+        n = int(self.var_dark_n.get())
+        self.stop_evt.clear()
+        self.btn_dark.configure(state="disabled")
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.lf_right.configure(text="Master dark (accumulating)")
+        self.worker = threading.Thread(target=self._dark_worker, args=(n,),
+                                       daemon=True)
+        self.worker.start()
 
     def on_save_fits(self):
         if self.stack_sum is None or self.stack_n == 0:
@@ -695,7 +867,7 @@ class App:
 
     def _dark_worker(self, total):
         dev = self.var_dev.get()
-        exp = int(self.var_exp.get())
+        exp = self.exp_value
         cap = self.make_capture()
         try:
             cc.set_ctrl(dev, "auto_exposure", 1)
@@ -706,19 +878,23 @@ class App:
                 burst = min(16, total - count)
                 path, _, _ = cap.capture_run(burst, discard=1,
                                              timeout=30.0, verbose=False)
+                last = None
                 for fr in cap.iter_luma(path, burst, discard=1):
                     count += 1
                     if mean is None:
                         mean = np.zeros_like(fr)
                     mean += (fr - mean) / count
+                    last = fr
                 try:
                     os.remove(path)
                 except OSError:
                     pass
-                # downsampled COPY: the UI must not read the array this loop
-                # keeps mutating, and a full-res frame is queue bloat anyway
-                small, _ = downsample_to_fit(mean, CANVAS_W, CANVAS_H)
-                self.q.put(("progress", count, total, small.copy()))
+                # downsampled COPIES: the UI must not read arrays this loop
+                # keeps mutating, and full-res frames are queue bloat anyway
+                msmall, _ = downsample_to_fit(mean, CANVAS_W, CANVAS_H)
+                lsmall, _ = downsample_to_fit(last, CANVAS_W, CANVAS_H)
+                self.q.put(("progress", count, total,
+                            msmall.copy(), lsmall.copy()))
             if mean is None:
                 self.q.put(("log", "dark acquisition produced no frames"))
                 return
@@ -731,9 +907,56 @@ class App:
             cap.close()
             self.q.put(("worker_done",))
 
+    def _dark_preview_worker(self):
+        """Continuous DARK-mode preview: raw stream + dark-corrected residual
+        at a fixed stretch (ideally complete blackness), with residual stats
+        saying how close to ideal the correction is."""
+        dev = self.var_dev.get()
+        cap = self.make_capture()
+        master = self.master_dark
+        defects = self.defects
+        try:
+            cc.set_ctrl(dev, "auto_exposure", 1)
+            cc.set_ctrl(dev, "exposure_time_absolute", self.exp_value)
+            while not self.stop_evt.is_set():
+                cap.exposure = self.exp_value  # live-adjustable
+                path, _, _ = cap.capture_run(4, discard=1,
+                                             timeout=60.0, verbose=False)
+                last = None
+                for fr in cap.iter_luma(path, 4, discard=1):
+                    last = fr
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                if last is None:
+                    continue
+                raw_small, _ = downsample_to_fit(last, CANVAS_W, CANVAS_H)
+                raw8 = stretch_to_u8(raw_small)
+                if master is not None:
+                    resid = last - master
+                    if defects is not None and len(defects):
+                        repair_defects(resid, defects)
+                    rs, _ = downsample_to_fit(np.clip(resid, 0, None),
+                                              CANVAS_W, CANVAS_H)
+                    resid8 = residual_to_u8(rs)
+                    stats = (float(resid.mean()),
+                             float(1.4826 * np.median(np.abs(
+                                 resid - np.median(resid)))),
+                             float(resid.max()))
+                else:
+                    resid8 = None
+                    stats = None
+                self.q.put(("dark_preview", raw8, resid8, stats,
+                            cap.last_fps))
+        except Exception as e:
+            self.q.put(("log", f"dark preview failed: {e}"))
+        finally:
+            cap.close()
+            self.q.put(("worker_done",))
+
     def _light_worker(self):
         dev = self.var_dev.get()
-        exp = int(self.var_exp.get())
         sub = self.var_sub.get() and self.master_dark is not None
         fix = self.var_fix.get() and self.defects is not None \
             and len(self.defects) > 0
@@ -742,13 +965,34 @@ class App:
         defects = self.defects
         cap = self.make_capture()
         burst = 6
+        # rolling integration: ring buffer of the last N processed frames
+        # (float32 to halve memory), running float64 sum for O(1) update
+        ring = deque()
+        ssum = None
+        align_ref = None
+        pause_ref_stars = None
+        was_paused = False
         try:
             cc.set_ctrl(dev, "auto_exposure", 1)
-            cc.set_ctrl(dev, "exposure_time_absolute", exp)
+            cc.set_ctrl(dev, "exposure_time_absolute", self.exp_value)
             while not self.stop_evt.is_set():
+                cap.exposure = self.exp_value  # live-adjustable
+                maxn = self.stack_max_value
                 path, _, _ = cap.capture_run(burst, discard=1,
                                              timeout=60.0, verbose=False)
-                last = None
+                paused = self.pause_evt.is_set()
+                if paused and not was_paused:
+                    pause_ref_stars = list(self.stars)  # pre-pause positions
+                if was_paused and not paused:
+                    pause_ref_stars = None
+                    if self.reset_on_resume:
+                        ring.clear()
+                        ssum = None
+                        align_ref = None
+                was_paused = paused
+
+                last_raw = None
+                last_proc = None
                 for fr in cap.iter_luma(path, burst, discard=1):
                     if self.stop_evt.is_set():
                         break
@@ -757,33 +1001,58 @@ class App:
                         proc = np.clip(fr - master, 0.0, None)
                     if fix:
                         proc = repair_defects(proc.copy(), defects)
+                    last_raw = fr
+                    last_proc = proc
+                    if paused:
+                        continue          # display only; no integration
                     if align:
                         small, f = downsample_to_fit(proc, 256, 256)
-                        if self.align_ref is None:
-                            self.align_ref = small
+                        if align_ref is None:
+                            align_ref = small.copy()
                         else:
-                            dy, dx = phase_shift(self.align_ref, small)
+                            dy, dx = phase_shift(align_ref, small)
                             if dy or dx:
                                 proc = np.roll(proc, (dy * f, dx * f),
                                                axis=(0, 1))
-                    if self.stack_sum is None:
-                        self.stack_sum = proc.astype(np.float64)
-                        self.stack_n = 1
-                    else:
-                        self.stack_sum += proc
-                        self.stack_n += 1
-                    last = fr
+                    f32 = proc.astype(np.float32)
+                    while len(ring) >= maxn:   # window shrink also handled
+                        ssum -= ring.popleft()
+                    ring.append(f32)
+                    ssum = f32.astype(np.float64) if ssum is None \
+                        else ssum + f32
                 try:
                     os.remove(path)
                 except OSError:
                     pass
-                if last is None:
+                if last_raw is None:
                     continue
-                stack = self.stack_sum / self.stack_n
+
+                raw_small, _ = downsample_to_fit(last_raw, CANVAS_W, CANVAS_H)
+                raw8 = stretch_to_u8(raw_small)
+
+                if paused:
+                    # star-motion feedback: match live-frame detections to
+                    # the pre-pause stack positions, draw the vectors
+                    cur, _, _ = extract_stars(last_proc, nsigma=4.5,
+                                              max_stars=40)
+                    pairs = match_stars(pause_ref_stars or [], cur)
+                    _, stride = downsample_to_fit(last_raw,
+                                                  CANVAS_W, CANVAS_H)
+                    self.q.put(("pause_update", raw8, pairs, stride,
+                                motion_summary(pairs), cap.last_fps))
+                    continue
+
+                if not ring:
+                    continue
+                stack = ssum / len(ring)
+                # publish for solve/save (UI thread reads these between
+                # queue messages; assignment is atomic under the GIL)
+                self.stack_sum = ssum
+                self.stack_n = len(ring)
                 stars, bg, sigma = extract_stars(stack)
                 self.stars = stars
-                self.q.put(("light_update", last, stack, stars,
-                            self.stack_n, cap.last_fps, bg, sigma))
+                self.q.put(("light_update", raw8, stack, stars,
+                            len(ring), maxn, cap.last_fps, bg, sigma))
         except Exception as e:
             self.q.put(("log", f"capture failed: {e}"))
         finally:
@@ -806,10 +1075,25 @@ class App:
         if kind == "log":
             self.log(msg[1])
         elif kind == "progress":
-            _, count, total, small = msg
+            _, count, total, msmall, lsmall = msg
             self.prg["maximum"] = total
             self.prg["value"] = count
-            self._show(self.canvas_stack, stretch_to_u8(small), "stack")
+            self._show(self.canvas_live, stretch_to_u8(lsmall), "live")
+            self._show(self.canvas_stack, stretch_to_u8(msmall), "stack")
+        elif kind == "dark_preview":
+            _, raw8, resid8, stats, fps = msg
+            self._show(self.canvas_live, raw8, "live")
+            if resid8 is not None:
+                self._show(self.canvas_stack, resid8, "stack")
+                mean, sigma, mx = stats
+                self.lbl_stack.configure(
+                    text=f"residual: mean {mean:+.2f} σ {sigma:.2f} "
+                         f"max {mx:.1f} ADU @ {fps:.1f} fps "
+                         f"(ideal: all ~0)")
+            else:
+                self.lbl_stack.configure(
+                    text=f"@ {fps:.1f} fps -- no master dark: corrected "
+                         "view unavailable (acquire one)")
         elif kind == "dark_done":
             _, mean, coords, exp, count = msg
             self.master_dark = mean
@@ -819,22 +1103,40 @@ class App:
             self._update_dark_label()
             self.log(f"master dark: {count} frames, "
                      f"{len(coords)} hot pixels")
+            self.lf_right.configure(text="Dark-corrected residual")
+        elif kind == "pause_update":
+            _, raw8, pairs, stride, summary, fps = msg
+            self._show(self.canvas_live, raw8, "live",
+                       vectors=pairs, stride=stride)
+            if summary:
+                mdx, mdy, mag, ang = summary
+                horiz = "right" if mdx > 0 else "left"
+                vert = "down" if mdy > 0 else "up"
+                self.lbl_stars.configure(
+                    text=f"PAUSED — field moving: ({mdx:+.1f},{mdy:+.1f})px "
+                         f"= {mag:.1f}px toward {ang:.0f}° "
+                         f"({horiz}/{vert}), {len(pairs)} stars tracked")
+            else:
+                self.lbl_stars.configure(
+                    text="PAUSED — no matched stars to track "
+                         "(too few / moved too far)")
+            self.lbl_stack.configure(
+                text=f"integration paused @ {fps:.1f} fps "
+                     f"(stack frozen at {self.stack_n} frames)")
         elif kind == "light_update":
-            _, live, stack, stars, n, fps, bg, sigma = msg
-            small, _ = downsample_to_fit(live, CANVAS_W, CANVAS_H)
-            self._show(self.canvas_live, stretch_to_u8(small), "live")
+            _, raw8, stack, stars, n, maxn, fps, bg, sigma = msg
+            self._show(self.canvas_live, raw8, "live")
             ssmall, stride = downsample_to_fit(stack, CANVAS_W, CANVAS_H)
             self._show(self.canvas_stack, stretch_to_u8(ssmall), "stack",
                        stars=stars, stride=stride)
-            # noise-floor readout: measured single-frame sigma vs stack sigma
-            # against the theoretical sqrt(N) gain (computed on the
-            # downsampled frame -- plenty for a gain estimate)
-            b1 = float(np.median(small))
-            s1 = 1.4826 * float(np.median(np.abs(small - b1)))
-            gain = (s1 / sigma) if sigma > 0 else 0.0
+            # noise-floor readout: measured single-frame->stack noise gain
+            # against theoretical sqrt(N) (on the downsampled stack: plenty
+            # for a gain estimate)
+            b1 = float(np.median(ssmall))
+            sN = 1.4826 * float(np.median(np.abs(ssmall - b1)))
+            gain = (sigma / sN) if sN > 0 else 0.0
             self.lbl_stack.configure(
-                text=f"stack: {n} frames @ {fps:.1f} fps | noise "
-                     f"×{gain:.1f} down (theory ×{np.sqrt(n):.1f})")
+                text=f"integrating: {n}/{maxn} frames @ {fps:.1f} fps")
             if stars:
                 s0 = stars[0]
                 self.lbl_stars.configure(
@@ -869,10 +1171,16 @@ class App:
                     fg="#802000")
             self.btn_solve.configure(state="normal")
         elif kind == "worker_done":
-            self.btn_dark.configure(state="normal")
-            self.btn_start.configure(state="normal")
+            self.btn_dark.configure(
+                state="normal" if self.fourcc else "disabled")
+            self.btn_start.configure(
+                state="normal" if self.fourcc else "disabled")
             self.btn_stop.configure(state="disabled")
+            self.btn_pause.configure(state="disabled",
+                                     text="Pause integration")
+            self.pause_evt.clear()
             self.prg["value"] = 0
+            self._set_mode_banner()  # restore right-canvas label
 
     def _save_dark(self, mean, coords, exp, count):
         w, h = self.current_size()
