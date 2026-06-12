@@ -67,7 +67,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.4"
+TOOL_VERSION = "0.5"
 
 
 # ----------------------------------------------------------------------------
@@ -561,6 +561,8 @@ class App:
         self.last_solve_t = 0.0
         self.status_base = "starting…"
         self.last_evt_t = time.monotonic()
+        # live display target; grows when the user enlarges the window
+        self.canvas_w, self.canvas_h = CANVAS_W, CANVAS_H
 
         self._build_ui()
         self._set_mode_banner()
@@ -582,20 +584,24 @@ class App:
                                    bg="#202020", fg="#80c0ff", padx=8, pady=3)
         self.lbl_status.pack(fill="x")
 
+        # canvases grow with the window: drag the window larger and both
+        # panels expand; the rational scaler refits the image each update
         disp = tk.Frame(self.root)
         disp.pack(fill="both", expand=True, padx=4, pady=4)
         self.lf_left = tk.LabelFrame(disp, text="Raw stream")
-        self.lf_left.pack(side="left", padx=2)
+        self.lf_left.pack(side="left", padx=2, fill="both", expand=True)
         self.canvas_live = tk.Canvas(self.lf_left, width=CANVAS_W,
                                      height=CANVAS_H, bg="#141414",
                                      highlightthickness=0)
-        self.canvas_live.pack()
+        self.canvas_live.pack(fill="both", expand=True)
         self.lf_right = tk.LabelFrame(disp, text="Dark-corrected residual")
-        self.lf_right.pack(side="left", padx=2)
+        self.lf_right.pack(side="left", padx=2, fill="both", expand=True)
         self.canvas_stack = tk.Canvas(self.lf_right, width=CANVAS_W,
                                       height=CANVAS_H, bg="#141414",
                                       highlightthickness=0)
-        self.canvas_stack.pack()
+        self.canvas_stack.pack(fill="both", expand=True)
+        self.canvas_live.bind("<Configure>", self._on_canvas_resize)
+        self.root.minsize(2 * CANVAS_W + 40, CANVAS_H + 320)
 
         ctl = tk.Frame(self.root)
         ctl.pack(fill="x", padx=4)
@@ -758,6 +764,12 @@ class App:
         self.last_evt_t = time.monotonic()
         self.lbl_status.configure(text=text, fg=fg)
 
+    def _on_canvas_resize(self, event):
+        # workers downsample to this target; _show always refits the actual
+        # canvas, so a mid-capture resize just upscales until the next burst
+        if event.width > 50 and event.height > 50:
+            self.canvas_w, self.canvas_h = event.width, event.height
+
     def _on_exp_change(self, *a):
         try:
             self.exp_value = int(self.var_exp.get())
@@ -801,9 +813,13 @@ class App:
         """Best integer zoom/subsample pair (z, q) so the image FILLS as much
         of the canvas as possible without cropping -- e.g. a 320x240 frame on
         a 480x360 canvas gets 3/2. tk.PhotoImage only scales by integer
-        ratios, hence the rational search instead of a single factor."""
+        ratios, hence the rational search instead of a single factor. The
+        zoom range adapts to the canvas so enlarged windows keep filling."""
+        # z can exceed the integer-fit factor because q divides it back down
+        # (e.g. 320px into 1440px wants z/q = 9/2 = 4.5)
+        zmax = max(4, min(16, (cw // max(w, 1)) * 2 + 2))
         best, best_s = (1, 1), 0.0
-        for z in range(1, 5):
+        for z in range(1, zmax + 1):
             for q in range(1, 5):
                 s = z / q
                 if w * s <= cw + 0.5 and h * s <= ch + 0.5 and s > best_s:
@@ -812,14 +828,18 @@ class App:
 
     def _show(self, canvas, img8, which, stars=None, stride=1, vectors=None):
         h, w = img8.shape
-        z, q = self._fit_scale(w, h, CANVAS_W, CANVAS_H)
+        cw = canvas.winfo_width()
+        ch = canvas.winfo_height()
+        if cw < 64 or ch < 64:  # not yet mapped by the geometry manager
+            cw, ch = CANVAS_W, CANVAS_H
+        z, q = self._fit_scale(w, h, cw, ch)
         photo = tk.PhotoImage(data=pgm_bytes(img8))
         if z > 1:
             photo = photo.zoom(z, z)
         if q > 1:
             photo = photo.subsample(q, q)
-        ox = (CANVAS_W - photo.width()) // 2
-        oy = (CANVAS_H - photo.height()) // 2
+        ox = (cw - photo.width()) // 2
+        oy = (ch - photo.height()) // 2
         canvas.delete("all")
         canvas.create_image(ox, oy, image=photo, anchor="nw")
         s = z / q  # display px per img8 px; overlays use full-res coords
@@ -1011,7 +1031,8 @@ class App:
             defects=0 if self.defects is None else len(self.defects))
         self._update_dark_label()
         if self.master_dark is not None:
-            small, _ = downsample_to_fit(self.master_dark, CANVAS_W, CANVAS_H)
+            small, _ = downsample_to_fit(self.master_dark,
+                                         self.canvas_w, self.canvas_h)
             self._show(self.canvas_stack, stretch_to_u8(small), "stack")
 
     def _update_dark_label(self):
@@ -1035,21 +1056,20 @@ class App:
         nd = 0 if self.defects is None else len(self.defects)
         top = tk.Toplevel(self.root)
         top.title(f"Master dark {w}x{h} — {nd} defects")
-        cv = tk.Canvas(top, width=CANVAS_W, height=CANVAS_H, bg="#141414",
+        vw, vh = self.canvas_w, self.canvas_h  # match current display size
+        cv = tk.Canvas(top, width=vw, height=vh, bg="#141414",
                        highlightthickness=0)
         cv.pack()
-        small, stride = downsample_to_fit(self.master_dark,
-                                          CANVAS_W, CANVAS_H)
+        small, stride = downsample_to_fit(self.master_dark, vw, vh)
         img8 = stretch_to_u8(small)
-        z, q = self._fit_scale(img8.shape[1], img8.shape[0],
-                               CANVAS_W, CANVAS_H)
+        z, q = self._fit_scale(img8.shape[1], img8.shape[0], vw, vh)
         photo = tk.PhotoImage(data=pgm_bytes(img8))
         if z > 1:
             photo = photo.zoom(z, z)
         if q > 1:
             photo = photo.subsample(q, q)
-        ox = (CANVAS_W - photo.width()) // 2
-        oy = (CANVAS_H - photo.height()) // 2
+        ox = (vw - photo.width()) // 2
+        oy = (vh - photo.height()) // 2
         cv.create_image(ox, oy, image=photo, anchor="nw")
         top._photo = photo  # keep a reference or Tk drops the image
         s = z / q
@@ -1228,8 +1248,10 @@ class App:
                     pass
                 # downsampled COPIES: the UI must not read arrays this loop
                 # keeps mutating, and full-res frames are queue bloat anyway
-                msmall, _ = downsample_to_fit(mean, CANVAS_W, CANVAS_H)
-                lsmall, _ = downsample_to_fit(last, CANVAS_W, CANVAS_H)
+                msmall, _ = downsample_to_fit(mean, self.canvas_w,
+                                              self.canvas_h)
+                lsmall, _ = downsample_to_fit(last, self.canvas_w,
+                                              self.canvas_h)
                 self.dbg.log("dark_progress", frames=count, of=total,
                              capture_s=round(cap.last_capture_s, 2),
                              fps=round(cap.last_fps, 2),
@@ -1281,14 +1303,15 @@ class App:
                     pass
                 if last is None:
                     continue
-                raw_small, _ = downsample_to_fit(last, CANVAS_W, CANVAS_H)
+                raw_small, _ = downsample_to_fit(last, self.canvas_w,
+                                                 self.canvas_h)
                 raw8 = stretch_to_u8(raw_small)
                 if master is not None:
                     resid = last - master
                     if defects is not None and len(defects):
                         repair_defects(resid, defects)
                     rs, _ = downsample_to_fit(np.clip(resid, 0, None),
-                                              CANVAS_W, CANVAS_H)
+                                              self.canvas_w, self.canvas_h)
                     resid8 = residual_to_u8(rs)
                     stats = (float(resid.mean()),
                              float(1.4826 * np.median(np.abs(
@@ -1395,7 +1418,8 @@ class App:
                 if last_raw is None:
                     continue
 
-                raw_small, _ = downsample_to_fit(last_raw, CANVAS_W, CANVAS_H)
+                raw_small, stride = downsample_to_fit(
+                    last_raw, self.canvas_w, self.canvas_h)
                 raw8 = stretch_to_u8(raw_small)
 
                 if paused:
@@ -1405,8 +1429,6 @@ class App:
                                               max_stars=40)
                     pairs = match_stars(pause_ref_stars or [], cur)
                     summary = motion_summary(pairs)
-                    _, stride = downsample_to_fit(last_raw,
-                                                  CANVAS_W, CANVAS_H)
                     self.dbg.log("pause", state="tracking",
                                  detected=len(cur), matched=len(pairs),
                                  motion=(dict(zip(
@@ -1534,7 +1556,8 @@ class App:
             self.set_status(f"INTEGRATING {n}/{maxn} @ {fps:.1f} fps — "
                             f"{len(stars)} stars")
             self._show(self.canvas_live, raw8, "live")
-            ssmall, stride = downsample_to_fit(stack, CANVAS_W, CANVAS_H)
+            ssmall, stride = downsample_to_fit(stack, self.canvas_w,
+                                               self.canvas_h)
             self._show(self.canvas_stack, stretch_to_u8(ssmall), "stack",
                        stars=stars, stride=stride)
             # noise-floor readout: measured single-frame->stack noise gain
