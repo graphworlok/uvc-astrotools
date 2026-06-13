@@ -67,7 +67,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.5"
+TOOL_VERSION = "0.6"
 
 
 # ----------------------------------------------------------------------------
@@ -293,9 +293,60 @@ def motion_summary(pairs):
     return mdx, mdy, mag, ang
 
 
+def hist_counts(img, lo, hi, bins=128):
+    """Histogram counts for the display panel."""
+    return np.histogram(img, bins=bins, range=(lo, hi))[0]
+
+
 # ----------------------------------------------------------------------------
 # Plate solving (local astrometry.net)
 # ----------------------------------------------------------------------------
+
+def _parse_wcs_cards(raw):
+    """Parse the numeric cards of a FITS header blob (solve-field's .wcs)."""
+    cards = {}
+    text = raw.decode("ascii", "replace")
+    for i in range(0, len(text) - 79, 80):
+        card = text[i:i + 80]
+        if card.startswith("END"):
+            break
+        if card[8:10] != "= ":
+            continue
+        key = card[:8].strip()
+        val = card[10:].split("/")[0].strip()
+        try:
+            cards[key] = float(val)
+        except ValueError:
+            pass
+    return cards
+
+
+def pole_pixel_from_wcs(raw):
+    """Pixel position (0-based x, y) of the celestial pole of the field's
+    hemisphere, from a TAN WCS. The great circle toward the pole is 'north'
+    by definition, and the CD matrix encodes rotation AND parity, so this is
+    exact -- no mirror-flip ambiguity. Returns None if not computable.
+
+    Gnomonic: for dec=+/-90 the tangent-plane coords relative to a tangent
+    point at dec0 are xi=0, eta=cot(dec0) (radians; same expression for the
+    same-hemisphere pole in either hemisphere)."""
+    c = _parse_wcs_cards(raw)
+    try:
+        dec0 = math.radians(c["CRVAL2"])
+        cd = ((c["CD1_1"], c["CD1_2"]), (c["CD2_1"], c["CD2_2"]))
+        crpix = (c["CRPIX1"], c["CRPIX2"])
+    except KeyError:
+        return None
+    if abs(math.sin(dec0)) < 1e-6:
+        return None  # pointing at the equator: pole at infinity in TAN
+    xi = 0.0
+    eta = math.degrees(1.0 / math.tan(dec0))
+    det = cd[0][0] * cd[1][1] - cd[0][1] * cd[1][0]
+    if abs(det) < 1e-20:
+        return None
+    dx = (cd[1][1] * xi - cd[0][1] * eta) / det
+    dy = (-cd[1][0] * xi + cd[0][0] * eta) / det
+    return (crpix[0] - 1.0 + dx, crpix[1] - 1.0 + dy)
 
 def solve_field(stack, solve_path, scale_low, scale_high, timeout=180,
                 dbg=None):
@@ -338,6 +389,18 @@ def solve_field(stack, solve_path, scale_low, scale_high, timeout=180,
                       r" ([EW]) of N", out)
         if m:
             info["rot"] = float(m.group(1)) * (1 if m.group(2) == "E" else -1)
+        m = re.search(r"pixel scale ([0-9.]+) arcsec/pix", out)
+        if m:
+            info["arcsec_per_px"] = float(m.group(1))
+        wcs_path = os.path.join(tmp, "stack.wcs")
+        if solved and os.path.exists(wcs_path):
+            try:
+                with open(wcs_path, "rb") as fh:
+                    pp = pole_pixel_from_wcs(fh.read())
+                if pp:
+                    info["pole_xy"] = [round(pp[0], 1), round(pp[1], 1)]
+            except Exception:
+                pass
         lines = []
         for pat in (r"Field center: \(RA,Dec\) = \([^)]*\) deg",
                     r"Field center: \(RA H:M:S, Dec D:M:S\) = \([^)]*\)",
@@ -510,6 +573,7 @@ def start_debug(args):
 # ----------------------------------------------------------------------------
 
 CANVAS_W, CANVAS_H = 480, 360
+AUX_W = 220  # width of the bullseye / noise / histogram panel column
 
 DARK_BANNER = ("DARK MODE — lens capped: build / verify the master dark",
                "#1c1c1c", "#e0e0e0")
@@ -564,8 +628,16 @@ class App:
         # live display target; grows when the user enlarges the window
         self.canvas_w, self.canvas_h = CANVAS_W, CANVAS_H
 
+        # visualisation state
+        self.solve_history = []   # [{t, ra, dec, sep_arcmin}, ...]
+        self.pole_xy = None       # pole pixel from last solve's WCS
+        self.noise_hist = []      # [(n, stack_sigma, single_sigma), ...]
+
         self._build_ui()
         self._set_mode_banner()
+        self._draw_bullseye()
+        self._draw_noise()
+        self._draw_hist([])
         root.after(100, self._poll)
         # probe the default device automatically -- a blank, disabled UI with
         # no explanation was the worst possible first impression
@@ -601,7 +673,28 @@ class App:
                                       highlightthickness=0)
         self.canvas_stack.pack(fill="both", expand=True)
         self.canvas_live.bind("<Configure>", self._on_canvas_resize)
-        self.root.minsize(2 * CANVAS_W + 40, CANVAS_H + 320)
+
+        # aux visualisation column: pole bullseye, noise convergence,
+        # histogram -- fixed size, main canvases take the slack
+        aux = tk.Frame(disp)
+        aux.pack(side="left", fill="y", padx=2)
+        lfp = tk.LabelFrame(aux, text="Pole offset (θ = RA)")
+        lfp.pack(fill="x")
+        self.canvas_pole = tk.Canvas(lfp, width=AUX_W, height=AUX_W,
+                                     bg="#101018", highlightthickness=0)
+        self.canvas_pole.pack()
+        lfn = tk.LabelFrame(aux, text="Stack noise vs √N")
+        lfn.pack(fill="x", pady=2)
+        self.canvas_noise = tk.Canvas(lfn, width=AUX_W, height=110,
+                                      bg="#101018", highlightthickness=0)
+        self.canvas_noise.pack()
+        lfh = tk.LabelFrame(aux, text="Histogram (log y)")
+        lfh.pack(fill="x")
+        self.canvas_hist = tk.Canvas(lfh, width=AUX_W, height=110,
+                                     bg="#101018", highlightthickness=0)
+        self.canvas_hist.pack()
+
+        self.root.minsize(2 * CANVAS_W + AUX_W + 60, CANVAS_H + 320)
 
         ctl = tk.Frame(self.root)
         ctl.pack(fill="x", padx=4)
@@ -826,7 +919,138 @@ class App:
                     best_s, best = s, (z, q)
         return best
 
-    def _show(self, canvas, img8, which, stars=None, stride=1, vectors=None):
+    def _draw_bullseye(self):
+        """Polar-scope-style chart: rings at 1'/5'/10'/30'/1° (sqrt radial
+        mapping so the inner rings stay visible), each solve plotted at
+        angle=RA, radius=pole separation; trail fades, newest is bright.
+        Watching the dot walk toward centre IS the polar alignment.
+
+        Hemisphere-aware: the pole (NCP/SCP) is taken from the latest solve's
+        declination sign, and the angular handedness is mirrored for the SCP
+        so the chart turns the same way the southern sky does (clockwise
+        facing south) instead of the northern convention."""
+        cv = self.canvas_pole
+        cv.delete("all")
+        cx = cy = AUX_W // 2
+        R = cx - 14
+        pts = self.solve_history[-20:]
+        south = bool(pts) and pts[-1]["dec"] < 0
+        ysign = 1.0 if south else -1.0  # SCP: clockwise; NCP: counter-clockwise
+        for sep, lab in ((1, "1'"), (5, "5'"), (10, "10'"),
+                         (30, "30'"), (60, "1°")):
+            r = R * math.sqrt(sep / 60.0)
+            cv.create_oval(cx - r, cy - r, cx + r, cy + r, outline="#2c3a4c")
+            cv.create_text(cx + r - 2, cy - 7, text=lab, fill="#4a5a6c",
+                           font=("TkDefaultFont", 7), anchor="e")
+        cv.create_line(cx - 4, cy, cx + 4, cy, fill="#80a0c0")
+        cv.create_line(cx, cy - 4, cx, cy + 4, fill="#80a0c0")
+        if pts:
+            cv.create_text(cx + 7, cy + 8, text=("SCP" if south else "NCP"),
+                           fill="#80a0c0", anchor="w",
+                           font=("TkDefaultFont", 8, "bold"))
+        prev = None
+        for i, p in enumerate(pts):
+            r = R * math.sqrt(min(p["sep_arcmin"], 60.0) / 60.0)
+            a = math.radians(p["ra"])
+            x = cx + r * math.cos(a)
+            y = cy + ysign * r * math.sin(a)
+            if prev:
+                cv.create_line(prev[0], prev[1], x, y, fill="#2e5a3a")
+            last = i == len(pts) - 1
+            d = 4 if last else 2
+            cv.create_oval(x - d, y - d, x + d, y + d,
+                           fill="#00ff60" if last else "#3a7a4a", outline="")
+            prev = (x, y)
+        if pts:
+            sep = pts[-1]["sep_arcmin"]
+            txt = f"{sep:.1f}'" if sep < 100 else f"{sep / 60.0:.2f}°"
+            if sep > 60:
+                txt = "off-chart  " + txt
+            cv.create_text(cx, AUX_W - 9,
+                           text=f"{('SCP' if south else 'NCP')}  {txt}",
+                           fill="#00ff60",
+                           font=("TkDefaultFont", 10, "bold"))
+        else:
+            cv.create_text(cx, AUX_W - 9, text="no solves yet",
+                           fill="#4a5a6c")
+
+    def _draw_noise(self):
+        """Measured stack noise vs integration depth against the 1/sqrt(N)
+        ideal. Where the green curve departs from the grey one is the
+        FPN/drift floor -- the actual limit of integrating deeper."""
+        cv = self.canvas_noise
+        cv.delete("all")
+        W, H, padl, padb = AUX_W, 110, 30, 14
+        data = self.noise_hist
+        if len(data) < 2:
+            cv.create_text(W // 2, H // 2, text="integrate to populate",
+                           fill="#4a5a6c")
+            return
+        sig1 = float(np.median([d[2] for d in data]))
+        nmax = max(d[0] for d in data)
+        ymax = max(max(d[1] for d in data), sig1) * 1.1 or 1.0
+
+        def X(n):
+            return padl + (W - padl - 6) * n / nmax
+
+        def Y(s):
+            return (H - padb) - (H - padb - 8) * s / ymax
+
+        theory = [(X(n), Y(sig1 / math.sqrt(n)))
+                  for n in range(1, nmax + 1)]
+        for a, b in zip(theory[:-1], theory[1:]):
+            cv.create_line(*a, *b, fill="#506070")
+        meas = [(X(n), Y(s)) for n, s, _ in data]
+        for a, b in zip(meas[:-1], meas[1:]):
+            cv.create_line(*a, *b, fill="#00d050", width=2)
+        cv.create_text(padl - 2, Y(ymax / 1.1), text=f"{ymax / 1.1:.2f}",
+                       fill="#4a5a6c", anchor="e",
+                       font=("TkDefaultFont", 7))
+        cv.create_text(padl - 2, Y(0), text="0", fill="#4a5a6c", anchor="e",
+                       font=("TkDefaultFont", 7))
+        cv.create_text(W - 8, H - 4, text=f"N={nmax}", fill="#4a5a6c",
+                       anchor="e", font=("TkDefaultFont", 7))
+        cv.create_text(padl + 4, 8, anchor="w", fill="#00d050",
+                       font=("TkDefaultFont", 7),
+                       text=f"σ {data[-1][1]:.2f} (ideal "
+                            f"{sig1 / math.sqrt(nmax):.2f})")
+
+    def _draw_hist(self, series):
+        """series: list of (counts, color, lo, hi, label). Log-y polylines.
+        A zero-ADU tick is drawn when the range spans zero (residual view)."""
+        cv = self.canvas_hist
+        cv.delete("all")
+        W, H, pad = AUX_W, 110, 6
+        if not series:
+            cv.create_text(W // 2, H // 2, text="no data", fill="#4a5a6c")
+            return
+        for counts, color, lo, hi, label in series:
+            if counts is None:
+                continue
+            logc = np.log10(1.0 + counts.astype(np.float64))
+            top = float(logc.max()) or 1.0
+            n = len(counts)
+            pts = []
+            for i in range(n):
+                x = pad + (W - 2 * pad) * i / (n - 1)
+                y = (H - 14) - (H - 24) * (logc[i] / top)
+                pts.extend((x, y))
+            cv.create_line(*pts, fill=color)
+            if lo < 0 < hi:
+                xz = pad + (W - 2 * pad) * (0 - lo) / (hi - lo)
+                cv.create_line(xz, 10, xz, H - 14, fill="#506070",
+                               dash=(2, 2))
+        y = H - 6
+        x = pad
+        for counts, color, lo, hi, label in series:
+            if counts is None:
+                continue
+            cv.create_text(x, y, text=label, fill=color, anchor="w",
+                           font=("TkDefaultFont", 7))
+            x += 8 + 6 * len(label)
+
+    def _show(self, canvas, img8, which, stars=None, stride=1, vectors=None,
+              cross=None):
         h, w = img8.shape
         cw = canvas.winfo_width()
         ch = canvas.winfo_height()
@@ -854,6 +1078,19 @@ class App:
                 canvas.create_line(rx / stride * s + ox, ry / stride * s + oy,
                                    cx / stride * s + ox, cy / stride * s + oy,
                                    fill="#ffd000", width=2, arrow=tk.LAST)
+        if cross:
+            # celestial pole position from the last solve's WCS
+            x = cross[0] / stride * s + ox
+            y = cross[1] / stride * s + oy
+            if -20 <= x <= cw + 20 and -20 <= y <= ch + 20:
+                canvas.create_line(x - 14, y, x + 14, y, fill="#ff50ff",
+                                   width=2)
+                canvas.create_line(x, y - 14, x, y + 14, fill="#ff50ff",
+                                   width=2)
+                canvas.create_oval(x - 7, y - 7, x + 7, y + 7,
+                                   outline="#ff50ff", width=2)
+                canvas.create_text(x, y - 20, text="pole", fill="#ff50ff",
+                                   font=("TkDefaultFont", 8, "bold"))
         if which == "live":
             self._photo_live = photo
         else:
@@ -984,6 +1221,7 @@ class App:
         self.master_dark = None
         self.master_exp = None
         self.defects = None
+        self.pole_xy = None  # pole pixel position is resolution-specific
         self.on_reset_stack()
         w, h = self.current_size()
         if w is None:
@@ -1101,6 +1339,8 @@ class App:
         self.stack_sum = None
         self.stack_n = 0
         self.stars = []
+        self.noise_hist = []
+        self._draw_noise()
         self.lbl_stack.configure(text="integrating: 0 frames")
         self.lbl_stars.configure(text="stars: -")
         self.btn_solve.configure(state="disabled")
@@ -1327,8 +1567,11 @@ class App:
                     fps=round(cap.last_fps, 2), raw=frame_stats(last),
                     residual=(frame_stats(resid) if master is not None
                               else None))
+                hraw = hist_counts(last, 0.0, 256.0)
+                hres = (hist_counts(resid, -10.0, 22.0)
+                        if master is not None else None)
                 self.q.put(("dark_preview", raw8, resid8, stats,
-                            cap.last_fps))
+                            cap.last_fps, hraw, hres))
         except Exception as e:
             self.dbg.exc("error", where="dark_preview_worker")
             self.q.put(("log", f"dark preview failed: {e}"))
@@ -1462,7 +1705,10 @@ class App:
                                 ("x", "y", "flux", "fwhm")}
                                for s in stars[:3]])
                 self.q.put(("light_update", raw8, stack, stars,
-                            len(ring), maxn, cap.last_fps, bg, sigma))
+                            len(ring), maxn, cap.last_fps, bg, sigma,
+                            hist_counts(last_raw, 0.0, 256.0),
+                            hist_counts(stack, 0.0, 256.0),
+                            frame_stats(last_proc)["mad_sigma"]))
         except Exception as e:
             self.dbg.exc("error", where="light_worker")
             self.q.put(("log", f"capture failed: {e}"))
@@ -1502,10 +1748,16 @@ class App:
             self._show(self.canvas_live, stretch_to_u8(lsmall), "live")
             self._show(self.canvas_stack, stretch_to_u8(msmall), "stack")
         elif kind == "dark_preview":
-            _, raw8, resid8, stats, fps = msg
+            _, raw8, resid8, stats, fps, hraw, hres = msg
             self.set_status(f"DARK PREVIEW @ {fps:.1f} fps"
                             + ("" if resid8 is not None
                                else " — no master dark yet"))
+            if hres is not None:
+                self._draw_hist([(hres, "#00d050", -10.0, 22.0,
+                                  "residual -10..22 ADU")])
+            else:
+                self._draw_hist([(hraw, "#7a8aa0", 0.0, 256.0,
+                                  "raw 0..255")])
             self._show(self.canvas_live, raw8, "live")
             if resid8 is not None:
                 self._show(self.canvas_stack, resid8, "stack")
@@ -1552,14 +1804,20 @@ class App:
                 text=f"integration paused @ {fps:.1f} fps "
                      f"(stack frozen at {self.stack_n} frames)")
         elif kind == "light_update":
-            _, raw8, stack, stars, n, maxn, fps, bg, sigma = msg
+            (_, raw8, stack, stars, n, maxn, fps, bg, sigma,
+             hraw, hstack, sig1) = msg
             self.set_status(f"INTEGRATING {n}/{maxn} @ {fps:.1f} fps — "
                             f"{len(stars)} stars")
             self._show(self.canvas_live, raw8, "live")
             ssmall, stride = downsample_to_fit(stack, self.canvas_w,
                                                self.canvas_h)
             self._show(self.canvas_stack, stretch_to_u8(ssmall), "stack",
-                       stars=stars, stride=stride)
+                       stars=stars, stride=stride, cross=self.pole_xy)
+            self._draw_hist([(hraw, "#7a8aa0", 0.0, 256.0, "raw"),
+                             (hstack, "#00d050", 0.0, 256.0, "stack")])
+            if not self.noise_hist or n > self.noise_hist[-1][0]:
+                self.noise_hist.append((n, sigma, sig1))
+                self._draw_noise()
             # noise-floor readout: measured single-frame->stack noise gain
             # against theoretical sqrt(N) (on the downsampled stack: plenty
             # for a gain estimate)
@@ -1596,6 +1854,19 @@ class App:
                     pos += f"  rot {info['rot']:+.1f}°"
                 pos += "  |  " + pole_offset_text(info["ra"], info["dec"])
                 self.lbl_solve.configure(text=pos, fg="#006000")
+                self.solve_history.append(
+                    {"t": time.time(), "ra": info["ra"], "dec": info["dec"],
+                     "sep_arcmin": (90.0 - abs(info["dec"])) * 60.0})
+                del self.solve_history[:-50]
+                self._draw_bullseye()
+                self.pole_xy = info.get("pole_xy")
+                if self.pole_xy:
+                    w, h = self.current_size()
+                    px, py = self.pole_xy
+                    inside = (w and 0 <= px < w and 0 <= py < h)
+                    self.log(f"pole at pixel ({px:.0f},{py:.0f})"
+                             + ("" if inside else " (outside the frame; "
+                                "crosshair appears when it comes into view)"))
             elif not ok:
                 self.lbl_solve.configure(
                     text="sky position: " + text.splitlines()[0],

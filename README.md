@@ -221,6 +221,29 @@ with a median displacement/direction readout: live feedback on where the
 field is going during polar alignment. Resume optionally resets the stack
 (the old integration is invalid once the sensor has moved).
 
+An auxiliary panel column carries three live visualisations:
+
+- **Pole bullseye** — a polar-scope-style chart with rings at 1′/5′/10′/30′/1°
+  (√-radial mapping so the inner rings stay legible), plotting each solve at
+  angle = RA, radius = pole separation, with a fading trail. Watching the dot
+  walk toward centre as you turn the bolts *is* the polar alignment. It is
+  hemisphere-aware: the pole (NCP/SCP) is read from each solve's declination
+  and the angular handedness is mirrored for the SCP, so the chart turns the
+  way the southern sky actually does — which is where solve-based alignment
+  matters most, the SCP having no bright pole star to sight on.
+- **Stack noise vs √N** — measured stack noise against the 1/√N ideal as
+  integration deepens. Where the measured curve departs from ideal is the
+  FPN/drift floor: the actual limit of integrating deeper, and the key figure
+  when mining the noise floor.
+- **Histogram (log-y)** — raw vs stack in light mode, raw vs residual in dark
+  mode, showing pedestal position, clipping at either rail, and headroom at a
+  glance.
+
+When a solve yields a WCS, the **celestial pole's pixel position** is computed
+from the CD matrix (exact, including rotation and parity) and drawn as a
+magenta crosshair on the stack view whenever it falls within the frame — so
+the live image itself becomes the polar scope.
+
 The UVC processing controls the device actually exposes (gain, gamma,
 brightness, contrast, sharpness, saturation) are presented with their real
 ranges after probing and applied live; exposure is adjustable mid-capture.
