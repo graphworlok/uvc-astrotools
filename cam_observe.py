@@ -67,20 +67,23 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.6"
+TOOL_VERSION = "0.7"
 
 
 # ----------------------------------------------------------------------------
 # Image processing
 # ----------------------------------------------------------------------------
 
-def stretch_to_u8(img, lo_pct=0.5, hi_pct=99.7):
-    """Percentile auto-stretch to displayable uint8."""
+def stretch_to_u8(img, lo_pct=0.5, hi_pct=99.7, return_bounds=False):
+    """Percentile auto-stretch to displayable uint8. With return_bounds, also
+    returns the (lo, hi) ADU values mapped to black/white -- a small span
+    means the display is heavily amplifying a near-flat frame."""
     lo, hi = np.percentile(img, (lo_pct, hi_pct))
     if hi <= lo:
         hi = lo + 1.0
     out = (img - lo) * (255.0 / (hi - lo))
-    return np.clip(out, 0, 255).astype(np.uint8)
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    return (out, float(lo), float(hi)) if return_bounds else out
 
 
 def residual_to_u8(resid, gain=8.0):
@@ -162,23 +165,65 @@ def write_fits_u16(path, img):
         fh.write(b"\x00" * pad)
 
 
+# Phase-correlation peak prominence (peak height over the surface's robust
+# sigma) below which the estimated shift is treated as untrustworthy: a
+# featureless field (vignette + noise, no stars) gives a flat surface whose
+# argmax is random, and aligning on that smears the stack. Tunable; logged
+# per burst as align_conf so it can be calibrated against real fields.
+ALIGN_MIN_CONF = 6.0
+
+
 def phase_shift(ref_small, img_small):
-    """Integer (dy, dx) translation of img relative to ref via phase
-    correlation on downsampled frames. Cheap and rotation-free -- right for
-    short-session drift, not for field rotation."""
-    f1 = np.fft.rfft2(ref_small)
-    f2 = np.fft.rfft2(img_small)
+    """Integer (dy, dx, conf) translation of img relative to ref via phase
+    correlation on downsampled frames. conf is the correlation peak's
+    prominence over the surface (peak-minus-median / robust sigma); a low
+    conf means there is no trustworthy translation signal and the caller
+    should not align. Cheap and rotation-free -- right for short-session
+    drift, not for field rotation."""
+    a = ref_small.astype(np.float64)
+    b = img_small.astype(np.float64)
+    # mean-subtract + separable Hann window: removes the DC term and the
+    # FFT edge-wrap cross that otherwise plant a spurious peak when the frame
+    # carries no real translation signal
+    a -= a.mean()
+    b -= b.mean()
+    win = np.hanning(a.shape[0])[:, None] * np.hanning(a.shape[1])[None, :]
+    a *= win
+    b *= win
+    f1 = np.fft.rfft2(a)
+    f2 = np.fft.rfft2(b)
     cps = f1 * np.conj(f2)
     mag = np.abs(cps)
     mag[mag < 1e-12] = 1e-12
     corr = np.fft.irfft2(cps / mag, s=ref_small.shape)
-    peak = np.unravel_index(np.argmax(corr), corr.shape)
-    dy, dx = peak
+    peak_idx = np.unravel_index(np.argmax(corr), corr.shape)
+    med = float(np.median(corr))
+    sigma = 1.4826 * float(np.median(np.abs(corr - med))) or 1e-9
+    conf = (float(corr[peak_idx]) - med) / sigma
+    dy, dx = peak_idx
     if dy > ref_small.shape[0] // 2:
         dy -= ref_small.shape[0]
     if dx > ref_small.shape[1] // 2:
         dx -= ref_small.shape[1]
-    return dy, dx
+    return dy, dx, conf
+
+
+def shift_fill(img, dy, dx):
+    """Translate by (dy, dx) WITHOUT wraparound. Exposed edges are filled
+    with the frame's own background (median), so a drift correction never
+    folds the bright opposite edge back into the stack -- np.roll's wrap was
+    the source of the mirrored 'butterfly' ghosts on featureless fields."""
+    if dy == 0 and dx == 0:
+        return img
+    h, w = img.shape
+    if abs(dy) >= h or abs(dx) >= w:        # shifted entirely out of frame
+        return np.full_like(img, float(np.median(img)))
+    out = np.full_like(img, float(np.median(img)))
+    sy0, sy1 = max(0, -dy), min(h, h - dy)
+    sx0, sx1 = max(0, -dx), min(w, w - dx)
+    out[max(0, dy):max(0, dy) + (sy1 - sy0),
+        max(0, dx):max(0, dx) + (sx1 - sx0)] = img[sy0:sy1, sx0:sx1]
+    return out
 
 
 def repair_defects(img, yx):
@@ -633,6 +678,15 @@ class App:
         self.pole_xy = None       # pole pixel from last solve's WCS
         self.noise_hist = []      # [(n, stack_sigma, single_sigma), ...]
 
+        # "known-good" solve region: when dark/defect correction can't clean
+        # the whole frame, the user drags a rectangle on the LIGHT stack view
+        # and only that crop is handed to the solver. Full-res stack pixels.
+        self.roi = None           # (x0, y0, x1, y1) or None = whole frame
+        self._roi_arm = False     # next drag on the stack canvas defines it
+        self._roi_drag = None     # (x0, y0, x1, y1) live drag, canvas px
+        self._xform_stack = None  # (ox, oy, s, stride) of last stack draw
+        self._solve_roi = None    # crop origin snapshot for the in-flight solve
+
         self._build_ui()
         self._set_mode_banner()
         self._draw_bullseye()
@@ -673,6 +727,10 @@ class App:
                                       highlightthickness=0)
         self.canvas_stack.pack(fill="both", expand=True)
         self.canvas_live.bind("<Configure>", self._on_canvas_resize)
+        # drag a known-good solve region on the stack view
+        self.canvas_stack.bind("<ButtonPress-1>", self._on_roi_press)
+        self.canvas_stack.bind("<B1-Motion>", self._on_roi_drag)
+        self.canvas_stack.bind("<ButtonRelease-1>", self._on_roi_release)
 
         # aux visualisation column: pole bullseye, noise convergence,
         # histogram -- fixed size, main canvases take the slack
@@ -832,6 +890,23 @@ class App:
                                   command=self.on_save_fits, state="disabled")
         self.btn_fits.pack(side="left", padx=6)
 
+        # row 3b: known-good solve region (crop fed to the solver when the
+        # dark/defect correction can't clean the whole frame)
+        r3b = tk.Frame(ctl); r3b.pack(fill="x", pady=1)
+        tk.Label(r3b, text="Solve region:").pack(side="left")
+        self.btn_roi = tk.Button(r3b, text="Select on stack",
+                                 command=self.on_roi_select)
+        self.btn_roi.pack(side="left", padx=4)
+        self.btn_roi_coords = tk.Button(r3b, text="Enter coords…",
+                                        command=self.on_roi_coords)
+        self.btn_roi_coords.pack(side="left", padx=4)
+        self.btn_roi_clear = tk.Button(r3b, text="Clear (whole frame)",
+                                       command=self.on_roi_clear,
+                                       state="disabled")
+        self.btn_roi_clear.pack(side="left")
+        self.lbl_roi = tk.Label(r3b, text="whole frame")
+        self.lbl_roi.pack(side="left", padx=8)
+
         # row 4: sky position / polar alignment readout
         r4 = tk.Frame(ctl); r4.pack(fill="x", pady=2)
         self.lbl_solve = tk.Label(r4, text="sky position: (not solved)",
@@ -891,6 +966,27 @@ class App:
     def data_dir(self):
         d = self.args.data_dir
         return os.path.join(d, self.dev_tag) if self.dev_tag else d
+
+    def _prefs_path(self):
+        # lives in the per-camera data dir, so prefs are naturally per-camera
+        return os.path.join(self.data_dir(), "ui_prefs.json")
+
+    def _load_prefs(self):
+        try:
+            with open(self._prefs_path()) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return {}
+
+    def _save_prefs(self, **kv):
+        prefs = self._load_prefs()
+        prefs.update(kv)
+        try:
+            os.makedirs(self.data_dir(), exist_ok=True)
+            with open(self._prefs_path(), "w") as fh:
+                json.dump(prefs, fh)
+        except OSError as e:
+            self.dbg.log("error", where="save_prefs", err=str(e))
 
     def make_capture(self):
         w, h = self.current_size()
@@ -1091,10 +1187,198 @@ class App:
                                    outline="#ff50ff", width=2)
                 canvas.create_text(x, y - 20, text="pole", fill="#ff50ff",
                                    font=("TkDefaultFont", 8, "bold"))
+        # known-good solve region: record the transform so canvas clicks map
+        # back to full-res pixels, and keep the box drawn across frame redraws
+        if which == "stack" and self.var_mode.get() == "light":
+            self._xform_stack = (ox, oy, s, stride)
+            if self.roi is not None:
+                rx0, ry0, rx1, ry1 = self.roi
+                canvas.create_rectangle(
+                    rx0 / stride * s + ox, ry0 / stride * s + oy,
+                    rx1 / stride * s + ox, ry1 / stride * s + oy,
+                    outline="#00e5ff", width=2)
+                canvas.create_text(rx0 / stride * s + ox + 2,
+                                   ry0 / stride * s + oy - 2, anchor="sw",
+                                   text="solve region", fill="#00e5ff",
+                                   font=("TkDefaultFont", 8, "bold"))
+            if self._roi_drag is not None:
+                canvas.create_rectangle(*self._roi_drag, outline="#00e5ff",
+                                        dash=(4, 3), tags="roidrag")
         if which == "live":
             self._photo_live = photo
         else:
             self._photo_stack = photo
+
+    # ---------------- known-good solve region (ROI) ----------------
+
+    def on_roi_select(self):
+        """Arm a one-shot rectangle drag on the stack view. The selection
+        maps the displayed (downsampled, scaled) pixels back to full-res
+        stack pixels, so the solver receives exactly the chosen crop."""
+        if self.var_mode.get() != "light":
+            self.log("switch to LIGHT mode and integrate first, then select "
+                     "the solve region on the stack view")
+            self.set_status("LIGHT mode needed to pick a solve region",
+                            fg="#ff8060")
+            return
+        self._roi_arm = True
+        self.btn_roi.configure(relief="sunken")
+        self.set_status("drag a rectangle on the stack view to mark the "
+                        "known-good solve region", fg="#ffd000")
+        self.dbg.log("ui", action="roi_arm")
+
+    def _reset_roi_state(self):
+        """Drop the in-memory ROI and reset its UI -- does NOT touch the saved
+        preference (used when a resolution change invalidates the pixels)."""
+        self.roi = None
+        self._roi_arm = False
+        self._roi_drag = None
+        self.canvas_stack.delete("roidrag")
+        self.btn_roi.configure(relief="raised")
+        self.btn_roi_clear.configure(state="disabled")
+        self.lbl_roi.configure(text="whole frame")
+
+    def on_roi_clear(self):
+        self._reset_roi_state()
+        self._save_roi_pref(None)  # user intent: forget it for this resolution
+        self.log("solve region cleared -- solving the whole frame")
+        self.dbg.log("ui", action="roi_clear")
+
+    def _save_roi_pref(self, roi):
+        """Persist (or remove) the ROI for the CURRENT resolution in the
+        per-camera prefs, keyed by resolution since ROI pixels are
+        resolution-specific."""
+        w, h = self.current_size()
+        if w is None:
+            return
+        rmap = self._load_prefs().get("roi", {})
+        key = f"{w}x{h}"
+        if roi is None:
+            rmap.pop(key, None)
+        else:
+            rmap[key] = [int(v) for v in roi]
+        self._save_prefs(roi=rmap)
+
+    def _canvas_to_full(self, cx, cy):
+        """Stack-canvas pixel -> full-res stack pixel via the transform the
+        last _show captured. None if the stack has not been drawn yet."""
+        xf = self._xform_stack
+        if not xf or xf[2] <= 0:
+            return None
+        ox, oy, s, stride = xf
+        return (cx - ox) / s * stride, (cy - oy) / s * stride
+
+    def _on_roi_press(self, event):
+        if self._roi_arm:
+            self._roi_drag = (event.x, event.y, event.x, event.y)
+
+    def _on_roi_drag(self, event):
+        if not self._roi_arm or self._roi_drag is None:
+            return
+        x0, y0, _, _ = self._roi_drag
+        self._roi_drag = (x0, y0, event.x, event.y)
+        self.canvas_stack.delete("roidrag")
+        self.canvas_stack.create_rectangle(x0, y0, event.x, event.y,
+                                           outline="#00e5ff", dash=(4, 3),
+                                           tags="roidrag")
+
+    def _on_roi_release(self, event):
+        if not self._roi_arm or self._roi_drag is None:
+            return
+        x0c, y0c, x1c, y1c = self._roi_drag
+        self._roi_drag = None
+        self._roi_arm = False
+        self.canvas_stack.delete("roidrag")
+        self.btn_roi.configure(relief="raised")
+        p0 = self._canvas_to_full(min(x0c, x1c), min(y0c, y1c))
+        p1 = self._canvas_to_full(max(x0c, x1c), max(y0c, y1c))
+        if p0 is None or p1 is None:
+            self.log("no stack image yet -- integrate in LIGHT mode, then "
+                     "select the region")
+            return
+        self._set_roi(p0[0], p0[1], p1[0], p1[1], source="drag")
+
+    def _set_roi(self, x0, y0, x1, y1, source="drag"):
+        """Normalise, clamp to the frame, validate (>= 16px each side) and
+        commit an ROI. Shared by the drag selection and the numeric dialog;
+        returns True on success."""
+        w, h = self.current_size()
+        x0, x1 = sorted((int(round(x0)), int(round(x1))))
+        y0, y1 = sorted((int(round(y0)), int(round(y1))))
+        x0, y0 = max(0, x0), max(0, y0)
+        if w:
+            x1 = min(w, x1)
+        if h:
+            y1 = min(h, y1)
+        if x1 - x0 < 16 or y1 - y0 < 16:
+            self.log("region too small (need >= 16px each side); try again")
+            self.set_status("region too small -- give it >= 16px each side",
+                            fg="#ff8060")
+            return False
+        self.roi = (x0, y0, x1, y1)
+        self.btn_roi_clear.configure(state="normal")
+        frac = 100.0 * (x1 - x0) * (y1 - y0) / max(1, (w or 1) * (h or 1))
+        self.lbl_roi.configure(
+            text=f"x[{x0},{x1}) y[{y0},{y1})  "
+                 f"({x1 - x0}x{y1 - y0}, {frac:.0f}% of frame)")
+        self.log(f"solve region set ({source}): x[{x0},{x1}) y[{y0},{y1}) "
+                 f"({x1 - x0}x{y1 - y0}px) -- solves use this crop")
+        self.set_status("solve region set", fg="#80ff80")
+        self.dbg.log("ui", action="roi_set", roi=[x0, y0, x1, y1],
+                     frame=[w, h], source=source)
+        if source != "restored":  # don't rewrite what we just loaded
+            self._save_roi_pref(self.roi)
+        return True
+
+    def on_roi_coords(self):
+        """Pop a small dialog to type the ROI in full-res pixels -- works
+        without integrating (no display transform needed), unlike the drag."""
+        w, h = self.current_size()
+        if w is None:
+            self.log("probe a device first so the frame size is known")
+            self.set_status("probe a device before entering ROI coords",
+                            fg="#ff8060")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Solve region coordinates")
+        win.transient(self.root)
+        win.resizable(False, False)
+        tk.Label(win, text=f"Frame: {w}x{h} px.  x0,y0 = top-left, "
+                 "x1,y1 = bottom-right (exclusive).").grid(
+                     row=0, column=0, columnspan=4, padx=8, pady=(8, 4),
+                     sticky="w")
+        cur = self.roi if self.roi else (0, 0, w, h)
+        fields = {}
+        for col, (lab, val) in enumerate(zip(("x0", "y0", "x1", "y1"), cur)):
+            tk.Label(win, text=lab).grid(row=1, column=col, padx=(8, 0))
+            v = tk.IntVar(value=int(val))
+            tk.Spinbox(win, from_=0, to=max(w, h), width=7,
+                       textvariable=v).grid(row=2, column=col, padx=4, pady=2)
+            fields[lab] = v
+        msg = tk.Label(win, text="", fg="#b00000")
+        msg.grid(row=3, column=0, columnspan=4, padx=8, sticky="w")
+
+        def apply_and_close():
+            try:
+                vals = [fields[k].get() for k in ("x0", "y0", "x1", "y1")]
+            except (tk.TclError, ValueError):
+                msg.configure(text="all four values must be integers")
+                return
+            if self._set_roi(*vals, source="manual"):
+                win.destroy()
+            else:
+                msg.configure(text="region too small / out of bounds "
+                                   "(need >= 16px each side, within frame)")
+
+        btns = tk.Frame(win)
+        btns.grid(row=4, column=0, columnspan=4, pady=8)
+        tk.Button(btns, text="Apply", command=apply_and_close).pack(
+            side="left", padx=4)
+        tk.Button(btns, text="Cancel", command=win.destroy).pack(
+            side="left", padx=4)
+        win.bind("<Return>", lambda e: apply_and_close())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.grab_set()
 
     # ---------------- device probing / calibration files ----------------
 
@@ -1141,8 +1425,16 @@ class App:
         self.sizes = sorted(set(sizes), key=lambda s: s[0] * s[1])
         self.cmb_res["values"] = [f"{w}x{h} ({aspect_str(w, h)})"
                                   for w, h in self.sizes]
-        sw, sh = self.sizes[0]
+        self.dev_tag = usb_device_tag(dev)  # set first: prefs key on it
+        # restore the resolution last used with THIS camera, if still offered
+        saved = self._load_prefs().get("resolution")
+        pick = next((wh for wh in self.sizes
+                     if f"{wh[0]}x{wh[1]}" == saved), None)
+        sw, sh = pick if pick else self.sizes[0]
         self.var_res.set(f"{sw}x{sh} ({aspect_str(sw, sh)})")
+        if pick:
+            self.log(f"restored last-used resolution {sw}x{sh} "
+                     "for this camera")
         # native aspect, inferred from the largest advertised frame: smaller
         # modes with a different ratio are cropped or anamorphic
         nw, nh = self.sizes[-1]
@@ -1155,7 +1447,6 @@ class App:
                      f"{self.exp_rng.get('max', '?')}]")
             if self.exp_rng.get("max"):
                 self.var_exp.set(self.exp_rng["max"])
-        self.dev_tag = usb_device_tag(dev)
         self._build_uvc_panel(dev)
         self.dbg.log("probe", device=dev, identity=identify(dev),
                      fourcc=self.fourcc,
@@ -1222,10 +1513,16 @@ class App:
         self.master_exp = None
         self.defects = None
         self.pole_xy = None  # pole pixel position is resolution-specific
+        self._reset_roi_state()  # ROI pixels are resolution-specific too
         self.on_reset_stack()
         w, h = self.current_size()
         if w is None:
             return
+        self._save_prefs(resolution=f"{w}x{h}")  # remember per camera
+        # restore the ROI last used at THIS resolution on THIS camera
+        saved_roi = self._load_prefs().get("roi", {}).get(f"{w}x{h}")
+        if saved_roi and len(saved_roi) == 4:
+            self._set_roi(*saved_roi, source="restored")
         d = self.data_dir()
         mp = os.path.join(d, f"master_{w}x{h}.npy")
         dp = os.path.join(d, f"defects_{w}x{h}.txt")
@@ -1441,13 +1738,28 @@ class App:
         if self.stack_sum is None or self.stack_n == 0 or self.solving:
             return
         stack = self.stack_sum / self.stack_n
+        # crop to the known-good region (if set) so only clean data reaches
+        # the solver; remember the origin to put WCS pixel coords back into
+        # full-frame space afterwards
+        self._solve_roi = None
+        if self.roi is not None:
+            h, w = stack.shape
+            x0 = max(0, min(self.roi[0], w))
+            y0 = max(0, min(self.roi[1], h))
+            x1 = max(0, min(self.roi[2], w))
+            y1 = max(0, min(self.roi[3], h))
+            if x1 - x0 >= 16 and y1 - y0 >= 16:
+                stack = stack[y0:y1, x0:x1]
+                self._solve_roi = (x0, y0)
         if self.master_dark is None and not auto:
             self.log("solving an unsubtracted stack -- hot pixels may "
                      "masquerade as stars")
         self.solving = True
         self.last_solve_t = time.monotonic()
         self.btn_solve.configure(state="disabled")
-        self.log("plate solving..." + (" (auto)" if auto else ""))
+        self.log("plate solving..." + (" (auto)" if auto else "")
+                 + (f" [region {stack.shape[1]}x{stack.shape[0]}px]"
+                    if self._solve_roi else ""))
         t = threading.Thread(
             target=lambda: self.q.put(
                 ("solved", solve_field(stack, self.var_solver.get(),
@@ -1626,6 +1938,7 @@ class App:
                 last_raw = None
                 last_proc = None
                 last_shift = (0, 0)
+                last_conf = None
                 for fr in cap.iter_luma(path, burst, discard=1):
                     if self.stop_evt.is_set():
                         break
@@ -1643,11 +1956,19 @@ class App:
                         if align_ref is None:
                             align_ref = small.copy()
                         else:
-                            dy, dx = phase_shift(align_ref, small)
-                            last_shift = (dy * f, dx * f)
-                            if dy or dx:
-                                proc = np.roll(proc, (dy * f, dx * f),
-                                               axis=(0, 1))
+                            dy, dx, conf = phase_shift(align_ref, small)
+                            # only act on a clear peak and a plausible drift
+                            # (<= 1/4 frame); otherwise a featureless field
+                            # yields garbage shifts that smear the stack
+                            maxsh = max(small.shape) // 4
+                            if (conf >= ALIGN_MIN_CONF
+                                    and abs(dy) <= maxsh and abs(dx) <= maxsh):
+                                last_shift = (dy * f, dx * f)
+                                last_conf = conf
+                                proc = shift_fill(proc, dy * f, dx * f)
+                            else:
+                                last_shift = (0, 0)
+                                last_conf = conf
                     f32 = proc.astype(np.float32)
                     while len(ring) >= maxn:   # window shrink also handled
                         ssum -= ring.popleft()
@@ -1697,6 +2018,8 @@ class App:
                     fps=round(cap.last_fps, 2),
                     ring=len(ring), window_max=maxn,
                     align_shift=list(last_shift),
+                    align_conf=(round(last_conf, 2)
+                                if last_conf is not None else None),
                     raw=frame_stats(last_raw), proc=frame_stats(last_proc),
                     stack=frame_stats(stack),
                     stars=len(stars), bg=round(bg, 3),
@@ -1811,7 +2134,8 @@ class App:
             self._show(self.canvas_live, raw8, "live")
             ssmall, stride = downsample_to_fit(stack, self.canvas_w,
                                                self.canvas_h)
-            self._show(self.canvas_stack, stretch_to_u8(ssmall), "stack",
+            stack8, st_lo, st_hi = stretch_to_u8(ssmall, return_bounds=True)
+            self._show(self.canvas_stack, stack8, "stack",
                        stars=stars, stride=stride, cross=self.pole_xy)
             self._draw_hist([(hraw, "#7a8aa0", 0.0, 256.0, "raw"),
                              (hstack, "#00d050", 0.0, 256.0, "stack")])
@@ -1824,22 +2148,36 @@ class App:
             b1 = float(np.median(ssmall))
             sN = 1.4826 * float(np.median(np.abs(ssmall - b1)))
             gain = (sigma / sN) if sN > 0 else 0.0
+            # stretch readout: the ADU window mapped to black..white. A tiny
+            # span means the auto-stretch is amplifying a near-flat frame
             self.lbl_stack.configure(
-                text=f"integrating: {n}/{maxn} frames @ {fps:.1f} fps")
+                text=f"integrating: {n}/{maxn} frames @ {fps:.1f} fps  ·  "
+                     f"stretch {st_lo:.2f}..{st_hi:.2f} ADU "
+                     f"(span {st_hi - st_lo:.2f})")
+            # the solver only sees the region (if set); gate auto-solve and
+            # the readout on the stars that actually fall inside it
+            if self.roi is not None:
+                rx0, ry0, rx1, ry1 = self.roi
+                roi_stars = [s for s in stars
+                             if rx0 <= s["x"] < rx1 and ry0 <= s["y"] < ry1]
+                region_note = f"  ({len(roi_stars)} in region)"
+            else:
+                roi_stars = stars
+                region_note = ""
             if stars:
                 s0 = stars[0]
                 self.lbl_stars.configure(
                     text=f"stars: {len(stars)} (brightest flux "
                          f"{s0['flux']:.0f}, FWHM {s0['fwhm']}px) "
-                         f"bg {bg:.1f} σ {sigma:.2f}")
+                         f"bg {bg:.1f} σ {sigma:.2f}{region_note}")
             else:
                 self.lbl_stars.configure(
                     text=f"stars: 0  bg {bg:.1f} σ {sigma:.2f}")
             self.btn_solve.configure(
                 state="disabled" if self.solving else "normal")
             self.btn_fits.configure(state="normal")
-            if (self.var_autosolve.get() and not self.solving and stars
-                    and len(stars) >= int(self.var_solve_minstars.get())
+            if (self.var_autosolve.get() and not self.solving and roi_stars
+                    and len(roi_stars) >= int(self.var_solve_minstars.get())
                     and time.monotonic() - self.last_solve_t
                         > float(self.var_solve_interval.get())):
                 self._trigger_solve(auto=True)
@@ -1860,6 +2198,11 @@ class App:
                 del self.solve_history[:-50]
                 self._draw_bullseye()
                 self.pole_xy = info.get("pole_xy")
+                # WCS pixels are relative to the solved crop -- shift them
+                # back to full-frame coords so the crosshair lands correctly
+                if self.pole_xy and self._solve_roi:
+                    self.pole_xy = [self.pole_xy[0] + self._solve_roi[0],
+                                    self.pole_xy[1] + self._solve_roi[1]]
                 if self.pole_xy:
                     w, h = self.current_size()
                     px, py = self.pole_xy
