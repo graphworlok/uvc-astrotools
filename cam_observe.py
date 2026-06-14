@@ -677,6 +677,9 @@ class App:
         self.solve_history = []   # [{t, ra, dec, sep_arcmin}, ...]
         self.pole_xy = None       # pole pixel from last solve's WCS
         self.noise_hist = []      # [(n, stack_sigma, single_sigma), ...]
+        self._last_hist_series = []   # cached so a popout can redraw on resize
+        self._popouts = {}        # kind -> Canvas in an expanded popout window
+        self._popout_wins = {}    # kind -> Toplevel
 
         # "known-good" solve region: when dark/defect correction can't clean
         # the whole frame, the user drags a rectangle on the LIGHT stack view
@@ -751,6 +754,14 @@ class App:
         self.canvas_hist = tk.Canvas(lfh, width=AUX_W, height=110,
                                      bg="#101018", highlightthickness=0)
         self.canvas_hist.pack()
+
+        # click any aux graph to pop it out larger in its own resizable window
+        for c, kind in ((self.canvas_pole, "pole"),
+                        (self.canvas_noise, "noise"),
+                        (self.canvas_hist, "hist")):
+            c.configure(cursor="hand2")
+            c.bind("<Button-1>",
+                   lambda e, k=kind: self._popout_graph(k))
 
         self.root.minsize(2 * CANVAS_W + AUX_W + 60, CANVAS_H + 320)
 
@@ -1016,6 +1027,69 @@ class App:
         return best
 
     def _draw_bullseye(self):
+        self._render_pole(self.canvas_pole)
+        if "pole" in self._popouts:
+            self._render_pole(self._popouts["pole"])
+
+    def _draw_noise(self):
+        self._render_noise(self.canvas_noise)
+        if "noise" in self._popouts:
+            self._render_noise(self._popouts["noise"])
+
+    def _draw_hist(self, series=None):
+        if series is not None:
+            self._last_hist_series = series
+        self._render_hist(self.canvas_hist)
+        if "hist" in self._popouts:
+            self._render_hist(self._popouts["hist"])
+
+    def _popout_graph(self, kind):
+        """Open (or raise) a larger, resizable window of one aux graph. It
+        re-renders on resize and tracks live data through the _draw_* fan-out
+        (the same renderer draws the embedded panel and the popout)."""
+        self.log(f"opening {kind} graph popout")
+        win = self._popout_wins.get(kind)
+        if win is not None and win.winfo_exists():
+            self._raise_popout(win)
+            return
+        titles = {"pole": "Pole offset (θ = RA)",
+                  "noise": "Stack noise vs √N", "hist": "Histogram (log y)"}
+        init = {"pole": (560, 560), "noise": (720, 400), "hist": (720, 400)}
+        renderers = {"pole": self._render_pole, "noise": self._render_noise,
+                     "hist": self._render_hist}
+        w0, h0 = init[kind]
+        win = tk.Toplevel(self.root)
+        # explicit offset so it can't open exactly behind a maximised parent
+        win.geometry(f"{w0}x{h0}+140+120")
+        win.title(titles[kind] + " — expanded (drag edges to resize)")
+        cv = tk.Canvas(win, width=w0, height=h0, bg="#101018",
+                       highlightthickness=0)
+        cv.pack(fill="both", expand=True)
+        self._popouts[kind] = cv
+        self._popout_wins[kind] = win
+        render = renderers[kind]
+        cv.bind("<Configure>", lambda e: render(cv))  # also fires on first map
+
+        def on_close():
+            self._popouts.pop(kind, None)
+            self._popout_wins.pop(kind, None)
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        self._raise_popout(win)
+        self.dbg.log("ui", action="graph_popout", graph=kind)
+
+    @staticmethod
+    def _raise_popout(win):
+        """Force a popout to the front -- new Toplevels can otherwise open
+        behind a maximised/fullscreen main window on some Linux WMs."""
+        win.deiconify()
+        win.lift()
+        win.focus_force()
+        win.attributes("-topmost", True)
+        win.after(400, lambda: win.winfo_exists()
+                  and win.attributes("-topmost", False))
+
+    def _render_pole(self, cv):
         """Polar-scope-style chart: rings at 1'/5'/10'/30'/1° (sqrt radial
         mapping so the inner rings stay visible), each solve plotted at
         angle=RA, radius=pole separation; trail fades, newest is bright.
@@ -1025,9 +1099,11 @@ class App:
         declination sign, and the angular handedness is mirrored for the SCP
         so the chart turns the same way the southern sky does (clockwise
         facing south) instead of the northern convention."""
-        cv = self.canvas_pole
         cv.delete("all")
-        cx = cy = AUX_W // 2
+        size = min(cv.winfo_width(), cv.winfo_height())
+        if size < 50:                       # not yet mapped (or tiny)
+            size = AUX_W
+        cx = cy = size // 2
         R = cx - 14
         pts = self.solve_history[-20:]
         south = bool(pts) and pts[-1]["dec"] < 0
@@ -1062,21 +1138,24 @@ class App:
             txt = f"{sep:.1f}'" if sep < 100 else f"{sep / 60.0:.2f}°"
             if sep > 60:
                 txt = "off-chart  " + txt
-            cv.create_text(cx, AUX_W - 9,
+            cv.create_text(cx, size - 9,
                            text=f"{('SCP' if south else 'NCP')}  {txt}",
                            fill="#00ff60",
                            font=("TkDefaultFont", 10, "bold"))
         else:
-            cv.create_text(cx, AUX_W - 9, text="no solves yet",
+            cv.create_text(cx, size - 9, text="no solves yet",
                            fill="#4a5a6c")
 
-    def _draw_noise(self):
+    def _render_noise(self, cv):
         """Measured stack noise vs integration depth against the 1/sqrt(N)
         ideal. Where the green curve departs from the grey one is the
         FPN/drift floor -- the actual limit of integrating deeper."""
-        cv = self.canvas_noise
         cv.delete("all")
-        W, H, padl, padb = AUX_W, 110, 30, 14
+        W = cv.winfo_width()
+        H = cv.winfo_height()
+        W = W if W > 50 else AUX_W
+        H = H if H > 30 else 110
+        padl, padb = 30, 14
         data = self.noise_hist
         if len(data) < 2:
             cv.create_text(W // 2, H // 2, text="integrate to populate",
@@ -1111,12 +1190,17 @@ class App:
                        text=f"σ {data[-1][1]:.2f} (ideal "
                             f"{sig1 / math.sqrt(nmax):.2f})")
 
-    def _draw_hist(self, series):
-        """series: list of (counts, color, lo, hi, label). Log-y polylines.
-        A zero-ADU tick is drawn when the range spans zero (residual view)."""
-        cv = self.canvas_hist
+    def _render_hist(self, cv):
+        """Log-y histogram polylines from the last series handed to
+        _draw_hist; a zero-ADU tick is drawn when the range spans zero
+        (residual view). series: list of (counts, color, lo, hi, label)."""
+        series = self._last_hist_series
         cv.delete("all")
-        W, H, pad = AUX_W, 110, 6
+        W = cv.winfo_width()
+        H = cv.winfo_height()
+        W = W if W > 50 else AUX_W
+        H = H if H > 30 else 110
+        pad = 6
         if not series:
             cv.create_text(W // 2, H // 2, text="no data", fill="#4a5a6c")
             return
@@ -2009,10 +2093,32 @@ class App:
                 # queue messages; assignment is atomic under the GIL)
                 self.stack_sum = ssum
                 self.stack_n = len(ring)
-                stars, bg, sigma = extract_stars(stack)
+                # detect only within the known-good ROI when one is set:
+                # background/noise come from the clean region and edge junk
+                # can't masquerade as stars. Coords are shifted back to
+                # full-frame so overlays and the solver line up.
+                roi = self.roi
+                roi_used = None
+                if roi is not None:
+                    sh, sw = stack.shape
+                    rx0 = max(0, min(roi[0], sw))
+                    ry0 = max(0, min(roi[1], sh))
+                    rx1 = max(0, min(roi[2], sw))
+                    ry1 = max(0, min(roi[3], sh))
+                    if rx1 - rx0 >= 16 and ry1 - ry0 >= 16:
+                        stars, bg, sigma = extract_stars(stack[ry0:ry1,
+                                                               rx0:rx1])
+                        for s in stars:
+                            s["x"] += rx0
+                            s["y"] += ry0
+                        roi_used = [rx0, ry0, rx1, ry1]
+                    else:
+                        stars, bg, sigma = extract_stars(stack)
+                else:
+                    stars, bg, sigma = extract_stars(stack)
                 self.stars = stars
                 self.dbg.log(
-                    "burst", kind="light",
+                    "burst", kind="light", roi=roi_used,
                     exposure_units=cap.exposure,
                     capture_s=round(cap.last_capture_s, 2),
                     fps=round(cap.last_fps, 2),
@@ -2154,16 +2260,9 @@ class App:
                 text=f"integrating: {n}/{maxn} frames @ {fps:.1f} fps  ·  "
                      f"stretch {st_lo:.2f}..{st_hi:.2f} ADU "
                      f"(span {st_hi - st_lo:.2f})")
-            # the solver only sees the region (if set); gate auto-solve and
-            # the readout on the stars that actually fall inside it
-            if self.roi is not None:
-                rx0, ry0, rx1, ry1 = self.roi
-                roi_stars = [s for s in stars
-                             if rx0 <= s["x"] < rx1 and ry0 <= s["y"] < ry1]
-                region_note = f"  ({len(roi_stars)} in region)"
-            else:
-                roi_stars = stars
-                region_note = ""
+            # detection is already scoped to the ROI in the worker, so this
+            # star list is the in-region set -- note that in the readout
+            region_note = "  (in region)" if self.roi else ""
             if stars:
                 s0 = stars[0]
                 self.lbl_stars.configure(
@@ -2172,12 +2271,12 @@ class App:
                          f"bg {bg:.1f} σ {sigma:.2f}{region_note}")
             else:
                 self.lbl_stars.configure(
-                    text=f"stars: 0  bg {bg:.1f} σ {sigma:.2f}")
+                    text=f"stars: 0  bg {bg:.1f} σ {sigma:.2f}{region_note}")
             self.btn_solve.configure(
                 state="disabled" if self.solving else "normal")
             self.btn_fits.configure(state="normal")
-            if (self.var_autosolve.get() and not self.solving and roi_stars
-                    and len(roi_stars) >= int(self.var_solve_minstars.get())
+            if (self.var_autosolve.get() and not self.solving and stars
+                    and len(stars) >= int(self.var_solve_minstars.get())
                     and time.monotonic() - self.last_solve_t
                         > float(self.var_solve_interval.get())):
                 self._trigger_solve(auto=True)
