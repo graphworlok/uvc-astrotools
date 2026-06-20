@@ -1054,17 +1054,48 @@ class App:
             return
         titles = {"pole": "Pole offset (θ = RA)",
                   "noise": "Stack noise vs √N", "hist": "Histogram (log y)"}
-        init = {"pole": (560, 560), "noise": (720, 400), "hist": (720, 400)}
+        init = {"pole": (560, 560), "noise": (720, 420), "hist": (720, 420)}
         renderers = {"pole": self._render_pole, "noise": self._render_noise,
                      "hist": self._render_hist}
+        desc = {
+            "pole":
+                "Polar-alignment scope. Each plate solve plots a point at "
+                "angle = field RA and radius = the field centre's angular "
+                "distance from the celestial pole (rings: 1', 5', 10', 30', "
+                "1°; √ radial scale). Newest solve is bright, the trail "
+                "shows drift — adjust the mount to walk the point into the "
+                "centre.",
+            "noise":
+                "Noise of the integrated stack (robust MAD σ) vs frame "
+                "count N. Grey = the ideal 1/√N improvement from averaging; "
+                "green = what's measured. Where green lifts off grey is your "
+                "fixed-pattern / drift floor — past it, stacking more frames "
+                "stops helping. With a solve region set, σ is measured "
+                "inside it. On a near-empty frame this σ reflects residual "
+                "spatial structure, not a true temporal noise floor.",
+            "hist":
+                "Distribution of pixel values, log count on Y. Grey = raw "
+                "frame, green = integrated stack. After dark subtraction the "
+                "stack should pile up near 0 ADU: a narrow spike means a "
+                "clean subtraction with little signal, while a bright tail "
+                "is stars (or, spread across the frame, leftover structure "
+                "/ stray light).",
+        }
         w0, h0 = init[kind]
         win = tk.Toplevel(self.root)
         # explicit offset so it can't open exactly behind a maximised parent
         win.geometry(f"{w0}x{h0}+140+120")
         win.title(titles[kind] + " — expanded (drag edges to resize)")
+        # explanation pinned at the bottom; canvas fills the rest
+        cap = tk.Label(win, text=desc[kind], justify="left", anchor="w",
+                       wraplength=w0 - 16, fg="#9fb0c4", bg="#181820",
+                       padx=8, pady=6, font=("TkDefaultFont", 9))
+        cap.pack(side="bottom", fill="x")
+        cap.bind("<Configure>",
+                 lambda e, lbl=cap: lbl.configure(wraplength=e.width - 16))
         cv = tk.Canvas(win, width=w0, height=h0, bg="#101018",
                        highlightthickness=0)
-        cv.pack(fill="both", expand=True)
+        cv.pack(side="top", fill="both", expand=True)
         self._popouts[kind] = cv
         self._popout_wins[kind] = win
         render = renderers[kind]
@@ -1649,10 +1680,10 @@ class App:
             master_exposure_units=self.master_exp,
             defects=0 if self.defects is None else len(self.defects))
         self._update_dark_label()
-        if self.master_dark is not None:
-            small, _ = downsample_to_fit(self.master_dark,
-                                         self.canvas_w, self.canvas_h)
-            self._show(self.canvas_stack, stretch_to_u8(small), "stack")
+        # NB: the loaded master dark is NOT drawn into the integrated-stack
+        # panel -- doing so looked like persisted stack data across restarts.
+        # Use "View dark/defects" to inspect it; the panel stays blank until
+        # real integration produces a stack (on_reset_stack ran above).
 
     def _update_dark_label(self):
         if self.master_dark is None:
@@ -1722,6 +1753,17 @@ class App:
         self.stars = []
         self.noise_hist = []
         self._draw_noise()
+        # blank the integrated-stack panel so a previous run's image can't
+        # masquerade as live data (the stack lives only in memory; nothing
+        # is reloaded from disk)
+        self.canvas_stack.delete("all")
+        cw = self.canvas_stack.winfo_width()
+        ch = self.canvas_stack.winfo_height()
+        cw = cw if cw > 64 else CANVAS_W
+        ch = ch if ch > 64 else CANVAS_H
+        self.canvas_stack.create_text(cw // 2, ch // 2, fill="#404040",
+                                      text="(empty — Start to integrate)")
+        self._photo_stack = None
         self.lbl_stack.configure(text="integrating: 0 frames")
         self.lbl_stars.configure(text="stars: -")
         self.btn_solve.configure(state="disabled")
