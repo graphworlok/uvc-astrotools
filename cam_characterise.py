@@ -61,6 +61,7 @@ Notes specific to long exposure:
 import argparse
 import ctypes
 import fcntl
+import hashlib
 import json
 import mmap
 import os
@@ -1222,6 +1223,100 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
 # Main
 # ----------------------------------------------------------------------------
 
+def sanitize_tag_component(s, maxlen=32):
+    s = re.sub(r'[^A-Za-z0-9._-]', '_', s)
+    s = re.sub(r'_+', '_', s)
+    s = s.strip('_')
+    return s[:maxlen]
+
+
+def _enum_advertised_modes(device):
+    try:
+        r = subprocess.run(["v4l2-ctl", "-d", device, "--list-formats-ext"],
+                           capture_output=True, text=True, timeout=10)
+        modes, cur_fourcc, cur_w, cur_h = [], None, None, None
+        for line in r.stdout.splitlines():
+            m = re.search(r"\[\d+\]:\s+'(\w+)'", line)
+            if m:
+                cur_fourcc = m.group(1); cur_w = cur_h = None; continue
+            m = re.search(r"Size:\s+Discrete\s+(\d+)x(\d+)", line)
+            if m and cur_fourcc:
+                cur_w, cur_h = int(m.group(1)), int(m.group(2)); continue
+            m = re.search(r"Interval:\s+Discrete\s+[\d.]+s\s+\(([\d.]+)\s*fps\)", line)
+            if m and cur_fourcc and cur_w is not None:
+                fps = float(m.group(1))
+                hit = next((x for x in modes if x['fourcc'] == cur_fourcc
+                            and x['width'] == cur_w and x['height'] == cur_h), None)
+                if hit:
+                    if fps > hit['max_fps']:
+                        hit['max_fps'] = fps
+                else:
+                    modes.append({'fourcc': cur_fourcc, 'width': cur_w,
+                                  'height': cur_h, 'max_fps': fps})
+        return modes
+    except Exception:
+        return []
+
+
+def get_usb_device_info(device):
+    name = os.path.basename(device)
+    try:
+        iface = os.path.realpath(f"/sys/class/video4linux/{name}/device")
+        usb_dev = os.path.dirname(iface)
+
+        def _rd(fname):
+            try:
+                v = open(os.path.join(usb_dev, fname)).read().strip()
+                return v if v else None
+            except OSError:
+                return None
+
+        vid = _rd('idVendor')
+        pid = _rd('idProduct')
+        if not vid or not pid:
+            return None
+
+        bus_raw = _rd('busnum')
+        dev_raw = _rd('devnum')
+
+        driver = None
+        drv = os.path.join(iface, 'driver')
+        if os.path.islink(drv):
+            driver = os.path.basename(os.path.realpath(drv))
+
+        return {
+            'usb_vendor_id':    vid.lower(),
+            'usb_product_id':   pid.lower(),
+            'usb_manufacturer': _rd('manufacturer'),
+            'usb_product':      _rd('product'),
+            'usb_serial':       _rd('serial'),
+            'usb_bcd_device':   _rd('bcdDevice'),
+            'usb_bus_num':      bus_raw.zfill(3) if bus_raw else None,
+            'usb_dev_num':      dev_raw.zfill(3) if dev_raw else None,
+            'kernel_driver':    driver,
+            'advertised_modes': _enum_advertised_modes(device),
+        }
+    except Exception:
+        return None
+
+
+def build_device_tag(usb_info):
+    if not usb_info:
+        return None
+    vid = usb_info.get('usb_vendor_id') or ''
+    pid = usb_info.get('usb_product_id') or ''
+    serial = usb_info.get('usb_serial')
+    if serial:
+        suffix = sanitize_tag_component(serial)
+    else:
+        mfr = usb_info.get('usb_manufacturer') or ''
+        prd = usb_info.get('usb_product') or ''
+        bcd = usb_info.get('usb_bcd_device') or ''
+        h = hashlib.sha1((mfr + prd + bcd).encode()).hexdigest()[:8]
+        suffix = f"NOSERIAL-{h}"
+    return f"{vid}{pid}_{suffix}"
+
+
 def _ensure_dir(path):
     """Create the parent directory of an output file. Save targets may carry a
     device-tag prefix (046d0825_SN123/master_640x480.npy); failing on a missing
@@ -1312,6 +1407,12 @@ def main():
               "argv": sys.argv[1:],
               "width": args.width, "height": args.height}
 
+    usb_info = get_usb_device_info(args.device)
+    report["usb_device"] = usb_info
+    _usb_warn = (None if usb_info is not None
+                 else f"WARNING: could not resolve USB device identity via sysfs for {args.device}")
+    _dev_tag = build_device_tag(usb_info)
+
     def _write_report():
         """Write the report to --report (explicit path) and/or --report-dir
         (timestamped auto-name). Safe to call at any exit point."""
@@ -1325,7 +1426,8 @@ def main():
             mode = ("auto" if args.auto else "ptc" if args.ptc
                     else "dark" if args.dark else "list")
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            fn = f"camchar_{mode}_{args.width}x{args.height}_{ts}.json"
+            tag_part = f"{_dev_tag}_" if _dev_tag else ""
+            fn = f"camchar_{tag_part}{mode}_{args.width}x{args.height}_{ts}.json"
             path = os.path.join(args.report_dir, fn)
             json.dump(report, open(path, "w"), indent=2)
             print(f"\nreport written to {path}")
@@ -1350,6 +1452,12 @@ def main():
 
     meas_fmt = args.format or best["fourcc"]
     report["measurement_format"] = meas_fmt
+    _adv = (usb_info or {}).get('advertised_modes') or []
+    report["is_native_advertised_mode"] = (
+        any(m['fourcc'] == meas_fmt.strip() and m['width'] == args.width
+            and m['height'] == args.height for m in _adv)
+        if usb_info is not None else None
+    )
 
     if args.list and not (args.ptc or args.dark or args.auto):
         _write_report()
@@ -1380,14 +1488,18 @@ def main():
 
     # --- manual mode ---
     print(f"\n=== Forcing manual / disabling adaptive processing ===")
-    report["manual_notes"] = prepare_manual(args.device,
-                                             exposure=args.exposure,
-                                             gain=args.gain,
-                                             gamma=args.gamma,
-                                             brightness=args.brightness,
-                                             contrast=args.contrast,
-                                             sharpness=args.sharpness,
-                                             saturation=args.saturation)
+    _manual_notes = prepare_manual(args.device,
+                                   exposure=args.exposure,
+                                   gain=args.gain,
+                                   gamma=args.gamma,
+                                   brightness=args.brightness,
+                                   contrast=args.contrast,
+                                   sharpness=args.sharpness,
+                                   saturation=args.saturation)
+    if _usb_warn:
+        print(f"   {_usb_warn}")
+        _manual_notes.insert(0, _usb_warn)
+    report["manual_notes"] = _manual_notes
 
     # --- PTC ---
     if args.ptc:

@@ -20,6 +20,7 @@ bridge -- it only reads standard descriptors and standard control ranges.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -42,31 +43,42 @@ def _run(cmd):
         return ""
 
 
+def sanitize_tag_component(s, maxlen=32):
+    s = re.sub(r'[^A-Za-z0-9._-]', '_', s)
+    s = re.sub(r'_+', '_', s)
+    s = s.strip('_')
+    return s[:maxlen]
+
+
 def usb_device_tag(device):
-    """Return a stable identifier string for a /dev/videoN device: vid+pid[_serial].
-    Reads USB VID, PID and serial number from sysfs. Returns '' on failure or
-    non-Linux platforms so callers can fall back to resolution-only naming."""
+    """Return a stable identifier string for a /dev/videoN device: vid+pid_serial
+    (or vid+pid_NOSERIAL-<hash> when serial is absent). Reads from sysfs only.
+    Returns '' on failure so callers can fall back to resolution-only naming."""
     name = os.path.basename(device)
     try:
-        # /sys/class/video4linux/videoN/device -> UVC interface symlink
-        # one level up is the USB device node with idVendor/idProduct/serial
         iface = os.path.realpath(f"/sys/class/video4linux/{name}/device")
         usb_dev = os.path.dirname(iface)
 
-        def _read(fname):
+        def _rd(fname):
             try:
-                return open(os.path.join(usb_dev, fname)).read().strip()
+                v = open(os.path.join(usb_dev, fname)).read().strip()
+                return v if v else None
             except OSError:
-                return ""
+                return None
 
-        vid, pid, sn = _read("idVendor"), _read("idProduct"), _read("serial")
+        vid, pid = _rd("idVendor"), _rd("idProduct")
         if not vid or not pid:
             return ""
-        tag = vid + pid                              # e.g. "046d0825"
-        if sn:
-            sn = re.sub(r"[^a-zA-Z0-9\-]", "_", sn)
-            tag += "_" + sn
-        return tag
+        serial = _rd("serial")
+        if serial:
+            suffix = sanitize_tag_component(serial)
+        else:
+            mfr = _rd("manufacturer") or ""
+            prd = _rd("product") or ""
+            bcd = _rd("bcdDevice") or ""
+            h = hashlib.sha1((mfr + prd + bcd).encode()).hexdigest()[:8]
+            suffix = f"NOSERIAL-{h}"
+        return f"{vid}{pid}_{suffix}"
     except Exception:
         return ""
 
