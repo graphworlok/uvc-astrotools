@@ -333,7 +333,7 @@ def main():
         print("  device tag: (not available — USB sysfs lookup failed; "
               "files will be in the current directory)")
 
-    base = [args.python, args.tool]
+    base = [args.python, args.tool, "--device", args.device]
     lines = []
     for r in runs:
         tail = list(r["argv_tail"]) + ["--report-dir", args.report_dir]
