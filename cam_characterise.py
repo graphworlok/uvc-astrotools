@@ -1317,6 +1317,24 @@ def build_device_tag(usb_info):
     return f"{vid}{pid}_{suffix}"
 
 
+_NAMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_names.json")
+
+
+def load_device_names():
+    try:
+        with open(_NAMES_FILE) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_device_name(tag, name):
+    names = load_device_names()
+    names[tag] = name
+    with open(_NAMES_FILE, "w") as f:
+        json.dump(names, f, indent=2)
+
+
 def _ensure_dir(path):
     """Create the parent directory of an output file. Save targets may carry a
     device-tag prefix (046d0825_SN123/master_640x480.npy); failing on a missing
@@ -1329,6 +1347,9 @@ def _ensure_dir(path):
 def main():
     ap = argparse.ArgumentParser(description="UVC camera noise/codec characteriser")
     ap.add_argument("--device", default="/dev/video0")
+    ap.add_argument("--name", default=None,
+                    help="human-readable camera name; saved against the device tag "
+                    "and auto-loaded on future runs for the same device")
     ap.add_argument("--list", action="store_true",
                     help="enumerate + rank formats and pick measurement format")
     ap.add_argument("--ptc", action="store_true", help="run photon transfer curve")
@@ -1412,6 +1433,16 @@ def main():
     _usb_warn = (None if usb_info is not None
                  else f"WARNING: could not resolve USB device identity via sysfs for {args.device}")
     _dev_tag = build_device_tag(usb_info)
+
+    _names = load_device_names()
+    _device_name = args.name
+    if _device_name and _dev_tag:
+        save_device_name(_dev_tag, _device_name)
+        print(f"   device name '{_device_name}' saved for {_dev_tag}")
+    elif not _device_name and _dev_tag and _dev_tag in _names:
+        _device_name = _names[_dev_tag]
+        print(f"   device name: '{_device_name}'")
+    report["device_name"] = _device_name
 
     def _write_report():
         """Write the report to --report (explicit path) and/or --report-dir
