@@ -1230,6 +1230,27 @@ def sanitize_tag_component(s, maxlen=32):
     return s[:maxlen]
 
 
+def _ctrl_capabilities_str(device):
+    try:
+        r = subprocess.run(["v4l2-ctl", "-d", device, "--list-ctrls"],
+                           capture_output=True, text=True, timeout=10)
+        entries = []
+        for line in r.stdout.splitlines():
+            m = re.match(r'\s*(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)', line)
+            if not m:
+                continue
+            name, ctype, rest = m.group(1), m.group(2), m.group(3)
+            parts = [f"{name}({ctype})"]
+            for k in ('min', 'max', 'step', 'default'):
+                mm = re.search(rf'{k}=(-?\d+)', rest)
+                if mm:
+                    parts.append(f"{k}={mm.group(1)}")
+            entries.append(':'.join(parts))
+        return '|'.join(sorted(entries))
+    except Exception:
+        return ''
+
+
 def _enum_advertised_modes(device):
     try:
         r = subprocess.run(["v4l2-ctl", "-d", device, "--list-formats-ext"],
@@ -1284,6 +1305,15 @@ def get_usb_device_info(device):
         if os.path.islink(drv):
             driver = os.path.basename(os.path.realpath(drv))
 
+        adv = _enum_advertised_modes(device)
+        modes_str = '|'.join(
+            f"{m['fourcc']}:{m['width']}x{m['height']}@{m['max_fps']}"
+            for m in sorted(adv, key=lambda m: (m['fourcc'], m['width'], m['height']))
+        )
+        cap_hash = hashlib.sha1(
+            f"{modes_str};{_ctrl_capabilities_str(device)}".encode()
+        ).hexdigest()[:12]
+
         return {
             'usb_vendor_id':    vid.lower(),
             'usb_product_id':   pid.lower(),
@@ -1294,7 +1324,8 @@ def get_usb_device_info(device):
             'usb_bus_num':      bus_raw.zfill(3) if bus_raw else None,
             'usb_dev_num':      dev_raw.zfill(3) if dev_raw else None,
             'kernel_driver':    driver,
-            'advertised_modes': _enum_advertised_modes(device),
+            'advertised_modes': adv,
+            'capability_hash':  cap_hash,
         }
     except Exception:
         return None
