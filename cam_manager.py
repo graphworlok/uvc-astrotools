@@ -34,6 +34,24 @@ from datetime import datetime, timezone
 # Introspection via v4l2-ctl (standalone; does not import the main tool)
 # ----------------------------------------------------------------------------
 
+_NAMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_names.json")
+
+
+def load_device_names():
+    try:
+        with open(_NAMES_FILE) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_device_name(tag, name):
+    names = load_device_names()
+    names[tag] = name
+    with open(_NAMES_FILE, "w") as f:
+        json.dump(names, f, indent=2)
+
+
 def _run(cmd):
     try:
         return subprocess.run(cmd, capture_output=True, text=True,
@@ -292,6 +310,9 @@ def main():
     ap = argparse.ArgumentParser(
         description="Query a camera and generate a full cam_characterise.py run set.")
     ap.add_argument("--device", default="/dev/video0")
+    ap.add_argument("--name", default=None,
+                    help="human-readable camera name; saved against the device tag "
+                    "and auto-loaded on future runs for the same device")
     ap.add_argument("--tool", default="cam_characterise.py",
                     help="path to the characterisation tool to invoke")
     ap.add_argument("--python", default=sys.executable)
@@ -332,6 +353,16 @@ def main():
         sys.exit(1)
 
     small, large, exp_min, exp_max, dev_tag = meta
+
+    _names = load_device_names()
+    _device_name = args.name
+    if _device_name and dev_tag:
+        save_device_name(dev_tag, _device_name)
+        print(f"  device name: '{_device_name}' (saved)")
+    elif not _device_name and dev_tag and dev_tag in _names:
+        _device_name = _names[dev_tag]
+        print(f"  device name: '{_device_name}'")
+
     print(f"\n  measurement format: {fmt['fourcc']}")
     print(f"  instrument resolution (small): {small['w']}x{small['h']} "
           f"(max {max_advertised_fps(small)} fps)")
