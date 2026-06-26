@@ -172,10 +172,19 @@ def write_fits_u16(path, img):
 # per burst as align_conf so it can be calibrated against real fields.
 ALIGN_MIN_CONF = 6.0
 
+# Thumbnail box the phase correlation runs on. Bigger thumbnail -> smaller
+# downsample stride -> finer shift. At 1920x1080 a 256 box gave stride 8, so
+# any drift under 8 full-res px rounded to a zero shift and the stack smeared
+# on exactly the sub-pixel drift it was meant to correct. 512 gives stride ~4,
+# and phase_shift's parabolic refinement adds sub-pixel within that.
+ALIGN_THUMB = 512
+
 
 def phase_shift(ref_small, img_small):
-    """Integer (dy, dx, conf) translation of img relative to ref via phase
-    correlation on downsampled frames. conf is the correlation peak's
+    """Sub-pixel (dy, dx, conf) translation of img relative to ref via phase
+    correlation on downsampled frames. The integer peak is refined by
+    parabolic interpolation on its neighbours, so the estimate is NOT
+    quantized to the downsample stride. conf is the correlation peak's
     prominence over the surface (peak-minus-median / robust sigma); a low
     conf means there is no trustworthy translation signal and the caller
     should not align. Cheap and rotation-free -- right for short-session
@@ -196,34 +205,69 @@ def phase_shift(ref_small, img_small):
     mag = np.abs(cps)
     mag[mag < 1e-12] = 1e-12
     corr = np.fft.irfft2(cps / mag, s=ref_small.shape)
-    peak_idx = np.unravel_index(np.argmax(corr), corr.shape)
+    h, w = corr.shape
+    py, px = np.unravel_index(np.argmax(corr), corr.shape)
     med = float(np.median(corr))
     sigma = 1.4826 * float(np.median(np.abs(corr - med))) or 1e-9
-    conf = (float(corr[peak_idx]) - med) / sigma
-    dy, dx = peak_idx
-    if dy > ref_small.shape[0] // 2:
-        dy -= ref_small.shape[0]
-    if dx > ref_small.shape[1] // 2:
-        dx -= ref_small.shape[1]
+    conf = (float(corr[py, px]) - med) / sigma
+
+    # parabolic sub-pixel refinement along each axis from the peak's immediate
+    # neighbours. The correlation surface is circular, so index mod size. The
+    # offset of a true quadratic peak falls in [-0.5, 0.5]; clamp to [-1, 1]
+    # against a near-flat denominator on a featureless field.
+    def _sub(c_minus, c0, c_plus):
+        denom = c_minus - 2.0 * c0 + c_plus
+        if denom == 0.0:
+            return 0.0
+        return max(-1.0, min(1.0, 0.5 * (c_minus - c_plus) / denom))
+
+    c0 = float(corr[py, px])
+    fy = _sub(float(corr[(py - 1) % h, px]), c0, float(corr[(py + 1) % h, px]))
+    fx = _sub(float(corr[py, (px - 1) % w]), c0, float(corr[py, (px + 1) % w]))
+    dy = py + fy
+    dx = px + fx
+    if dy > h / 2.0:
+        dy -= h
+    if dx > w / 2.0:
+        dx -= w
     return dy, dx, conf
 
 
 def shift_fill(img, dy, dx):
-    """Translate by (dy, dx) WITHOUT wraparound. Exposed edges are filled
-    with the frame's own background (median), so a drift correction never
-    folds the bright opposite edge back into the stack -- np.roll's wrap was
-    the source of the mirrored 'butterfly' ghosts on featureless fields."""
+    """Translate by (dy, dx) -- fractional allowed, bilinear -- WITHOUT
+    wraparound. Exposed edges are filled with the frame's own background
+    (median), so a drift correction never folds the bright opposite edge back
+    into the stack (np.roll's wrap was the source of the mirrored 'butterfly'
+    ghosts on featureless fields)."""
     if dy == 0 and dx == 0:
         return img
     h, w = img.shape
+    fill = float(np.median(img))
     if abs(dy) >= h or abs(dx) >= w:        # shifted entirely out of frame
-        return np.full_like(img, float(np.median(img)))
-    out = np.full_like(img, float(np.median(img)))
-    sy0, sy1 = max(0, -dy), min(h, h - dy)
-    sx0, sx1 = max(0, -dx), min(w, w - dx)
-    out[max(0, dy):max(0, dy) + (sy1 - sy0),
-        max(0, dx):max(0, dx) + (sx1 - sx0)] = img[sy0:sy1, sx0:sx1]
-    return out
+        return np.full_like(img, fill)
+
+    def _int_shift(a, sy, sx):
+        out = np.full_like(a, fill)
+        ah, aw = a.shape
+        dy0, dy1 = max(0, -sy), min(ah, ah - sy)
+        dx0, dx1 = max(0, -sx), min(aw, aw - sx)
+        if dy1 > dy0 and dx1 > dx0:
+            out[max(0, sy):max(0, sy) + (dy1 - dy0),
+                max(0, sx):max(0, sx) + (dx1 - dx0)] = a[dy0:dy1, dx0:dx1]
+        return out
+
+    iy, fy = int(np.floor(dy)), float(dy - np.floor(dy))
+    ix, fx = int(np.floor(dx)), float(dx - np.floor(dx))
+    if fy == 0.0 and fx == 0.0:
+        return _int_shift(img, iy, ix)
+    # bilinear blend of the four integer-shifted corners: out[y] samples img
+    # between rows (y-iy-1) and (y-iy), weighted by the fractional part.
+    c00 = _int_shift(img, iy, ix)
+    c01 = _int_shift(img, iy, ix + 1)
+    c10 = _int_shift(img, iy + 1, ix)
+    c11 = _int_shift(img, iy + 1, ix + 1)
+    return ((1.0 - fy) * ((1.0 - fx) * c00 + fx * c01)
+            + fy * ((1.0 - fx) * c10 + fx * c11))
 
 
 def repair_defects(img, yx):
@@ -245,11 +289,17 @@ def repair_defects(img, yx):
     return img
 
 
-def extract_stars(img, nsigma=5.0, min_pix=2, max_pix=500, max_stars=100):
+def extract_stars(img, nsigma=5.0, min_pix=2, max_pix=500, max_stars=100,
+                  min_fwhm=1.3):
     """Detect stars on a (dark-subtracted) image: robust background via
     median/MAD, threshold at nsigma, 8-connected components by flood fill on
     the sparse mask, flux-weighted centroids, flux, and a moment-based FWHM.
-    Returns a list of dicts sorted by flux descending."""
+    Returns a list of dicts sorted by flux descending.
+
+    min_fwhm rejects components tighter than a real (even undersampled) star:
+    single hot pixels and 2-3px hot-pixel clusters have FWHM well under ~1.3,
+    and on bridges with an unstable dark floor they are the dominant source of
+    phantom 'stars'. A genuine point source on these optics spreads wider."""
     bg = float(np.median(img))
     mad = float(np.median(np.abs(img - bg)))
     sigma = 1.4826 * mad
@@ -295,6 +345,8 @@ def extract_stars(img, nsigma=5.0, min_pix=2, max_pix=500, max_stars=100):
         var = float(((ys - cyf) ** 2 * fluxes).sum() / ftot
                     + ((xs - cxf) ** 2 * fluxes).sum() / ftot) / 2.0
         fwhm = 2.355 * np.sqrt(max(var, 0.05))
+        if fwhm < min_fwhm:
+            continue            # hot pixel / tight cluster, not a star
         stars.append({"x": cxf, "y": cyf, "flux": ftot,
                       "npix": len(comp), "fwhm": round(fwhm, 2)})
     stars.sort(key=lambda s: -s["flux"])
@@ -2063,8 +2115,10 @@ class App:
 
                 last_raw = None
                 last_proc = None
-                last_shift = (0, 0)
+                last_shift = (0.0, 0.0)
                 last_conf = None
+                last_applied = False      # a non-zero shift was actually used
+                last_ref_set = align_ref is not None
                 for fr in cap.iter_luma(path, burst, discard=1):
                     if self.stop_evt.is_set():
                         break
@@ -2078,23 +2132,24 @@ class App:
                     if paused:
                         continue          # display only; no integration
                     if align:
-                        small, f = downsample_to_fit(proc, 256, 256)
+                        small, f = downsample_to_fit(proc, ALIGN_THUMB, ALIGN_THUMB)
                         if align_ref is None:
                             align_ref = small.copy()
+                            last_ref_set = True
                         else:
                             dy, dx, conf = phase_shift(align_ref, small)
+                            last_conf = conf      # logged even when not applied
                             # only act on a clear peak and a plausible drift
                             # (<= 1/4 frame); otherwise a featureless field
                             # yields garbage shifts that smear the stack
                             maxsh = max(small.shape) // 4
                             if (conf >= ALIGN_MIN_CONF
                                     and abs(dy) <= maxsh and abs(dx) <= maxsh):
-                                last_shift = (dy * f, dx * f)
-                                last_conf = conf
-                                proc = shift_fill(proc, dy * f, dx * f)
-                            else:
-                                last_shift = (0, 0)
-                                last_conf = conf
+                                sy, sx = dy * f, dx * f
+                                if sy != 0.0 or sx != 0.0:
+                                    proc = shift_fill(proc, sy, sx)
+                                    last_shift = (sy, sx)
+                                    last_applied = True
                     f32 = proc.astype(np.float32)
                     while len(ring) >= maxn:   # window shrink also handled
                         ssum -= ring.popleft()
@@ -2165,7 +2220,16 @@ class App:
                     capture_s=round(cap.last_capture_s, 2),
                     fps=round(cap.last_fps, 2),
                     ring=len(ring), window_max=maxn,
-                    align_shift=list(last_shift),
+                    # align_on distinguishes "toggle off" from a real attempt;
+                    # align_applied distinguishes a no-shift result (good conf,
+                    # zero drift, OR rejected low conf) from one that moved the
+                    # frame. With these three an inert pipeline is unambiguous
+                    # in the log: align_on false = off; on+conf+!applied = no
+                    # usable shift; applied = corrected.
+                    align_on=align,
+                    align_ref_set=last_ref_set,
+                    align_applied=last_applied,
+                    align_shift=[round(last_shift[0], 2), round(last_shift[1], 2)],
                     align_conf=(round(last_conf, 2)
                                 if last_conf is not None else None),
                     raw=frame_stats(last_raw), proc=frame_stats(last_proc),
