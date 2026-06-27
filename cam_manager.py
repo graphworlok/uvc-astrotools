@@ -288,6 +288,34 @@ def plan(device, formats, ctrls, args):
                        "(watch corner/centre ratio).",
                 "argv_tail": tail})
 
+    # 3b. clamp sweep (--clamp-sweep): the FULL exposure ladder at each of
+    # several gamma steps. Single-exposure gamma runs above cannot tell where
+    # an ISP black-level clamp releases or whether exposure control is real;
+    # this maps both jointly. Per gamma watch: does ladder mean ADU rise with
+    # exposure (clamp released) or stay flat (clamped), and does the
+    # exposure-fidelity verdict flip from synthetic to real.
+    if has_gamma and getattr(args, "clamp_sweep", False):
+        try:
+            gammas = [int(x) for x in args.clamp_gammas.split(",") if x.strip()]
+        except ValueError:
+            gammas = [g_lo, g_mid, g_hi]
+        gammas = sorted(set(max(g_lo, min(g_hi, gv)) for gv in gammas))
+        for gv in gammas:
+            tail = ["--dark"] + common + lad + ["--gamma", str(gv)]
+            for c in ("brightness", "contrast"):
+                if c in ctrls:
+                    tail += [f"--{c}", "0"]
+            if "sharpness" in ctrls:
+                tail += ["--sharpness", str(ctrls["sharpness"].get("min", 1))]
+            tail += ["--save-master", f"{p}master_clamp_g{gv}.npy"]
+            runs.append({
+                "label": f"clamp_g{gv}",
+                "why": f"gamma={gv}, FULL exposure ladder {exp_min}..{exp_max}: "
+                       "maps where the black-level clamp releases (mean ADU "
+                       "starts rising with exposure) and whether exposure "
+                       "becomes real (fps falls with exposure) vs synthetic.",
+                "argv_tail": tail})
+
     # 4. AE reference at small res (uses the calibration from run 1)
     runs.append({
         "label": "auto_ae_reference",
@@ -322,6 +350,13 @@ def main():
     ap.add_argument("--ladder-frames", type=int, default=16)
     ap.add_argument("--auto-iters", type=int, default=20)
     ap.add_argument("--auto-frames", type=int, default=30)
+    ap.add_argument("--clamp-sweep", action="store_true",
+                    help="add full-exposure-ladder dark runs at each --clamp-gammas "
+                    "step, to map where a black-level clamp releases and whether "
+                    "exposure control becomes real (vs synthetic) with gamma")
+    ap.add_argument("--clamp-gammas", default="100,150,200,250,300",
+                    help="comma-separated gamma values for --clamp-sweep "
+                    "(clamped to the device's gamma range). Default 100..300.")
     ap.add_argument("--out", default=None,
                     help="write the generated commands to this shell script")
     ap.add_argument("--run", action="store_true",

@@ -1381,6 +1381,11 @@ def main():
     ap.add_argument("--name", default=None,
                     help="human-readable camera name; saved against the device tag "
                     "and auto-loaded on future runs for the same device")
+    ap.add_argument("--identify", action="store_true",
+                    help="print full USB identity + capability hash + device tag "
+                    "for this device, then exit. Run on each unit to compare two "
+                    "cameras that share a VID:PID (different capability_hash = "
+                    "different sensor/firmware).")
     ap.add_argument("--list", action="store_true",
                     help="enumerate + rank formats and pick measurement format")
     ap.add_argument("--ptc", action="store_true", help="run photon transfer curve")
@@ -1494,6 +1499,26 @@ def main():
             json.dump(report, open(path, "w"), indent=2)
             print(f"\nreport written to {path}")
 
+    # --- identify: print identity + capability hash and exit ---
+    if args.identify:
+        print(f"\n=== IDENTITY for {args.device} ===")
+        print(f"  device_name : {_device_name or '(unnamed)'}")
+        print(f"  device_tag  : {_dev_tag or '(unresolved)'}")
+        if usb_info is None:
+            print(f"  {_usb_warn}")
+        else:
+            for k in ("usb_vendor_id", "usb_product_id", "usb_manufacturer",
+                      "usb_product", "usb_serial", "usb_bcd_device",
+                      "kernel_driver", "capability_hash"):
+                print(f"  {k:16s}: {usb_info.get(k)}")
+            modes = usb_info.get("advertised_modes") or []
+            print(f"  advertised_modes: {len(modes)}")
+            for m in modes:
+                print(f"      {m['fourcc']:5s} {m['width']}x{m['height']} "
+                      f"@ {m['max_fps']}fps")
+        _write_report()
+        return
+
     # --- formats ---
     formats = enum_formats(args.device)
     ranked = rank_formats(formats)
@@ -1520,6 +1545,21 @@ def main():
             and m['height'] == args.height for m in _adv)
         if usb_info is not None else None
     )
+    # A resolution the device does not advertise is produced by the bridge
+    # scaling/cropping a different native readout. The interpolation seam shows
+    # up as edge-column "hot pixels" and inflated FPN, so the defect map and
+    # FPN from such a run are artefacts, not the sensor. Warn loudly.
+    _nonnative_warn = None
+    if report["is_native_advertised_mode"] is False:
+        native = ", ".join(sorted({f"{m['width']}x{m['height']}"
+                                   for m in _adv if m['fourcc'] == meas_fmt.strip()})) \
+                 or "(none advertised for this format)"
+        _nonnative_warn = (
+            f"WARNING: {meas_fmt} {args.width}x{args.height} is NOT an advertised "
+            f"native mode (advertised: {native}). The bridge is scaling/cropping; "
+            "defect map and FPN will be rescaling artefacts, not the sensor. "
+            "Re-run at an advertised native resolution.")
+        print(f"\n!! {_nonnative_warn}")
 
     if args.list and not (args.ptc or args.dark or args.auto):
         _write_report()
@@ -1544,6 +1584,16 @@ def main():
                                calib=calib)
         finally:
             cap.close()
+        # AE control readback is unreliable across every bridge tested: the
+        # exposure_time_absolute readback disagrees with the fps-implied
+        # exposure. Make the recommendation explicit and machine-readable so
+        # downstream tooling keys off fps, not the readback.
+        verdict = ae.get("control_vs_fps_verdict", "")
+        ae["exposure_source_recommendation"] = (
+            "use fps_implied_exposure as ground truth; do NOT trust "
+            "exposure_time_absolute readback"
+            if "DISAGREE" in verdict or not verdict
+            else "exposure_time_absolute readback agrees with fps; either may be used")
         report["auto_dark"] = ae
         _write_report()
         return
@@ -1561,6 +1611,8 @@ def main():
     if _usb_warn:
         print(f"   {_usb_warn}")
         _manual_notes.insert(0, _usb_warn)
+    if _nonnative_warn:
+        _manual_notes.insert(0, _nonnative_warn)
     report["manual_notes"] = _manual_notes
 
     # --- PTC ---
@@ -1609,6 +1661,14 @@ def main():
             print("   !! deep stack CLIPPED -- refusing to write master/defects/"
                   "dark-model (fix the processing path: reduce brightness/"
                   "contrast/gamma, then rerun)")
+        # Non-native resolution: still write if asked (the user may want it for a
+        # matching guide resolution), but stamp the artefact warning so the files
+        # are never mistaken for a true sensor defect map.
+        if _nonnative_warn and (args.save_master or args.save_defects
+                                or args.save_dark_model):
+            print(f"   !! writing calibration from a NON-NATIVE mode -- "
+                  f"{args.width}x{args.height} is bridge-scaled; these are "
+                  "rescaling artefacts, not the sensor's true defects/FPN")
         if args.save_master and master is not None and not deep_clipped:
             # Scale float64 luma (0-255) to uint16 (0-65535) for direct PHD2 import.
             # 257 * 255 = 65535 exactly; np.round preserves sub-ADU precision.
@@ -1625,6 +1685,11 @@ def main():
                          f"{args.width}x{args.height}\n")
                 fh.write(f"# Exposure: {args.exposure_max} units "
                          f"({dark['exposure_max_ms']}ms)\n")
+                fh.write(f"# Native advertised mode: "
+                         f"{report['is_native_advertised_mode']}\n")
+                if _nonnative_warn:
+                    fh.write("# WARNING: non-native (bridge-scaled) mode -- "
+                             "these defects are rescaling artefacts\n")
                 fh.write(f"# Defect count: {len(coords)}\n")
                 for y, x in coords:  # PHD2 format is x y (screen coords)
                     fh.write(f"{x} {y}\n")
