@@ -257,13 +257,40 @@ def ladder_for(exp_min, exp_max, n=12):
     return sorted(p for p in pts if exp_min <= p <= exp_max)
 
 
-def pick_resolutions(fmt):
-    """Return (smallest, largest) discrete sizes for the chosen format.
-    Smallest = best chance the fps-vs-exposure instrument works (high bandwidth
-    ceiling). Largest = full-array defect/shading picture."""
+def native_factor_sizes(sizes):
+    """Keep only resolutions that are an exact integer-factor decimation of the
+    native (largest) mode: native_w/w == native_h/h, both integer. Those are
+    true NxN bins/crops of the sensor array, so their defect map and FPN reflect
+    real sensor pixels. Non-integer scales (e.g. 1280x720 from 1920x1080 = 1.5x,
+    or any aspect-ratio change) are bridge interpolation and produce artefact
+    defect maps. The native mode itself (factor 1) is always kept."""
+    if not sizes:
+        return []
+    native = max(sizes, key=lambda s: s["w"] * s["h"])
+    nw, nh = native["w"], native["h"]
+    keep = []
+    for s in sizes:
+        if s["w"] <= 0 or s["h"] <= 0:
+            continue
+        if (nw % s["w"] == 0 and nh % s["h"] == 0
+                and nw // s["w"] == nh // s["h"]):
+            keep.append(s)
+    return keep
+
+
+def pick_resolutions(fmt, native_only=True):
+    """Return (sizes, smallest, largest) discrete sizes for the chosen format,
+    sorted ascending by pixel count. By default restrict to integer-factor
+    decimations of the native (largest) mode -- the only resolutions whose
+    defect/FPN data reflects real sensor pixels rather than bridge interpolation.
+    native_only=False returns every advertised discrete size."""
     if not fmt or not fmt["sizes"]:
         return [], None, None
     sizes = sorted(fmt["sizes"], key=lambda s: s["w"] * s["h"])
+    if native_only:
+        clean = native_factor_sizes(sizes)
+        if clean:
+            sizes = sorted(clean, key=lambda s: s["w"] * s["h"])
     return sizes, sizes[0], sizes[-1]
 
 
@@ -277,7 +304,8 @@ def plan(device, formats, ctrls, args):
     fmt = best_uncompressed(formats)
     if not fmt:
         return runs, None, None
-    sizes, small, large = pick_resolutions(fmt)
+    sizes, small, large = pick_resolutions(
+        fmt, native_only=not getattr(args, "all_resolutions", False))
 
     exp = ctrls.get("exposure_time_absolute", {})
     exp_min = exp.get("min", 1)
@@ -431,6 +459,11 @@ def main():
     ap.add_argument("--ladder-frames", type=int, default=16)
     ap.add_argument("--auto-iters", type=int, default=20)
     ap.add_argument("--auto-frames", type=int, default=30)
+    ap.add_argument("--all-resolutions", action="store_true",
+                    help="characterise every advertised discrete resolution. "
+                    "Default: only integer-factor decimations of the native (max) "
+                    "mode, whose defect/FPN data reflects real sensor pixels; "
+                    "non-integer scales are bridge interpolation (artefact maps).")
     ap.add_argument("--neutral-gamma", type=int, default=None,
                     help="gamma for the per-resolution dark runs (default: device "
                     "min == linear). Raise it on bridges whose min-gamma output is "
@@ -496,6 +529,22 @@ def main():
             print("    NOTE: gamma=100 is black-level clamped on some bridges "
                   "(flat masters). If the deep stack reads dead-flat, re-run "
                   "with --neutral-gamma above the clamp.")
+    # show which resolutions will be characterised and which were filtered out
+    all_sizes = sorted(fmt["sizes"], key=lambda s: s["w"] * s["h"])
+    kept, _, _ = pick_resolutions(fmt, native_only=not args.all_resolutions)
+    kept_set = {(s["w"], s["h"]) for s in kept}
+    nat = max(all_sizes, key=lambda s: s["w"] * s["h"])
+    if args.all_resolutions:
+        print(f"  resolutions: ALL {len(kept)} advertised modes (--all-resolutions)")
+    else:
+        dropped = [f"{s['w']}x{s['h']}" for s in all_sizes
+                   if (s["w"], s["h"]) not in kept_set]
+        print(f"  resolutions: {len(kept)} native-factor modes of "
+              f"{nat['w']}x{nat['h']} "
+              + ", ".join(f"{s['w']}x{s['h']}(1/{nat['w']//s['w']})" for s in kept))
+        if dropped:
+            print(f"    skipped (non-integer bridge scales): {', '.join(dropped)}")
+            print("    -> pass --all-resolutions to characterise them anyway")
     print(f"  instrument resolution (small): {small['w']}x{small['h']} "
           f"(max {max_advertised_fps(small)} fps)")
     print(f"  full resolution (large): {large['w']}x{large['h']} "
