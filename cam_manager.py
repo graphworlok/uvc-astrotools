@@ -288,6 +288,14 @@ def plan(device, formats, ctrls, args):
     g = ctrls.get("gamma", {})
     g_lo, g_hi = g.get("min", 100), g.get("max", 300)
     g_mid = (g_lo + g_hi) // 2
+    # Gamma for the per-resolution dark runs. Default g_lo (min == linear), the
+    # right choice for a well-behaved sensor. But some bridges (Sunplus
+    # 1bcf:28c4) sit in a black-level CLAMP at min gamma: the deep stack comes
+    # back dead-flat (mean ~4 ADU, zero temporal noise, zero FPN) and every
+    # master/defect/dark-model written is junk. On those, raise --neutral-gamma
+    # above the clamp (the clamp-sweep finds where it releases).
+    neutral_gamma = (g_lo if getattr(args, "neutral_gamma", None) is None
+                     else max(g_lo, min(g_hi, args.neutral_gamma)))
 
     # Device tag: vid+pid[_serial] from sysfs, used as output subdirectory so
     # files from different cameras never collide even at the same resolution.
@@ -297,7 +305,7 @@ def plan(device, formats, ctrls, args):
     def neutral_proc():
         t = []
         if has_gamma:
-            t += ["--gamma", str(g_lo)]
+            t += ["--gamma", str(neutral_gamma)]
         for c in ("brightness", "contrast"):
             if c in ctrls:
                 t += [f"--{c}", "0"]
@@ -423,6 +431,11 @@ def main():
     ap.add_argument("--ladder-frames", type=int, default=16)
     ap.add_argument("--auto-iters", type=int, default=20)
     ap.add_argument("--auto-frames", type=int, default=30)
+    ap.add_argument("--neutral-gamma", type=int, default=None,
+                    help="gamma for the per-resolution dark runs (default: device "
+                    "min == linear). Raise it on bridges whose min-gamma output is "
+                    "black-level clamped (dead-flat masters), e.g. --neutral-gamma "
+                    "200 on the Sunplus 1bcf:28c4 family. Clamped to the gamma range.")
     ap.add_argument("--clamp-sweep", action="store_true",
                     help="add full-exposure-ladder dark runs at each --clamp-gammas "
                     "step, to map where a black-level clamp releases and whether "
@@ -472,6 +485,17 @@ def main():
         print(f"  device name: '{_device_name}'")
 
     print(f"\n  measurement format: {fmt['fourcc']}")
+    if "gamma" in ctrls:
+        g = ctrls["gamma"]
+        ng = (g.get("min", 100) if args.neutral_gamma is None
+              else max(g.get("min", 100), min(g.get("max", 300), args.neutral_gamma)))
+        note = "" if args.neutral_gamma is None else "  (overridden)"
+        print(f"  dark-run gamma: {ng}{note}  [device range "
+              f"{g.get('min')}..{g.get('max')}]")
+        if args.neutral_gamma is None and g.get("min", 100) == 100:
+            print("    NOTE: gamma=100 is black-level clamped on some bridges "
+                  "(flat masters). If the deep stack reads dead-flat, re-run "
+                  "with --neutral-gamma above the clamp.")
     print(f"  instrument resolution (small): {small['w']}x{small['h']} "
           f"(max {max_advertised_fps(small)} fps)")
     print(f"  full resolution (large): {large['w']}x{large['h']} "
