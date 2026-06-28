@@ -1279,6 +1279,27 @@ def _enum_advertised_modes(device):
         return []
 
 
+def device_capability_hash(device, adv=None):
+    """Stable 12-char fingerprint of the device's ADVERTISED capabilities: the
+    mode list (fourcc + resolution + max fps) and the control ranges
+    (name/type/min/max/step/default -- never current values). Independent of
+    VID:PID and descriptor strings, so it tells apart two products that share a
+    generic bridge ID: a 4K sensor and a 1080p sensor advertise different
+    resolutions, so their mode lists -- and therefore this hash -- differ.
+
+    MUST stay byte-identical to cam_manager.py's copy, or the device tags the
+    two tools build will diverge and their output paths won't line up."""
+    if adv is None:
+        adv = _enum_advertised_modes(device)
+    modes_str = '|'.join(
+        f"{m['fourcc']}:{m['width']}x{m['height']}@{m['max_fps']}"
+        for m in sorted(adv, key=lambda m: (m['fourcc'], m['width'], m['height']))
+    )
+    return hashlib.sha1(
+        f"{modes_str};{_ctrl_capabilities_str(device)}".encode()
+    ).hexdigest()[:12]
+
+
 def get_usb_device_info(device):
     name = os.path.basename(device)
     try:
@@ -1306,13 +1327,7 @@ def get_usb_device_info(device):
             driver = os.path.basename(os.path.realpath(drv))
 
         adv = _enum_advertised_modes(device)
-        modes_str = '|'.join(
-            f"{m['fourcc']}:{m['width']}x{m['height']}@{m['max_fps']}"
-            for m in sorted(adv, key=lambda m: (m['fourcc'], m['width'], m['height']))
-        )
-        cap_hash = hashlib.sha1(
-            f"{modes_str};{_ctrl_capabilities_str(device)}".encode()
-        ).hexdigest()[:12]
+        cap_hash = device_capability_hash(device, adv)
 
         return {
             'usb_vendor_id':    vid.lower(),
@@ -1332,6 +1347,13 @@ def get_usb_device_info(device):
 
 
 def build_device_tag(usb_info):
+    """Filename-safe device tag: {vid}{pid}_{serial}_{capability_hash}.
+
+    The capability hash is appended because the bridge serial alone collides:
+    1bcf:28c4 reports serial '01.00.00' (a firmware string, not a per-unit id)
+    on both an IMX678 and an IMX385 module. The capability hash carries the
+    advertised mode list (incl. resolution), so the 4K and 1080p sensors get
+    distinct tags and their output dirs/reports never overwrite each other."""
     if not usb_info:
         return None
     vid = usb_info.get('usb_vendor_id') or ''
@@ -1345,6 +1367,9 @@ def build_device_tag(usb_info):
         bcd = usb_info.get('usb_bcd_device') or ''
         h = hashlib.sha1((mfr + prd + bcd).encode()).hexdigest()[:8]
         suffix = f"NOSERIAL-{h}"
+    caphash = usb_info.get('capability_hash')
+    if caphash:
+        suffix = f"{suffix}_{caphash}"
     return f"{vid}{pid}_{suffix}"
 
 

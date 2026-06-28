@@ -68,10 +68,80 @@ def sanitize_tag_component(s, maxlen=32):
     return s[:maxlen]
 
 
+# --- capability hash: the three functions below MUST stay byte-identical to
+# cam_characterise.py's copies (_ctrl_capabilities_str, _enum_advertised_modes,
+# device_capability_hash). If they drift, the two tools build different device
+# tags and their output paths (master/defects vs report filenames) won't line
+# up. Kept as a duplicate rather than an import so cam_manager stays standalone
+# (no numpy/fcntl dependency just to plan a run).
+
+def _ctrl_capabilities_str(device):
+    try:
+        r = subprocess.run(["v4l2-ctl", "-d", device, "--list-ctrls"],
+                           capture_output=True, text=True, timeout=10)
+        entries = []
+        for line in r.stdout.splitlines():
+            m = re.match(r'\s*(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)', line)
+            if not m:
+                continue
+            name, ctype, rest = m.group(1), m.group(2), m.group(3)
+            parts = [f"{name}({ctype})"]
+            for k in ('min', 'max', 'step', 'default'):
+                mm = re.search(rf'{k}=(-?\d+)', rest)
+                if mm:
+                    parts.append(f"{k}={mm.group(1)}")
+            entries.append(':'.join(parts))
+        return '|'.join(sorted(entries))
+    except Exception:
+        return ''
+
+
+def _enum_advertised_modes(device):
+    try:
+        r = subprocess.run(["v4l2-ctl", "-d", device, "--list-formats-ext"],
+                           capture_output=True, text=True, timeout=10)
+        modes, cur_fourcc, cur_w, cur_h = [], None, None, None
+        for line in r.stdout.splitlines():
+            m = re.search(r"\[\d+\]:\s+'(\w+)'", line)
+            if m:
+                cur_fourcc = m.group(1); cur_w = cur_h = None; continue
+            m = re.search(r"Size:\s+Discrete\s+(\d+)x(\d+)", line)
+            if m and cur_fourcc:
+                cur_w, cur_h = int(m.group(1)), int(m.group(2)); continue
+            m = re.search(r"Interval:\s+Discrete\s+[\d.]+s\s+\(([\d.]+)\s*fps\)", line)
+            if m and cur_fourcc and cur_w is not None:
+                fps = float(m.group(1))
+                hit = next((x for x in modes if x['fourcc'] == cur_fourcc
+                            and x['width'] == cur_w and x['height'] == cur_h), None)
+                if hit:
+                    if fps > hit['max_fps']:
+                        hit['max_fps'] = fps
+                else:
+                    modes.append({'fourcc': cur_fourcc, 'width': cur_w,
+                                  'height': cur_h, 'max_fps': fps})
+        return modes
+    except Exception:
+        return []
+
+
+def device_capability_hash(device, adv=None):
+    if adv is None:
+        adv = _enum_advertised_modes(device)
+    modes_str = '|'.join(
+        f"{m['fourcc']}:{m['width']}x{m['height']}@{m['max_fps']}"
+        for m in sorted(adv, key=lambda m: (m['fourcc'], m['width'], m['height']))
+    )
+    return hashlib.sha1(
+        f"{modes_str};{_ctrl_capabilities_str(device)}".encode()
+    ).hexdigest()[:12]
+
+
 def usb_device_tag(device):
-    """Return a stable identifier string for a /dev/videoN device: vid+pid_serial
-    (or vid+pid_NOSERIAL-<hash> when serial is absent). Reads from sysfs only.
-    Returns '' on failure so callers can fall back to resolution-only naming."""
+    """Return a stable identifier string for a /dev/videoN device:
+    vid+pid_serial_caphash (or vid+pid_NOSERIAL-<hash>_caphash when serial is
+    absent). Reads from sysfs + v4l2-ctl. Returns '' on failure so callers can
+    fall back to resolution-only naming. Must match cam_characterise.py's
+    build_device_tag exactly."""
     name = os.path.basename(device)
     try:
         iface = os.path.realpath(f"/sys/class/video4linux/{name}/device")
@@ -96,6 +166,9 @@ def usb_device_tag(device):
             bcd = _rd("bcdDevice") or ""
             h = hashlib.sha1((mfr + prd + bcd).encode()).hexdigest()[:8]
             suffix = f"NOSERIAL-{h}"
+        caphash = device_capability_hash(device)
+        if caphash:
+            suffix = f"{suffix}_{caphash}"
         return f"{vid}{pid}_{suffix}"
     except Exception:
         return ""
