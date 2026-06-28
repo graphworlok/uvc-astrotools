@@ -932,6 +932,77 @@ def run_auto_dark(cap, device, iterations=20, frames=30, settle_s=1.0,
     return out
 
 
+def exposure_fidelity_verdict(slope_data, knee):
+    """Decide real-vs-synthetic exposure from the dark ladder's (exposure,
+    eff_fps) pairs. Returns fields to merge into the exposure_fidelity report.
+
+    The fps-vs-exposure test only works where the frame PERIOD is set by
+    INTEGRATION, not by bus bandwidth. At high resolution each frame is large
+    and USB caps the frame rate, so the frame period is pinned long regardless
+    of exposure. If the longest exposure still fits inside that bandwidth-
+    limited frame period, fps physically CANNOT fall, and flat fps says nothing
+    about real-vs-synthetic -- calling it "synthetic" there is wrong. So gate on
+    the bandwidth ceiling: only points whose integration time exceeds the
+    bandwidth-limited frame period (1 / fastest-observed-fps) are genuinely
+    integration-limited. Points below the knee (clamped sub-frame pedestal) are
+    excluded too."""
+    out = {}
+    fps_ceiling = max((d["eff_fps"] for d in slope_data if d["eff_fps"] > 0),
+                      default=0.0)
+    # exposure units are 100us each; frame period (s) -> units = period / 100e-6
+    bw_period_units = ((1.0 / fps_ceiling) / 100e-6
+                       if fps_ceiling > 0 else float("inf"))
+    out["bandwidth_ceiling_fps"] = round(fps_ceiling, 2)
+    out["bandwidth_frame_period_units"] = (
+        round(bw_period_units) if bw_period_units != float("inf") else None)
+    integ = [d for d in slope_data
+             if d["exposure_units"] >= knee
+             and d["exposure_units"] >= bw_period_units
+             and d["eff_fps"] > 0]
+    max_exp = max((d["exposure_units"] for d in slope_data), default=0)
+    if len(integ) >= 2:
+        f0, f1 = integ[0]["eff_fps"], integ[-1]["eff_fps"]
+        e0, e1 = integ[0]["exposure_units"], integ[-1]["exposure_units"]
+        fps_drop = f0 / f1 if f1 else float("nan")
+        expo_rise = e1 / e0 if e0 else float("nan")
+        out["integrating_region"] = {
+            "exposure_from": e0, "exposure_to": e1,
+            "fps_drop": round(fps_drop, 2), "expo_rise": round(expo_rise, 2)}
+        # Real integration: fps falls roughly in proportion to exposure once
+        # past the bandwidth-limited frame period. Synthetic: fps stays flat
+        # while exposure climbs through that integration-limited region.
+        if fps_drop >= 0.6 * expo_rise:
+            out["verdict"] = (
+                f"in integration-limited region fps fell {fps_drop:.1f}x as "
+                f"exposure rose {expo_rise:.1f}x -> REAL integration")
+        elif fps_drop < 1.3 and expo_rise > 2:
+            out["verdict"] = (
+                f"in integration-limited region fps held ~flat while exposure "
+                f"rose {expo_rise:.1f}x -> synthetic exposure (gain/sum)")
+        else:
+            out["verdict"] = (
+                f"partial: fps fell {fps_drop:.1f}x vs exposure {expo_rise:.1f}x "
+                "-> integration real but sub-proportional (clamped/quantised)")
+    else:
+        # The common high-res case: the longest exposure never exceeds the
+        # bandwidth-limited frame period, so the test is simply untestable.
+        if bw_period_units != float("inf") and max_exp < bw_period_units:
+            out["verdict"] = (
+                f"indeterminate (bandwidth-limited): max exposure {max_exp} "
+                f"units (~{max_exp * 0.1:.0f}ms) stays within the bandwidth-"
+                f"limited frame period (~{bw_period_units * 0.1:.0f}ms at the "
+                f"{fps_ceiling:.1f}fps ceiling), so fps cannot respond to "
+                "exposure here. Real-vs-synthetic is UNTESTABLE at this "
+                "resolution -- use a smaller resolution (higher fps ceiling) "
+                "or a longer exposure to push past the frame period.")
+        else:
+            out["verdict"] = (
+                "too few integration-limited points for a verdict; add "
+                "exposures above the bandwidth-limited frame period "
+                f"(~{bw_period_units:.0f} units)")
+    return out
+
+
 def run_dark(cap, device, dark_frames, exposure_max, slope_points,
              ladder=None, discard=2, knee=2048, ladder_frames=16,
              ladder_points=7, verbose=True):
@@ -1127,40 +1198,9 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
             for s in expfid["by_step"]:
                 print(f"     {s['expo_ratio']:6.2f}  {s['fps_drop_ratio']:9.2f}  "
                       f"{s['mean_ratio']:7.2f}")
-        # Verdict: evaluate ONLY the integrating region (exposures above the
-        # frame-period knee). Below the knee, exposure is clamped within a frame
-        # period so fps cannot drop and mean cannot rise -- including those
-        # points falsely makes any real integration look "flat/synthetic".
-        integ = [d for d in slope_data if d["exposure_units"] >= knee
-                 and d["eff_fps"] > 0]
-        if len(integ) >= 2:
-            f0, f1 = integ[0]["eff_fps"], integ[-1]["eff_fps"]
-            e0, e1 = integ[0]["exposure_units"], integ[-1]["exposure_units"]
-            fps_drop = f0 / f1 if f1 else float("nan")
-            expo_rise = e1 / e0 if e0 else float("nan")
-            expfid["integrating_region"] = {
-                "exposure_from": e0, "exposure_to": e1,
-                "fps_drop": round(fps_drop, 2),
-                "expo_rise": round(expo_rise, 2)}
-            # Real integration: fps falls roughly in proportion to exposure once
-            # past the knee. Synthetic: fps stays flat while exposure climbs.
-            if fps_drop >= 0.6 * expo_rise:
-                expfid["verdict"] = (
-                    f"in integrating region fps fell {fps_drop:.1f}x as exposure "
-                    f"rose {expo_rise:.1f}x -> REAL integration")
-            elif fps_drop < 1.3 and expo_rise > 2:
-                expfid["verdict"] = (
-                    f"in integrating region fps held ~flat while exposure rose "
-                    f"{expo_rise:.1f}x -> synthetic exposure (gain/sum)")
-            else:
-                expfid["verdict"] = (
-                    f"partial: fps fell {fps_drop:.1f}x vs exposure {expo_rise:.1f}x "
-                    "-> integration real but sub-proportional (clamped/quantised)")
-            if verbose:
-                print(f"   -> {expfid['verdict']}")
-        elif verbose:
-            print("   -> too few integrating-region points for a verdict; "
-                  "add exposures above the knee")
+        expfid.update(exposure_fidelity_verdict(slope_data, knee))
+        if verbose:
+            print(f"   -> {expfid['verdict']}")
 
     # dark current slope: fit ONLY the integrating region (exposure >= knee).
     # Below the knee the level is the clamped pedestal and carries no dark-
