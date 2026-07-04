@@ -67,7 +67,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.7"
+TOOL_VERSION = "0.8"
 
 
 # ----------------------------------------------------------------------------
@@ -322,9 +322,17 @@ def extract_stars(img, nsigma=5.0, min_pix=2, max_pix=500, max_stars=100,
         stack_px = [(cy, cx)]
         visited[cy, cx] = True
         comp = []
-        while stack_px and len(comp) <= max_pix:
+        size = 0
+        # walk the WHOLE component even past max_pix (only storing up to the
+        # cap): stopping the fill early leaves the rest of an oversized blob
+        # unvisited, and its remainder chunks re-seed as small components
+        # that pass the size filter -- phantom stars on the rim of any
+        # saturated region. The n_above guard bounds total work.
+        while stack_px:
             y, x = stack_px.pop()
-            comp.append((y, x))
+            size += 1
+            if size <= max_pix:
+                comp.append((y, x))
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
                     ny, nx = y + dy, x + dx
@@ -332,7 +340,7 @@ def extract_stars(img, nsigma=5.0, min_pix=2, max_pix=500, max_stars=100,
                             and not visited[ny, nx]:
                         visited[ny, nx] = True
                         stack_px.append((ny, nx))
-        if not (min_pix <= len(comp) <= max_pix):
+        if not (min_pix <= size <= max_pix):
             continue
         ys = np.array([p[0] for p in comp], dtype=np.float64)
         xs = np.array([p[1] for p in comp], dtype=np.float64)
@@ -1051,9 +1059,12 @@ class App:
         except OSError as e:
             self.dbg.log("error", where="save_prefs", err=str(e))
 
-    def make_capture(self):
-        w, h = self.current_size()
-        cap = cc.Capture(self.var_dev.get(), w, h, self.fourcc)
+    def make_capture(self, dev, w, h):
+        """dev/w/h are passed in (snapshotted on the UI thread) rather than
+        read from Tk variables here: workers call this, and Tk variables must
+        never be touched from a worker thread -- a marshalled Tcl call can
+        stall against a blocked main loop."""
+        cap = cc.Capture(dev, w, h, self.fourcc)
         cap.exposure = self.exp_value
         return cap
 
@@ -1824,27 +1835,38 @@ class App:
     def on_start(self):
         if self.busy() or self.fourcc is None:
             return
+        # snapshot every Tk-variable-backed setting HERE, on the UI thread;
+        # the workers receive plain values and never touch Tk variables
+        dev = self.var_dev.get()
+        w, h = self.current_size()
+        if w is None:
+            self.log("no resolution selected -- probe a device first")
+            return
         self.stop_evt.clear()
         self.pause_evt.clear()
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         if self.var_mode.get() == "dark":
             self.worker = threading.Thread(target=self._dark_preview_worker,
-                                           daemon=True)
+                                           args=(dev, w, h), daemon=True)
             self.set_status("DARK PREVIEW — starting capture…")
             self.log("dark preview: raw vs dark-corrected residual "
                      "(fixed stretch x8 -- correction should look black)")
         else:
             self.on_reset_stack()
             exp = self.exp_value
+            sub = self.var_sub.get()
+            fix = self.var_fix.get()
+            align = self.var_align.get()
             if self.master_dark is not None and self.master_exp \
-                    and exp != self.master_exp and self.var_sub.get():
+                    and exp != self.master_exp and sub:
                 self.log(f"NOTE: master dark was built at exposure "
                          f"{self.master_exp}, capturing at {exp} -- "
                          "subtraction will be biased")
             self.btn_pause.configure(state="normal")
             self.set_status("INTEGRATING — starting capture…")
             self.worker = threading.Thread(target=self._light_worker,
+                                           args=(dev, w, h, sub, fix, align),
                                            daemon=True)
         self.worker.start()
 
@@ -1882,6 +1904,19 @@ class App:
         if self.busy():
             self.on_stop()
             self.worker.join(timeout=10)
+            if self.worker.is_alive():
+                # starting a second worker now would have two v4l2-ctl
+                # processes fighting over the device
+                self.log("previous capture is still shutting down -- "
+                         "try again in a moment")
+                self.set_status("waiting for previous capture to stop",
+                                fg="#ff8060")
+                return
+        dev = self.var_dev.get()
+        w, h = self.current_size()
+        if w is None:
+            self.log("no resolution selected -- probe a device first")
+            return
         n = int(self.var_dark_n.get())
         self.stop_evt.clear()
         self.btn_dark.configure(state="disabled")
@@ -1889,8 +1924,8 @@ class App:
         self.btn_stop.configure(state="normal")
         self.lf_right.configure(text="Master dark (accumulating)")
         self.set_status(f"ACQUIRING MASTER DARK 0/{n} — capturing…")
-        self.worker = threading.Thread(target=self._dark_worker, args=(n,),
-                                       daemon=True)
+        self.worker = threading.Thread(target=self._dark_worker,
+                                       args=(n, dev, w, h), daemon=True)
         self.worker.start()
 
     def on_save_fits(self):
@@ -1938,25 +1973,33 @@ class App:
         self.log("plate solving..." + (" (auto)" if auto else "")
                  + (f" [region {stack.shape[1]}x{stack.shape[0]}px]"
                     if self._solve_roi else ""))
+        # evaluate the Tk variables NOW, on the UI thread -- the lambda runs
+        # in the solve thread, where Tk variables must not be touched
+        solver = self.var_solver.get()
+        try:
+            sc_lo = float(self.var_sc_lo.get())
+            sc_hi = float(self.var_sc_hi.get())
+        except (tk.TclError, ValueError):
+            sc_lo = sc_hi = 0.0  # unparseable entry -> solve unhinted
         t = threading.Thread(
             target=lambda: self.q.put(
-                ("solved", solve_field(stack, self.var_solver.get(),
-                                       float(self.var_sc_lo.get()),
-                                       float(self.var_sc_hi.get()),
+                ("solved", solve_field(stack, solver, sc_lo, sc_hi,
                                        dbg=self.dbg))),
             daemon=True)
         t.start()
 
     # ---------------- workers (no Tk calls in here) ----------------
 
-    def _dark_worker(self, total):
-        dev = self.var_dev.get()
+    def _dark_worker(self, total, dev, w, h):
         exp = self.exp_value
-        cap = self.make_capture()
         self.dbg.log("worker_start", kind="dark_acquire", device=dev,
                      exposure_units=exp, frames_requested=total,
-                     resolution=self.var_res.get(), fourcc=self.fourcc)
+                     resolution=f"{w}x{h}", fourcc=self.fourcc)
+        cap = None
         try:
+            # inside the try: if construction raises, the finally still posts
+            # worker_done and the UI buttons come back
+            cap = self.make_capture(dev, w, h)
             cc.set_ctrl(dev, "auto_exposure", 1)
             cc.set_ctrl(dev, "exposure_time_absolute", exp)
             mean = None
@@ -1991,33 +2034,45 @@ class App:
             if mean is None:
                 self.q.put(("log", "dark acquisition produced no frames"))
                 return
+            # clip guard (same test as cam_characterise's run_dark): a master
+            # pinned at either rail is a clamped/saturated processing path,
+            # not a measurement -- it must never be installed or written into
+            # the PHD2 data dir for auto-load at every connect
+            floor_frac = float((mean <= 0.5).mean())
+            ceil_frac = float((mean >= 254.5).mean())
+            clipped = floor_frac > 0.5 or ceil_frac > 0.5
             hot = cc.hot_pixel_mask(mean)
             coords = np.argwhere(hot)
             self.dbg.log("dark_done", frames=count, hot_pixels=len(coords),
-                         master=frame_stats(mean), exposure_units=exp)
-            self.q.put(("dark_done", mean, coords, exp, count))
+                         master=frame_stats(mean), exposure_units=exp,
+                         clipped=clipped,
+                         clip_floor_frac=round(floor_frac, 4),
+                         clip_ceil_frac=round(ceil_frac, 4))
+            self.q.put(("dark_done", mean, coords, exp, count,
+                        (clipped, floor_frac, ceil_frac)))
         except Exception as e:
             self.dbg.exc("error", where="dark_worker")
             self.q.put(("log", f"dark acquisition failed: {e}"))
         finally:
-            cap.close()
+            if cap is not None:
+                cap.close()
             self.dbg.log("worker_end", kind="dark_acquire")
             self.q.put(("worker_done",))
 
-    def _dark_preview_worker(self):
+    def _dark_preview_worker(self, dev, w, h):
         """Continuous DARK-mode preview: raw stream + dark-corrected residual
         at a fixed stretch (ideally complete blackness), with residual stats
         saying how close to ideal the correction is."""
-        dev = self.var_dev.get()
-        cap = self.make_capture()
         master = self.master_dark
         defects = self.defects
         self.dbg.log("worker_start", kind="dark_preview", device=dev,
                      exposure_units=self.exp_value,
-                     resolution=self.var_res.get(), fourcc=self.fourcc,
+                     resolution=f"{w}x{h}", fourcc=self.fourcc,
                      master_loaded=master is not None,
                      defects=0 if defects is None else len(defects))
+        cap = None
         try:
+            cap = self.make_capture(dev, w, h)
             cc.set_ctrl(dev, "auto_exposure", 1)
             cc.set_ctrl(dev, "exposure_time_absolute", self.exp_value)
             while not self.stop_evt.is_set():
@@ -2066,19 +2121,18 @@ class App:
             self.dbg.exc("error", where="dark_preview_worker")
             self.q.put(("log", f"dark preview failed: {e}"))
         finally:
-            cap.close()
+            if cap is not None:
+                cap.close()
             self.dbg.log("worker_end", kind="dark_preview")
             self.q.put(("worker_done",))
 
-    def _light_worker(self):
-        dev = self.var_dev.get()
-        sub = self.var_sub.get() and self.master_dark is not None
-        fix = self.var_fix.get() and self.defects is not None \
-            and len(self.defects) > 0
-        align = self.var_align.get()
+    def _light_worker(self, dev, w, h, sub, fix, align):
+        # dev/w/h and the checkbox states arrive as plain values snapshotted
+        # on the UI thread (on_start) -- no Tk variable access in here
         master = self.master_dark
         defects = self.defects
-        cap = self.make_capture()
+        sub = sub and master is not None
+        fix = fix and defects is not None and len(defects) > 0
         burst = 6
         # rolling integration: ring buffer of the last N processed frames
         # (float32 to halve memory), running float64 sum for O(1) update
@@ -2087,14 +2141,17 @@ class App:
         align_ref = None
         pause_ref_stars = None
         was_paused = False
+        warned_drift = False   # one-shot UI warning for magnitude rejections
         self.dbg.log("worker_start", kind="light", device=dev,
                      exposure_units=self.exp_value,
-                     resolution=self.var_res.get(), fourcc=self.fourcc,
+                     resolution=f"{w}x{h}", fourcc=self.fourcc,
                      subtract_dark=sub, repair_defects=fix, align=align,
                      window_max=self.stack_max_value,
                      master_exposure_units=self.master_exp,
                      defects=0 if defects is None else len(defects))
+        cap = None
         try:
+            cap = self.make_capture(dev, w, h)
             cc.set_ctrl(dev, "auto_exposure", 1)
             cc.set_ctrl(dev, "exposure_time_absolute", self.exp_value)
             while not self.stop_evt.is_set():
@@ -2118,6 +2175,7 @@ class App:
                 last_shift = (0.0, 0.0)
                 last_conf = None
                 last_applied = False      # a non-zero shift was actually used
+                last_reject = None        # why a computed shift was NOT used
                 last_ref_set = align_ref is not None
                 for fr in cap.iter_luma(path, burst, discard=1):
                     if self.stop_evt.is_set():
@@ -2145,14 +2203,26 @@ class App:
                             maxsh = max(small.shape) // 4
                             if (conf >= ALIGN_MIN_CONF
                                     and abs(dy) <= maxsh and abs(dx) <= maxsh):
+                                last_reject = None
                                 sy, sx = dy * f, dx * f
                                 if sy != 0.0 or sx != 0.0:
                                     proc = shift_fill(proc, sy, sx)
                                     last_shift = (sy, sx)
                                     last_applied = True
+                            elif conf >= ALIGN_MIN_CONF:
+                                # confident peak but implausibly large drift:
+                                # cumulative motion has outrun the reference
+                                # frame -- from here alignment is inert and
+                                # the stack will smear (reset it)
+                                last_reject = "magnitude"
+                            else:
+                                last_reject = "confidence"
                     f32 = proc.astype(np.float32)
+                    # non-inplace subtract: ssum was published as
+                    # self.stack_sum, which the UI thread reads for solves
+                    # and saves -- mutating it in place tears that snapshot
                     while len(ring) >= maxn:   # window shrink also handled
-                        ssum -= ring.popleft()
+                        ssum = ssum - ring.popleft()
                     ring.append(f32)
                     ssum = f32.astype(np.float64) if ssum is None \
                         else ssum + f32
@@ -2162,6 +2232,19 @@ class App:
                     pass
                 if last_raw is None:
                     continue
+
+                # a confident shift rejected for magnitude means cumulative
+                # drift has outrun the alignment reference: say so once,
+                # visibly, instead of silently smearing the stack
+                if last_reject == "magnitude" and not warned_drift:
+                    warned_drift = True
+                    self.q.put(("log",
+                                "alignment: drift now exceeds the plausible "
+                                "limit vs the reference frame -- correction "
+                                "is inert and the stack may smear; Reset "
+                                "stack to re-anchor"))
+                elif last_applied:
+                    warned_drift = False
 
                 raw_small, stride = downsample_to_fit(
                     last_raw, self.canvas_w, self.canvas_h)
@@ -2229,6 +2312,7 @@ class App:
                     align_on=align,
                     align_ref_set=last_ref_set,
                     align_applied=last_applied,
+                    align_reject=last_reject,
                     align_shift=[round(last_shift[0], 2), round(last_shift[1], 2)],
                     align_conf=(round(last_conf, 2)
                                 if last_conf is not None else None),
@@ -2248,7 +2332,8 @@ class App:
             self.dbg.exc("error", where="light_worker")
             self.q.put(("log", f"capture failed: {e}"))
         finally:
-            cap.close()
+            if cap is not None:
+                cap.close()
             self.dbg.log("worker_end", kind="light")
             self.q.put(("worker_done",))
 
@@ -2306,7 +2391,24 @@ class App:
                     text=f"@ {fps:.1f} fps -- no master dark: corrected "
                          "view unavailable (acquire one)")
         elif kind == "dark_done":
-            _, mean, coords, exp, count = msg
+            _, mean, coords, exp, count, clip = msg
+            clipped, floor_frac, ceil_frac = clip
+            if clipped:
+                # same refusal cam_characterise applies: a rail-pinned master
+                # is a clamped processing path, not a measurement -- writing
+                # it would hand PHD2 junk to auto-load at every connect
+                where = ("floor (0)" if floor_frac > ceil_frac
+                         else "ceiling (255)")
+                self.log(f"master dark REJECTED: "
+                         f"{max(floor_frac, ceil_frac) * 100:.0f}% of pixels "
+                         f"pinned at the {where} -- output is clamped/"
+                         "saturated, nothing installed or saved. Adjust "
+                         "gamma/brightness/contrast (e.g. raise gamma above "
+                         "the black-level clamp) and re-acquire.")
+                self.lf_right.configure(text="Dark-corrected residual")
+                self.set_status("master dark rejected — output clipped, "
+                                "nothing saved", fg="#ff8060")
+                return
             self.master_dark = mean
             self.master_exp = exp
             self.defects = coords if len(coords) else None

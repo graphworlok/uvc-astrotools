@@ -23,10 +23,10 @@ Goals
        firmware faking long exposure (gain-boost / frame-sum instead of real
        integration).
 
-It captures via V4L2 (uncompressed YUYV/NV12 only -- compressed formats are
+It captures via V4L2 (uncompressed formats only -- compressed formats are
 refused for measurement because the codec destroys exactly the noise you are
-trying to quantify). Capture uses v4l2 mmap streaming through python's fcntl;
-no OpenCV required.
+trying to quantify). Capture shells out to v4l2-ctl --stream-mmap (see the
+Capture class for why); no OpenCV required.
 
 USAGE (typical, run as root for v4l2 control access):
   # 1. just list + rank formats and pick the measurement format
@@ -63,11 +63,8 @@ import ctypes
 import fcntl
 import hashlib
 import json
-import mmap
 import os
 import re
-import select
-import struct
 import subprocess
 import sys
 import tempfile
@@ -95,15 +92,12 @@ def _IOC(d, t, nr, size):
     return ((d << _IOC_DIRSHIFT) | (ord(t) << _IOC_TYPESHIFT) |
             (nr << _IOC_NRSHIFT) | (size << _IOC_SIZESHIFT))
 
-def _IOR(t, nr, structtype):  return _IOC(_IOC_READ, t, nr, ctypes.sizeof(structtype))
-def _IOW(t, nr, structtype):  return _IOC(_IOC_WRITE, t, nr, ctypes.sizeof(structtype))
 def _IOWR(t, nr, structtype): return _IOC(_IOC_READ | _IOC_WRITE, t, nr, ctypes.sizeof(structtype))
 
-# Request codes are assigned AFTER the structs are defined (see below).
+# Only format enumeration is done via ioctl; capture itself shells out to
+# v4l2-ctl (see Capture), so no other request codes or structs are needed.
 
 V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
-V4L2_MEMORY_MMAP            = 1
-V4L2_FIELD_NONE             = 1
 
 def fourcc(a, b, c, d):
     return (ord(a) | (ord(b) << 8) | (ord(c) << 16) | (ord(d) << 24))
@@ -139,54 +133,6 @@ FORMAT_FIDELITY = {
     "H265": (9, "LOSSY hevc -- unusable for noise"),
 }
 
-class v4l2_format_pix(ctypes.Structure):
-    _fields_ = [
-        ("width", ctypes.c_uint32), ("height", ctypes.c_uint32),
-        ("pixelformat", ctypes.c_uint32), ("field", ctypes.c_uint32),
-        ("bytesperline", ctypes.c_uint32), ("sizeimage", ctypes.c_uint32),
-        ("colorspace", ctypes.c_uint32), ("priv", ctypes.c_uint32),
-        ("flags", ctypes.c_uint32), ("ycbcr_enc", ctypes.c_uint32),
-        ("quantization", ctypes.c_uint32), ("xfer_func", ctypes.c_uint32),
-    ]
-
-class v4l2_format(ctypes.Structure):
-    # Kernel struct is 208 bytes on 32-bit: __u32 type + 4 pad + 200-byte union.
-    class _u(ctypes.Union):
-        _fields_ = [("pix", v4l2_format_pix), ("raw", ctypes.c_ubyte * 200)]
-    _fields_ = [("type", ctypes.c_uint32), ("_pad", ctypes.c_uint32), ("fmt", _u)]
-    _pack_ = 1  # avoid surprises; we add the pad explicitly
-
-class v4l2_requestbuffers(ctypes.Structure):
-    # 4.9 kernel layout: count,type,memory,reserved[2] = 20 bytes.
-    # (capabilities/flags are 5.x additions; including them breaks the _IOC size.)
-    _fields_ = [("count", ctypes.c_uint32), ("type", ctypes.c_uint32),
-                ("memory", ctypes.c_uint32), ("reserved", ctypes.c_uint32 * 2)]
-
-class v4l2_timeval(ctypes.Structure):
-    _fields_ = [("tv_sec", ctypes.c_int32), ("tv_usec", ctypes.c_int32)]
-
-class v4l2_timecode(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_uint32), ("flags", ctypes.c_uint32),
-                ("frames", ctypes.c_uint8), ("seconds", ctypes.c_uint8),
-                ("minutes", ctypes.c_uint8), ("hours", ctypes.c_uint8),
-                ("userbits", ctypes.c_uint8 * 4)]
-
-class v4l2_buffer(ctypes.Structure):
-    class _u(ctypes.Union):
-        # Fixed width: all 4 bytes on this 32-bit kernel. c_void_p/c_ulong
-        # would be 8 bytes under a 64-bit Python and break the struct size.
-        _fields_ = [("offset", ctypes.c_uint32), ("userptr", ctypes.c_uint32),
-                    ("planes", ctypes.c_uint32), ("fd", ctypes.c_int32)]
-    _fields_ = [
-        ("index", ctypes.c_uint32), ("type", ctypes.c_uint32),
-        ("bytesused", ctypes.c_uint32), ("flags", ctypes.c_uint32),
-        ("field", ctypes.c_uint32), ("timestamp", v4l2_timeval),
-        ("timecode", v4l2_timecode), ("sequence", ctypes.c_uint32),
-        ("memory", ctypes.c_uint32), ("m", _u),
-        ("length", ctypes.c_uint32), ("reserved2", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
-    ]
-
 class v4l2_fmtdesc(ctypes.Structure):
     _fields_ = [("index", ctypes.c_uint32), ("type", ctypes.c_uint32),
                 ("flags", ctypes.c_uint32), ("description", ctypes.c_char * 32),
@@ -194,37 +140,20 @@ class v4l2_fmtdesc(ctypes.Structure):
                 ("reserved", ctypes.c_uint32 * 3)]
 
 
-# Now that every struct is defined, compute the request codes so the encoded
-# size always matches sizeof(struct) on THIS platform/kernel.
-VIDIOC_ENUM_FMT  = _IOWR('V', 2,  v4l2_fmtdesc)
-VIDIOC_G_FMT     = _IOWR('V', 4,  v4l2_format)
-VIDIOC_S_FMT     = _IOWR('V', 5,  v4l2_format)
-VIDIOC_REQBUFS   = _IOWR('V', 8,  v4l2_requestbuffers)
-VIDIOC_QUERYBUF  = _IOWR('V', 9,  v4l2_buffer)
-VIDIOC_QBUF      = _IOWR('V', 15, v4l2_buffer)
-VIDIOC_DQBUF     = _IOWR('V', 17, v4l2_buffer)
-VIDIOC_STREAMON  = _IOW('V', 18, ctypes.c_int)
-VIDIOC_STREAMOFF = _IOW('V', 19, ctypes.c_int)
+# Computed from the actual ctypes struct size so the encoded size always
+# matches sizeof(struct) on THIS platform/kernel.
+VIDIOC_ENUM_FMT = _IOWR('V', 2, v4l2_fmtdesc)
 
 
 def xioctl(fd, req, arg):
     """Issue an ioctl, operating in place for ctypes structs.
 
     fcntl.ioctl with a ctypes Structure and the default path can pass a
-    non-writable / copied buffer; QUERYBUF and DQBUF need the kernel to write
-    fields (m.offset, length, bytesused...) back into OUR struct. For ctypes
-    args we wrap the struct's own memory in a writable buffer and pass it with
-    mutate_flag=True so the kernel's writes land in `arg` directly. For plain
-    bytes (e.g. STREAMON's packed int) we pass through unchanged.
+    non-writable / copied buffer; enumeration needs the kernel to write
+    fields (pixelformat, description...) back into OUR struct. So we wrap
+    the struct's own memory in a writable buffer and pass it with
+    mutate_flag=True so the kernel's writes land in `arg` directly.
     """
-    if isinstance(arg, (bytes, bytearray)):
-        while True:
-            try:
-                return fcntl.ioctl(fd, req, arg)
-            except OSError as e:
-                if e.errno == 4:
-                    continue
-                raise
     buf = (ctypes.c_char * ctypes.sizeof(arg)).from_address(ctypes.addressof(arg))
     while True:
         try:
@@ -544,9 +473,17 @@ def rank_formats(formats):
     ranked.sort(key=lambda x: (x["fidelity_rank"], x["fourcc"]))
     return ranked
 
+# Formats Capture._luma_from_frame can actually decode. Raw Bayer variants
+# rank 0 in FORMAT_FIDELITY but have no decode path here (demosaic is out of
+# scope for the UVC bridges this targets), so the auto-pick must skip them or
+# Capture.__init__ raises on the "best" format.
+CAPTURE_DECODABLE = {"YUYV", "YUY2", "UYVY", "NV12", "NV21", "I420",
+                     "GREY", "Y800", "Y8", "Y16"}
+
 def best_measurement_format(ranked):
     for f in ranked:
-        if f["fidelity_rank"] <= 2:  # raw or uncompressed YUV
+        if (f["fidelity_rank"] <= 2  # raw mono or uncompressed YUV
+                and f["fourcc"].strip() in CAPTURE_DECODABLE):
             return f
     return None
 
@@ -587,8 +524,17 @@ def run_ptc(cap, device, levels_prompt=True, pairs_per_level=1):
             if drops:
                 print(f"   !! {drops} short/dropped frames -- bandwidth limited; "
                       "result suspect at this size")
+            # pair only the frames that actually arrived: drops can leave
+            # fewer than 2*pairs_per_level and indexing past the end crashes
+            npairs = min(pairs_per_level, len(frames) // 2)
+            if npairs == 0:
+                print("   !! fewer than two whole frames captured -- "
+                      "level skipped")
+                if not levels_prompt:
+                    break
+                continue
             means, varis = [], []
-            for k in range(pairs_per_level):
+            for k in range(npairs):
                 m, v = frame_pair_stats(frames[2*k], frames[2*k+1])
                 means.append(m); varis.append(v)
             mean = float(np.mean(means)); var = float(np.mean(varis))
@@ -1241,7 +1187,13 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
     result = {
         "exposure_max_units": exposure_max,
         "exposure_max_ms": round(exposure_max * 0.1, 1),
+        # pixel_depth is the domain of every ADU value in this report -- the
+        # 0-255 luma float domain all formats are normalised into (Y16 /257).
+        # PHD2's dark-model import keys on it; the capture path's native
+        # depth is recorded separately below.
         "pixel_depth": 8,
+        "capture_fourcc": cap.pixfmt_str,
+        "native_bit_depth": 16 if cap.pixfmt_str == "Y16" else 8,
         "deep_stack_frames": dark_frames,
         "deep_stack_drops": deep_drops,
         "deep_stack_clipped": deep_clipped,
@@ -1297,9 +1249,12 @@ def _enum_advertised_modes(device):
                            capture_output=True, text=True, timeout=10)
         modes, cur_fourcc, cur_w, cur_h = [], None, None, None
         for line in r.stdout.splitlines():
-            m = re.search(r"\[\d+\]:\s+'(\w+)'", line)
+            # fourccs may be space-padded ('Y16 '); \w+ would miss them and
+            # silently drop every mode of that format. Capture to the quote
+            # and strip, so mono 16-bit devices enumerate correctly.
+            m = re.search(r"\[\d+\]:\s+'([^']+)'", line)
             if m:
-                cur_fourcc = m.group(1); cur_w = cur_h = None; continue
+                cur_fourcc = m.group(1).strip(); cur_w = cur_h = None; continue
             m = re.search(r"Size:\s+Discrete\s+(\d+)x(\d+)", line)
             if m and cur_fourcc:
                 cur_w, cur_h = int(m.group(1)), int(m.group(2)); continue
@@ -1765,7 +1720,9 @@ def main():
             model = {
                 "exposure_max_units": args.exposure_max,
                 "exposure_max_ms": dark["exposure_max_ms"],
-                "pixel_depth": 8,
+                "pixel_depth": 8,  # value domain (see run_dark result note)
+                "capture_fourcc": dark["capture_fourcc"],
+                "native_bit_depth": dark["native_bit_depth"],
                 "dark_current_fit": dcf,
                 "exposure_fidelity_verdict": (
                     dark.get("exposure_fidelity", {}).get("verdict", "")),

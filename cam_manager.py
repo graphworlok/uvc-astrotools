@@ -102,9 +102,12 @@ def _enum_advertised_modes(device):
                            capture_output=True, text=True, timeout=10)
         modes, cur_fourcc, cur_w, cur_h = [], None, None, None
         for line in r.stdout.splitlines():
-            m = re.search(r"\[\d+\]:\s+'(\w+)'", line)
+            # fourccs may be space-padded ('Y16 '); \w+ would miss them and
+            # silently drop every mode of that format. Capture to the quote
+            # and strip, so mono 16-bit devices enumerate correctly.
+            m = re.search(r"\[\d+\]:\s+'([^']+)'", line)
             if m:
-                cur_fourcc = m.group(1); cur_w = cur_h = None; continue
+                cur_fourcc = m.group(1).strip(); cur_w = cur_h = None; continue
             m = re.search(r"Size:\s+Discrete\s+(\d+)x(\d+)", line)
             if m and cur_fourcc:
                 cur_w, cur_h = int(m.group(1)), int(m.group(2)); continue
@@ -182,9 +185,10 @@ def query_formats(device):
     cur = None
     size = None
     for line in txt.splitlines():
-        m = re.search(r"\[\d+\]:\s+'(\w+)'\s+\(([^)]*)\)", line)
+        # '([^']+)' not '(\w+)': fourccs may be space-padded ('Y16 ')
+        m = re.search(r"\[\d+\]:\s+'([^']+)'\s+\(([^)]*)\)", line)
         if m:
-            cur = {"fourcc": m.group(1),
+            cur = {"fourcc": m.group(1).strip(),
                    "description": m.group(2),
                    "compressed": "compressed" in m.group(2).lower(),
                    "sizes": []}
@@ -237,12 +241,17 @@ def identify(device):
 # ----------------------------------------------------------------------------
 
 def best_uncompressed(formats):
-    """Pick the measurement format: prefer uncompressed YUYV/YUV over MJPG/H264."""
-    pref = ("YUYV", "YUY2", "UYVY", "NV12", "GREY", "Y8 ", "Y16 ")
+    """Pick the measurement format. Preference order mirrors
+    cam_characterise.py's FORMAT_FIDELITY ranking (true mono beats YUV: no
+    chroma path at all), so the planner chooses the same format the engine's
+    auto-pick would -- the resolutions planned here are for the format
+    actually measured."""
+    pref = ("GREY", "Y800", "Y8", "Y16",
+            "YUYV", "YUY2", "UYVY", "NV12", "NV21", "I420")
     unc = [f for f in formats if not f["compressed"]]
     for p in pref:
         for f in unc:
-            if f["fourcc"] == p.strip():
+            if f["fourcc"] == p:
                 return f
     return unc[0] if unc else (formats[0] if formats else None)
 
@@ -341,7 +350,13 @@ def plan(device, formats, ctrls, args):
             t += ["--sharpness", str(ctrls["sharpness"].get("min", 1))]
         return t
 
-    common = ["--width", str(small["w"]), "--height", str(small["h"]),
+    # Pin the engine to the planner's format choice: without --format the
+    # engine auto-picks its own best format, and the resolutions/ladders
+    # planned here may not be native modes of what it actually measures.
+    fmt_args = ["--format", fmt["fourcc"]]
+
+    common = fmt_args + ["--width", str(small["w"]), "--height",
+              str(small["h"]),
               "--discard", str(args.discard), "--ladder-frames",
               str(args.ladder_frames), "--exposure-max", str(exp_max),
               "--knee", str(knee)]
@@ -356,7 +371,7 @@ def plan(device, formats, ctrls, args):
     # PHD2 falls back gracefully — zero cost, full coverage when it works.
     for size in sizes:
         w, h = size["w"], size["h"]
-        com = ["--width", str(w), "--height", str(h),
+        com = fmt_args + ["--width", str(w), "--height", str(h),
                "--discard", str(args.discard), "--ladder-frames",
                str(args.ladder_frames), "--exposure-max", str(exp_max),
                "--knee", str(knee)]
@@ -431,10 +446,11 @@ def plan(device, formats, ctrls, args):
         "why": "auto-exposure in the dark: where AE parks exposure, stability, "
                "and whether exposure_time_absolute readback agrees with the "
                "framerate-implied exposure (control-honesty check).",
-        "argv_tail": ["--auto", "--width", str(sw), "--height", str(sh),
-                      "--auto-iters", str(args.auto_iters),
-                      "--auto-frames", str(args.auto_frames),
-                      "--calib", f"{p}calib_{sw}x{sh}.json"]})
+        "argv_tail": ["--auto"] + fmt_args
+                     + ["--width", str(sw), "--height", str(sh),
+                        "--auto-iters", str(args.auto_iters),
+                        "--auto-frames", str(args.auto_frames),
+                        "--calib", f"{p}calib_{sw}x{sh}.json"]})
 
     return runs, fmt, (small, large, exp_min, exp_max, dev_tag)
 
@@ -496,9 +512,10 @@ def main():
     exp = ctrls.get("exposure_time_absolute", {})
     print(f"  exposure_time_absolute: min={exp.get('min')} max={exp.get('max')} "
           f"default={exp.get('default')}")
-    print(f"  processing ctrls present: " + ", ".join(
+    present = ", ".join(
         c for c in ("gamma", "brightness", "contrast", "sharpness", "gain")
-        if c in ctrls) or "  (none)")
+        if c in ctrls)
+    print("  processing ctrls present: " + (present or "(none)"))
 
     runs, fmt, meta = plan(args.device, formats, ctrls, args)
     if not runs:
