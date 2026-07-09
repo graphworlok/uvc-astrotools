@@ -311,6 +311,18 @@ pause-mode star tracking, solve command lines and output tails, tracebacks),
 with the schema and environment documented in the first line — paste the file
 into a model session and it can reconstruct what happened without the source.
 
+For "that looks *wrong*" moments there is a **Deep-dive dump** button: one
+press captures the next burst in full — every raw frame, every processed
+frame (after each enabled calibration step, including the alignment shift),
+the master dark/flat/defect data in use, every parameter, and per-frame
+statistics — into a timestamped directory whose `manifest.json` documents
+each file and the complete processing context. All four capture modes
+support it (light integration, dark preview, dark/flat acquisition); pressed
+while idle it dumps the session's in-memory state instead. The directory is
+self-describing by design: hand it over and the question "why does the
+output look like this?" is answerable offline, without reproducing the
+sky, the setup, or the moment.
+
 Point `--data-dir` at the PHD2 data dir and the darks/defect maps built here
 are the same files PHD2 auto-loads at camera connect.
 

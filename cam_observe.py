@@ -62,6 +62,13 @@ The V4L2/UVC processing controls the device actually exposes (gain, gamma,
 brightness, contrast, sharpness, saturation) are presented with their real
 ranges and applied live.
 
+A "Deep-dive dump" button answers "that looks WRONG -- why?": one press
+writes the next capture burst in full (every raw frame, every processed
+frame, the calibration data in use, all parameters, per-frame statistics)
+to a self-describing directory whose manifest.json documents each file --
+press the button, hand over the directory. Idle, it dumps the session's
+in-memory state instead.
+
 Requires: Linux, v4l2-ctl, numpy, tkinter. Plate solving needs solve-field
 (astrometry.net) plus index files on the local machine.
 
@@ -94,7 +101,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.12"
+TOOL_VERSION = "0.13"
 
 
 # ----------------------------------------------------------------------------
@@ -729,6 +736,36 @@ DEBUG_SCHEMA = {
                  "with the tail of solve-field's output",
     "error": "exception with full traceback",
     "ui": "a user action in the GUI",
+    "deepdive": "a full per-frame diagnostic dump was written to disk "
+                "(directory and file list in the event)",
+}
+
+# What each deep-dive dump contains, written into its manifest.json so the
+# directory is self-describing: hand it (or its manifest plus a few arrays)
+# to a person or a model and the processing state is fully reconstructable.
+DEEPDIVE_README = {
+    "light": "One LIGHT-mode integration burst in full. raw_NN.npy = luma "
+             "frames as decoded (0-255 float); proc_NN.npy = the same "
+             "frame after the enabled calibration steps in processing "
+             "order (dark subtraction, flat correction, defect repair, "
+             "alignment shift); stack.npy = the rolling mean after this "
+             "burst; master_dark/master_flat/defects = calibration data "
+             "in use. per_frame carries raw/proc statistics per frame; "
+             "align_burst is the burst's alignment decision. Arrays are "
+             "float32 (converted from float64 processing).",
+    "dark_preview": "One DARK-mode preview burst. raw_NN.npy = luma frames "
+                    "as decoded; residual.npy = last frame minus master "
+                    "dark after defect repair (what the right-hand panel "
+                    "shows); master_dark/defects = calibration in use.",
+    "dark_acquire": "One burst from master-dark acquisition. raw_NN.npy = "
+                    "the burst's frames; mean_so_far.npy = the streaming "
+                    "per-pixel mean including this burst.",
+    "flat_acquire": "One burst from master-flat acquisition. raw_NN.npy = "
+                    "the burst's frames; mean_so_far.npy = the streaming "
+                    "per-pixel mean including this burst.",
+    "idle": "No capture was running: the session's in-memory state "
+            "(current stack, calibration masters, settings) at the "
+            "moment the button was pressed.",
 }
 
 
@@ -853,6 +890,7 @@ class App:
         self.q = queue.Queue()
         self.stop_evt = threading.Event()
         self.pause_evt = threading.Event()
+        self.deepdive_evt = threading.Event()  # dump the next burst in full
         self.worker = None          # the active capture thread (any kind)
 
         # camera state (set by Probe)
@@ -978,13 +1016,51 @@ class App:
             c.bind("<Button-1>",
                    lambda e, k=kind: self._popout_graph(k))
 
-        self.root.minsize(2 * CANVAS_W + AUX_W + 60, CANVAS_H + 320)
+        self.root.minsize(2 * CANVAS_W + AUX_W + 60, CANVAS_H + 430)
 
         ctl = tk.Frame(self.root)
         ctl.pack(fill="x", padx=4)
 
-        # row 0: device / probe / resolution / exposure
-        r0 = tk.Frame(ctl); r0.pack(fill="x", pady=2)
+        # capture bar: the two decisions that matter most -- which MODE the
+        # session is in, and running-or-not -- get the biggest, most
+        # explicit controls, on their own row above everything else
+        bar = tk.Frame(ctl)
+        bar.pack(fill="x", pady=(4, 2))
+        tk.Label(bar, text="Mode:",
+                 font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        self.var_mode = tk.StringVar(value="dark")
+        for text, val, sel in (
+                ("DARK — lens capped", "dark", "#c9c9c9"),
+                ("LIGHT — capturing photons", "light", "#aecdf0")):
+            tk.Radiobutton(bar, text=text, value=val,
+                           variable=self.var_mode,
+                           command=self.on_mode_change, indicatoron=0,
+                           font=("TkDefaultFont", 10, "bold"),
+                           padx=10, pady=5, selectcolor=sel
+                           ).pack(side="left", padx=3)
+        self.btn_start = tk.Button(bar, text="▶  Start dark preview",
+                                   command=self.on_start, state="disabled",
+                                   font=("TkDefaultFont", 11, "bold"),
+                                   padx=16, pady=4, width=20,
+                                   disabledforeground="#909090")
+        self.btn_start.pack(side="left", padx=(24, 4))
+        self.btn_stop = tk.Button(bar, text="■  Stop", command=self.on_stop,
+                                  state="disabled",
+                                  font=("TkDefaultFont", 11, "bold"),
+                                  padx=16, pady=4,
+                                  disabledforeground="#909090")
+        self.btn_stop.pack(side="left", padx=4)
+        # "that looks wrong" button: one press writes a self-describing
+        # per-frame diagnostic dump of the next burst (or, idle, of the
+        # session state) -- the artefact to hand over when asking why
+        self.btn_deepdive = tk.Button(bar, text="Deep-dive dump",
+                                      command=self.on_deepdive)
+        self.btn_deepdive.pack(side="right", padx=4)
+
+        # camera: everything about the device itself
+        lf_cam = tk.LabelFrame(ctl, text="Camera")
+        lf_cam.pack(fill="x", pady=2)
+        r0 = tk.Frame(lf_cam); r0.pack(fill="x", pady=2)
         tk.Label(r0, text="Device:").pack(side="left")
         devs = sorted(glob.glob("/dev/video*")) or [self.args.device]
         self.var_dev = tk.StringVar(value=self.args.device if
@@ -1012,30 +1088,23 @@ class App:
         self.lbl_exp_rng = tk.Label(r0, text="")
         self.lbl_exp_rng.pack(side="left")
 
-        # row 0b: UVC processing controls, populated after Probe with the
+        # UVC processing controls, populated after Probe with the
         # device's REAL controls and ranges
-        self.frm_uvc = tk.Frame(ctl)
+        self.frm_uvc = tk.Frame(lf_cam)
         self.frm_uvc.pack(fill="x", pady=2)
         tk.Label(self.frm_uvc, text="UVC controls: (probe a device)"
                  ).pack(side="left")
 
-        # row 1: mode + dark controls
-        r1 = tk.Frame(ctl); r1.pack(fill="x", pady=2)
-        tk.Label(r1, text="Mode:").pack(side="left")
-        self.var_mode = tk.StringVar(value="dark")
-        tk.Radiobutton(r1, text="DARK (lens capped)", value="dark",
-                       variable=self.var_mode,
-                       command=self.on_mode_change).pack(side="left")
-        tk.Radiobutton(r1, text="LIGHT (capturing photons)", value="light",
-                       variable=self.var_mode,
-                       command=self.on_mode_change).pack(side="left", padx=4)
-        self.btn_start = tk.Button(r1, text="Start", command=self.on_start,
-                                   state="disabled")
-        self.btn_start.pack(side="left", padx=8)
-        self.btn_stop = tk.Button(r1, text="Stop", command=self.on_stop,
-                                  state="disabled")
-        self.btn_stop.pack(side="left")
-        tk.Label(r1, text="   Dark frames:").pack(side="left")
+        # calibration masters: dark and flat rows share one frame, and each
+        # row label says which mode its acquisition needs -- that is also
+        # why the wrong-mode acquire button is greyed out
+        lf_cal = tk.LabelFrame(ctl, text="Calibration masters "
+                                         "(per device + resolution)")
+        lf_cal.pack(fill="x", pady=2)
+        r1 = tk.Frame(lf_cal); r1.pack(fill="x", pady=1)
+        tk.Label(r1, text="Dark (DARK mode):", width=17,
+                 anchor="w").pack(side="left")
+        tk.Label(r1, text="frames:").pack(side="left")
         self.var_dark_n = tk.IntVar(value=64)
         tk.Spinbox(r1, from_=8, to=1024, width=5,
                    textvariable=self.var_dark_n).pack(side="left")
@@ -1052,10 +1121,10 @@ class App:
                                       state="disabled")
         self.btn_viewdark.pack(side="left", padx=4)
 
-        # row 1b: master flat acquisition (LIGHT mode: aim at an evenly
-        # illuminated field -- twilight sky / light panel / defocused white)
-        r1b = tk.Frame(ctl); r1b.pack(fill="x", pady=2)
-        tk.Label(r1b, text="Flat frames:").pack(side="left")
+        r1b = tk.Frame(lf_cal); r1b.pack(fill="x", pady=1)
+        tk.Label(r1b, text="Flat (LIGHT mode):", width=17,
+                 anchor="w").pack(side="left")
+        tk.Label(r1b, text="frames:").pack(side="left")
         self.var_flat_n = tk.IntVar(value=64)
         tk.Spinbox(r1b, from_=8, to=1024, width=5,
                    textvariable=self.var_flat_n).pack(side="left")
@@ -1091,9 +1160,11 @@ class App:
         tk.Checkbutton(r1b, text="auto level",
                        variable=self.var_panel_auto).pack(side="left")
 
-        # row 2: integration controls
-        r2 = tk.Frame(ctl); r2.pack(fill="x", pady=2)
-        tk.Label(r2, text="Integrate (rolling):").pack(side="left")
+        # integration: what the LIGHT worker does with each frame
+        lf_int = tk.LabelFrame(ctl, text="Integration (LIGHT mode)")
+        lf_int.pack(fill="x", pady=2)
+        r2 = tk.Frame(lf_int); r2.pack(fill="x", pady=1)
+        tk.Label(r2, text="Rolling window:").pack(side="left")
         self.var_stack_max = tk.IntVar(value=self.stack_max_value)
         self.var_stack_max.trace_add("write", self._on_stack_max_change)
         tk.Spinbox(r2, from_=2, to=1024, width=5,
@@ -1131,15 +1202,17 @@ class App:
                                    command=self.on_reset_stack)
         self.btn_reset.pack(side="left", padx=8)
 
-        # row 2b: integration status
-        r2b = tk.Frame(ctl); r2b.pack(fill="x", pady=1)
+        # integration status
+        r2b = tk.Frame(lf_int); r2b.pack(fill="x", pady=1)
         self.lbl_stack = tk.Label(r2b, text="integrating: 0 frames")
         self.lbl_stack.pack(side="left", padx=4)
         self.lbl_stars = tk.Label(r2b, text="stars: -")
         self.lbl_stars.pack(side="left", padx=8)
 
-        # row 3: solving
-        r3 = tk.Frame(ctl); r3.pack(fill="x", pady=2)
+        # plate solving
+        lf_solve = tk.LabelFrame(ctl, text="Plate solving")
+        lf_solve.pack(fill="x", pady=2)
+        r3 = tk.Frame(lf_solve); r3.pack(fill="x", pady=1)
         tk.Label(r3, text="solve-field:").pack(side="left")
         self.var_solver = tk.StringVar(value=self.args.solver)
         tk.Entry(r3, textvariable=self.var_solver, width=16).pack(side="left")
@@ -1165,9 +1238,9 @@ class App:
                                   command=self.on_save_fits, state="disabled")
         self.btn_fits.pack(side="left", padx=6)
 
-        # row 3b: known-good solve region (crop fed to the solver when the
+        # known-good solve region (crop fed to the solver when the
         # dark/defect correction can't clean the whole frame)
-        r3b = tk.Frame(ctl); r3b.pack(fill="x", pady=1)
+        r3b = tk.Frame(lf_solve); r3b.pack(fill="x", pady=1)
         tk.Label(r3b, text="Solve region:").pack(side="left")
         self.btn_roi = tk.Button(r3b, text="Select on stack",
                                  command=self.on_roi_select)
@@ -1182,8 +1255,8 @@ class App:
         self.lbl_roi = tk.Label(r3b, text="whole frame")
         self.lbl_roi.pack(side="left", padx=8)
 
-        # row 4: sky position / polar alignment readout
-        r4 = tk.Frame(ctl); r4.pack(fill="x", pady=2)
+        # sky position / polar alignment readout
+        r4 = tk.Frame(lf_solve); r4.pack(fill="x", pady=2)
         self.lbl_solve = tk.Label(r4, text="sky position: (not solved)",
                                   font=("TkDefaultFont", 10, "bold"),
                                   anchor="w")
@@ -1231,6 +1304,45 @@ class App:
         self.banner.configure(text=text, bg=bg, fg=fg)
         self.lf_right.configure(
             text="Dark-corrected residual" if dark else "Integrated stack")
+        # the Start button says what Start will actually do in this mode
+        self.btn_start.configure(text="▶  Start dark preview" if dark
+                                 else "▶  Start integrating")
+
+    def _update_run_ui(self, running):
+        """Start/Stop prominence tracks the capture state: exactly one of
+        them is ever the coloured, obvious next click."""
+        if running:
+            self.btn_start.configure(state="disabled", bg="#d9d9d9",
+                                     fg="black",
+                                     activebackground="#d9d9d9")
+            self.btn_stop.configure(state="normal", bg="#c62828",
+                                    fg="white",
+                                    activebackground="#e53935",
+                                    activeforeground="white")
+        else:
+            ready = self.fourcc is not None
+            self.btn_start.configure(
+                state="normal" if ready else "disabled",
+                bg="#2e7d32" if ready else "#d9d9d9",
+                fg="white" if ready else "black",
+                activebackground="#388e3c" if ready else "#d9d9d9",
+                activeforeground="white")
+            self.btn_stop.configure(state="disabled", bg="#d9d9d9",
+                                    fg="black",
+                                    activebackground="#d9d9d9")
+
+    def _update_mode_ui(self, running=None):
+        """The acquire buttons follow the mode: a master dark needs the
+        lens capped (DARK), a master flat needs light (LIGHT). Greying the
+        wrong one out is clearer than a log message after the click."""
+        if running is None:
+            running = self.busy()
+        dark = self.var_mode.get() == "dark"
+        ready = self.fourcc is not None and not running
+        self.btn_dark.configure(
+            state="normal" if (ready and dark) else "disabled")
+        self.btn_flat.configure(
+            state="normal" if (ready and not dark) else "disabled")
 
     def current_size(self):
         m = re.match(r"(\d+)x(\d+)", self.var_res.get() or "")
@@ -1844,9 +1956,8 @@ class App:
                  f"{len(self.sizes)} resolutions, "
                  f"device tag {self.dev_tag or '(none)'}")
         self.on_res_change()
-        self.btn_start.configure(state="normal")
-        self.btn_dark.configure(state="normal")
-        self.btn_flat.configure(state="normal")
+        self._update_run_ui(running=False)
+        self._update_mode_ui(running=False)
         nw, nh = self.sizes[-1]
         self.set_status(
             f"ready — {dev} {self.fourcc}, {len(self.sizes)} resolutions, "
@@ -2196,6 +2307,7 @@ class App:
         if self.busy():
             self.on_stop()
         self._set_mode_banner()
+        self._update_mode_ui()
 
     def on_reset_stack(self):
         self.stack_sum = None
@@ -2231,8 +2343,8 @@ class App:
             return
         self.stop_evt.clear()
         self.pause_evt.clear()
-        self.btn_start.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
+        self._update_run_ui(running=True)
+        self._update_mode_ui(running=True)
         if self.var_mode.get() == "dark":
             self.worker = threading.Thread(target=self._dark_preview_worker,
                                            args=(dev, w, h), daemon=True)
@@ -2323,9 +2435,8 @@ class App:
             return
         n = int(self.var_dark_n.get())
         self.stop_evt.clear()
-        self.btn_dark.configure(state="disabled")
-        self.btn_start.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
+        self._update_run_ui(running=True)
+        self._update_mode_ui(running=True)
         self.lf_right.configure(text="Master dark (accumulating)")
         self.set_status(f"ACQUIRING MASTER DARK 0/{n} — capturing…")
         self.worker = threading.Thread(target=self._dark_worker,
@@ -2384,9 +2495,8 @@ class App:
                      f"{self.exp_value} -- the flat's dark subtraction "
                      "will be biased")
         self.stop_evt.clear()
-        self.btn_flat.configure(state="disabled")
-        self.btn_start.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
+        self._update_run_ui(running=True)
+        self._update_mode_ui(running=True)
         self.lf_right.configure(text="Master flat (accumulating)")
         self.set_status(f"ACQUIRING MASTER FLAT 0/{n} — capturing…")
         self.worker = threading.Thread(target=self._flat_worker,
@@ -2455,6 +2565,73 @@ class App:
             daemon=True)
         t.start()
 
+    # ---------------- deep-dive diagnostics ----------------
+
+    def _deepdive_write(self, kind, arrays, meta):
+        """Write one deep-dive dump: every array as .npy (float64 stored as
+        float32) plus a manifest.json that explains each file and carries
+        the full processing context. Thread-safe: touches no Tk state, so
+        workers call it directly."""
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        d = os.path.join(self.data_dir(), f"deepdive_{kind}_{ts}")
+        os.makedirs(d, exist_ok=True)
+        files = {}
+        for name, arr in arrays.items():
+            if arr is None:
+                continue
+            a = np.asarray(arr)
+            np.save(os.path.join(d, name + ".npy"),
+                    a.astype(np.float32) if a.dtype == np.float64 else a)
+            files[name + ".npy"] = {
+                "shape": list(a.shape),
+                "stats": (frame_stats(a)
+                          if a.ndim == 2 and a.dtype.kind == "f" else None)}
+        manifest = {"tool": "cam_observe.py", "tool_version": TOOL_VERSION,
+                    "kind": kind,
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "readme": DEEPDIVE_README.get(kind, ""),
+                    "pixel_domain": "8-bit luma float, 0-255 ADU "
+                                    "(Y16 normalised /257)",
+                    "files": files}
+        manifest.update(meta)
+        with open(os.path.join(d, "manifest.json"), "w") as fh:
+            json.dump(manifest, fh, indent=2, default=DebugLog._default)
+        self.dbg.log("deepdive", kind=kind, dir=d, files=sorted(files))
+        self.q.put(("log", f"deep-dive dump: {d} ({len(files)} arrays "
+                    "+ manifest.json)"))
+        return d
+
+    def on_deepdive(self):
+        """One press = one comprehensive diagnostic snapshot, for 'that
+        looks wrong' moments: while a capture runs, the NEXT burst is
+        dumped in full (every raw and processed frame, calibration data,
+        parameters, per-frame statistics); idle, the session's in-memory
+        state is dumped immediately."""
+        self.dbg.log("ui", action="deepdive", running=self.busy())
+        if self.busy():
+            self.deepdive_evt.set()
+            self.log("deep-dive armed -- the next capture burst will be "
+                     "dumped in full")
+            self.set_status("deep-dive armed — dumping the next burst",
+                            fg="#ffd000")
+            return
+        stack = (self.stack_sum / self.stack_n
+                 if self.stack_sum is not None and self.stack_n else None)
+        w, h = self.current_size()
+        self._deepdive_write(
+            "idle",
+            {"stack": stack, "master_dark": self.master_dark,
+             "master_flat": self.master_flat, "defects": self.defects},
+            {"device": self.var_dev.get(),
+             "resolution": f"{w}x{h}" if w else None,
+             "fourcc": self.fourcc,
+             "exposure_units": self.exp_value,
+             "master_dark_exposure_units": self.master_exp,
+             "flat_exposure_units": self.flat_exp,
+             "stack_frames": self.stack_n,
+             "roi": self.roi,
+             "stars": [dict(s) for s in self.stars[:20]]})
+
     # ---------------- workers (no Tk calls in here) ----------------
 
     def _dark_worker(self, total, dev, w, h):
@@ -2473,6 +2650,10 @@ class App:
             count = 0
             while count < total and not self.stop_evt.is_set():
                 burst = min(16, total - count)
+                dd = self.deepdive_evt.is_set()
+                if dd:
+                    self.deepdive_evt.clear()
+                dd_raw = []
                 path, _, _ = cap.capture_run(burst, discard=1,
                                              timeout=30.0, verbose=False)
                 last = None
@@ -2481,11 +2662,22 @@ class App:
                     if mean is None:
                         mean = np.zeros_like(fr)
                     mean += (fr - mean) / count
+                    if dd and len(dd_raw) < 8:  # cap the memory cost
+                        dd_raw.append(fr.copy())
                     last = fr
                 try:
                     os.remove(path)
                 except OSError:
                     pass
+                if dd and dd_raw:
+                    arrays = {f"raw_{i:02d}": a
+                              for i, a in enumerate(dd_raw)}
+                    arrays["mean_so_far"] = mean
+                    self._deepdive_write("dark_acquire", arrays, {
+                        "device": dev, "resolution": f"{w}x{h}",
+                        "fourcc": self.fourcc, "exposure_units": exp,
+                        "frames_done": count, "frames_requested": total,
+                        "fps": round(cap.last_fps, 2)})
                 # downsampled COPIES: the UI must not read arrays this loop
                 # keeps mutating, and full-res frames are queue bloat anyway
                 msmall, _ = downsample_to_fit(mean, self.canvas_w,
@@ -2675,6 +2867,10 @@ class App:
             count = 0
             while count < total and not self.stop_evt.is_set():
                 burst = min(16, total - count)
+                dd = self.deepdive_evt.is_set()
+                if dd:
+                    self.deepdive_evt.clear()
+                dd_raw = []
                 path, _, _ = cap.capture_run(burst, discard=1,
                                              timeout=30.0, verbose=False)
                 last = None
@@ -2683,11 +2879,22 @@ class App:
                     if mean is None:
                         mean = np.zeros_like(fr)
                     mean += (fr - mean) / count
+                    if dd and len(dd_raw) < 8:  # cap the memory cost
+                        dd_raw.append(fr.copy())
                     last = fr
                 try:
                     os.remove(path)
                 except OSError:
                     pass
+                if dd and dd_raw:
+                    arrays = {f"raw_{i:02d}": a
+                              for i, a in enumerate(dd_raw)}
+                    arrays["mean_so_far"] = mean
+                    self._deepdive_write("flat_acquire", arrays, {
+                        "device": dev, "resolution": f"{w}x{h}",
+                        "fourcc": self.fourcc, "exposure_units": exp,
+                        "frames_done": count, "frames_requested": total,
+                        "fps": round(cap.last_fps, 2)})
                 # downsampled COPIES: the UI must not read arrays this loop
                 # keeps mutating, and full-res frames are queue bloat anyway
                 msmall, _ = downsample_to_fit(mean, self.canvas_w,
@@ -2739,10 +2946,16 @@ class App:
             cc.set_ctrl(dev, "exposure_time_absolute", self.exp_value)
             while not self.stop_evt.is_set():
                 cap.exposure = self.exp_value  # live-adjustable
+                dd = self.deepdive_evt.is_set()
+                if dd:
+                    self.deepdive_evt.clear()
+                dd_raw = []
                 path, _, _ = cap.capture_run(4, discard=1,
                                              timeout=60.0, verbose=False)
                 last = None
                 for fr in cap.iter_luma(path, 4, discard=1):
+                    if dd:
+                        dd_raw.append(fr.copy())
                     last = fr
                 try:
                     os.remove(path)
@@ -2767,6 +2980,20 @@ class App:
                 else:
                     resid8 = None
                     stats = None
+                if dd and dd_raw:
+                    arrays = {f"raw_{i:02d}": a
+                              for i, a in enumerate(dd_raw)}
+                    arrays.update(
+                        residual=(resid if master is not None else None),
+                        master_dark=master, defects=defects)
+                    self._deepdive_write("dark_preview", arrays, {
+                        "device": dev, "resolution": f"{w}x{h}",
+                        "fourcc": self.fourcc,
+                        "exposure_units": cap.exposure,
+                        "master_dark_exposure_units": self.master_exp,
+                        "fps": round(cap.last_fps, 2),
+                        "residual_stats": (frame_stats(resid)
+                                           if master is not None else None)})
                 self.dbg.log(
                     "burst", kind="dark_preview",
                     exposure_units=cap.exposure,
@@ -2836,6 +3063,13 @@ class App:
                         align_ref = None
                 was_paused = paused
 
+                # deep-dive: when armed, this burst is kept in full and
+                # dumped with the complete processing context
+                dd = self.deepdive_evt.is_set()
+                if dd:
+                    self.deepdive_evt.clear()
+                dd_raw, dd_proc, dd_stats = [], [], []
+
                 last_raw = None
                 last_proc = None
                 last_shift = (0.0, 0.0)
@@ -2855,7 +3089,13 @@ class App:
                         proc = repair_defects(proc.copy(), defects)
                     last_raw = fr
                     last_proc = proc
+                    if dd:
+                        dd_raw.append(fr.copy())
                     if paused:
+                        if dd:
+                            dd_proc.append(proc.copy())
+                            dd_stats.append({"raw": frame_stats(fr),
+                                             "proc": frame_stats(proc)})
                         continue          # display only; no integration
                     if align:
                         small, f = downsample_to_fit(proc, ALIGN_THUMB, ALIGN_THUMB)
@@ -2885,6 +3125,12 @@ class App:
                                 last_reject = "magnitude"
                             else:
                                 last_reject = "confidence"
+                    if dd:
+                        # AFTER the align block: dd_proc holds the frame as
+                        # integrated, including any alignment shift
+                        dd_proc.append(proc.copy())
+                        dd_stats.append({"raw": frame_stats(fr),
+                                         "proc": frame_stats(proc)})
                     f32 = proc.astype(np.float32)
                     # non-inplace subtract: ssum was published as
                     # self.stack_sum, which the UI thread reads for solves
@@ -2900,6 +3146,35 @@ class App:
                     pass
                 if last_raw is None:
                     continue
+
+                if dd and dd_raw:
+                    arrays = {f"raw_{i:02d}": a
+                              for i, a in enumerate(dd_raw)}
+                    arrays.update({f"proc_{i:02d}": a
+                                   for i, a in enumerate(dd_proc)})
+                    arrays.update(master_dark=master, master_flat=flat,
+                                  defects=defects,
+                                  stack=(ssum / len(ring) if ring else None))
+                    self._deepdive_write("light", arrays, {
+                        "device": dev, "resolution": f"{w}x{h}",
+                        "fourcc": self.fourcc,
+                        "exposure_units": cap.exposure,
+                        "subtract_dark": sub, "flat_correct": flt,
+                        "flat_mode": fmode if flt else None,
+                        "repair_defects": fix, "align": align,
+                        "master_dark_exposure_units": self.master_exp,
+                        "flat_exposure_units": self.flat_exp,
+                        "roi": self.roi, "paused": paused,
+                        "ring": len(ring), "window_max": maxn,
+                        "fps": round(cap.last_fps, 2),
+                        "align_burst": {"shift": [round(last_shift[0], 3),
+                                                  round(last_shift[1], 3)],
+                                        "conf": last_conf,
+                                        "applied": last_applied,
+                                        "reject": last_reject},
+                        "per_frame": dd_stats,
+                        "stars_prev_burst": [dict(s)
+                                             for s in self.stars[:10]]})
 
                 # a confident shift rejected for magnitude means cumulative
                 # drift has outrun the alignment reference: say so once,
@@ -3256,13 +3531,8 @@ class App:
                     fg="#802000")
             self.btn_solve.configure(state="normal")
         elif kind == "worker_done":
-            self.btn_dark.configure(
-                state="normal" if self.fourcc else "disabled")
-            self.btn_flat.configure(
-                state="normal" if self.fourcc else "disabled")
-            self.btn_start.configure(
-                state="normal" if self.fourcc else "disabled")
-            self.btn_stop.configure(state="disabled")
+            self._update_run_ui(running=False)
+            self._update_mode_ui(running=False)
             self.btn_pause.configure(state="disabled",
                                      text="Pause integration")
             self.pause_evt.clear()
