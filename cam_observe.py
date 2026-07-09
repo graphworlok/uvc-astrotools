@@ -34,7 +34,13 @@ the lens is capped, so the human says so):
            division (true gain correction -- right on a linear path) or by
            subtracting the flat's structure scaled to the frame's own
            background (robust on gamma'd / black-clamped paths, at the
-           cost of not being photometric).
+           cost of not being photometric). "View flat" analyses the map:
+           radial gain profile, per-pixel noise the divide injects, and a
+           corner-vs-centre verdict separating optical falloff from
+           upstream LSC over-correction; during integration the stack's
+           corner/centre background ratio is reported live, so toggling
+           the correction on an evenly lit field shows directly whether
+           the frame flattens.
 
            "Pause integration" freezes stacking (capture and display keep
            running) for when the sensor is about to move -- e.g. adjusting an
@@ -79,7 +85,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.9"
+TOOL_VERSION = "0.10"
 
 
 # ----------------------------------------------------------------------------
@@ -361,6 +367,51 @@ def apply_flat(img, gain, mode):
     return img / gain
 
 
+def radial_profile(img, nbins=48):
+    """Mean value in equal-width radial bins from the frame centre, radius
+    normalised so 1.0 is the corner distance. Returns (r_centres, means)
+    with empty bins dropped -- the vignette/LSC signature of a gain map."""
+    h, w = img.shape
+    cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+    yy, xx = np.ogrid[:h, :w]
+    r = np.hypot(yy - cy, xx - cx) / math.hypot(cy, cx)
+    idx = np.minimum((r * nbins).astype(int), nbins - 1)
+    sums = np.bincount(idx.ravel(), weights=img.ravel(), minlength=nbins)
+    cnts = np.bincount(idx.ravel(), minlength=nbins)
+    keep = cnts > 0
+    centres = (np.arange(nbins) + 0.5) / nbins
+    return centres[keep], sums[keep] / cnts[keep]
+
+
+def flat_noise_sigma(gain):
+    """Per-pixel noise of the gain map, from horizontal first differences:
+    smooth structure (vignette) cancels between neighbours while noise adds
+    in quadrature, hence the /sqrt(2). This is the fractional noise the
+    divide injects into every corrected frame."""
+    d = np.diff(gain, axis=1)
+    return 1.4826 * float(np.median(np.abs(d - np.median(d)))) \
+        / math.sqrt(2.0)
+
+
+def field_flatness(img):
+    """Corner-vs-centre background of a frame: robust medians of the four
+    corner boxes and the central box (each frame/6 on a side). Returns
+    (centre, corner_mean, ratio); ratio is None when the centre background
+    is too near zero for the quotient to mean anything (a well-subtracted
+    night frame). Pointed at an evenly lit field, this ratio moving to ~1.0
+    when 'flat correct' is enabled IS the closed-loop flat verification."""
+    h, w = img.shape
+    bh, bw = max(2, h // 6), max(2, w // 6)
+    centre = float(np.median(img[(h - bh) // 2:(h + bh) // 2,
+                                 (w - bw) // 2:(w + bw) // 2]))
+    corner = float(np.mean([np.median(img[:bh, :bw]),
+                            np.median(img[:bh, -bw:]),
+                            np.median(img[-bh:, :bw]),
+                            np.median(img[-bh:, -bw:])]))
+    ratio = corner / centre if centre > 0.5 else None
+    return centre, corner, ratio
+
+
 def extract_stars(img, nsigma=5.0, min_pix=2, max_pix=500, max_stars=100,
                   min_fwhm=1.3):
     """Detect stars on a (dark-subtracted) image: robust background via
@@ -637,7 +688,9 @@ DEBUG_SCHEMA = {
                     "parameters in effect",
     "worker_end": "capture worker exited",
     "burst": "one capture burst: timing, fps, frame statistics before/after "
-             "calibration, alignment shift, integration depth, star count",
+             "calibration, alignment shift, integration depth, star count, "
+             "and the stack's corner/centre background ratio (the live "
+             "flat-field verification on an evenly lit field)",
     "dark_progress": "master-dark acquisition progress with accumulating "
                      "master statistics",
     "dark_done": "master dark finished: statistics and hot-pixel count",
@@ -1906,9 +1959,11 @@ class App:
             self.btn_viewflat.configure(state="normal")
 
     def on_view_flat(self):
-        """Inspection window: the normalised gain map auto-stretched -- the
-        vignette profile and any dust shadows should be obvious; a flat that
-        looks like pure noise was signal-starved and is worth re-acquiring."""
+        """Inspection + analysis window: the gain map auto-stretched (the
+        vignette profile and dust shadows should be obvious; pure noise
+        means signal-starved), its radial gain profile, the per-pixel noise
+        the divide injects, and a corner-vs-centre verdict saying whether
+        the shading is normal falloff or upstream LSC over-correction."""
         if self.master_flat is None:
             return
         w, h = self.current_size()
@@ -1929,12 +1984,74 @@ class App:
         cv.create_image((vw - photo.width()) // 2,
                         (vh - photo.height()) // 2, image=photo, anchor="nw")
         top._photo = photo  # keep a reference or Tk drops the image
+
+        # radial gain profile: gain vs distance from centre, 1.0 reference
+        # dashed -- the shape separates optical falloff (drooping) from LSC
+        # over-correction (rising toward the corners)
+        PH = 150
+        pc = tk.Canvas(top, width=vw, height=PH, bg="#101018",
+                       highlightthickness=0)
+        pc.pack(fill="x")
+        prof_r, prof_g = radial_profile(small)
+        gmin = min(float(prof_g.min()), 1.0)
+        gmax = max(float(prof_g.max()), 1.0)
+        span = (gmax - gmin) or 0.01
+        gmin -= 0.08 * span
+        gmax += 0.08 * span
+        padl, padb, padt = 46, 16, 8
+
+        def X(r):
+            return padl + (vw - padl - 10) * r
+
+        def Y(g):
+            return (PH - padb) - (PH - padb - padt) * (g - gmin) \
+                / (gmax - gmin)
+
+        pc.create_line(X(0.0), Y(1.0), X(1.0), Y(1.0), fill="#506070",
+                       dash=(3, 3))
+        pc.create_text(padl - 4, Y(1.0), text="1.00", fill="#4a5a6c",
+                       anchor="e", font=("TkDefaultFont", 7))
+        for gv in (float(prof_g.min()), float(prof_g.max())):
+            if abs(gv - 1.0) > 0.02 * span:
+                pc.create_text(padl - 4, Y(gv), text=f"{gv:.2f}",
+                               fill="#4a5a6c", anchor="e",
+                               font=("TkDefaultFont", 7))
+        pts = []
+        for r, g in zip(prof_r, prof_g):
+            pts.extend((X(r), Y(g)))
+        pc.create_line(*pts, fill="#00d050", width=2)
+        pc.create_text(X(0.0), PH - 6, text="centre", fill="#4a5a6c",
+                       anchor="w", font=("TkDefaultFont", 7))
+        pc.create_text(X(1.0), PH - 6, text="corner", fill="#4a5a6c",
+                       anchor="e", font=("TkDefaultFont", 7))
+
+        centre_g = float(np.mean(prof_g[:3]))
+        corner_g = float(np.mean(prof_g[-3:]))
+        ratio = corner_g / centre_g if centre_g else 0.0
+        noise = flat_noise_sigma(self.master_flat)
         exp = f"{self.flat_exp} units" if self.flat_exp else "unknown"
         info = (f"exposure {exp}  |  "
                 f"gain min {float(self.master_flat.min()):.3f} "
                 f"max {float(self.master_flat.max()):.3f}  |  "
+                f"divide injects ~{noise * 100:.2f}% px noise  |  "
                 "display auto-stretched")
-        tk.Label(top, text=info, anchor="w", padx=6, pady=4).pack(fill="x")
+        tk.Label(top, text=info, anchor="w", padx=6, pady=2).pack(fill="x")
+        dev_pct = (ratio - 1.0) * 100.0
+        if ratio > 1.02:
+            verdict = (f"corners {dev_pct:+.1f}% vs centre — OVER-corrected "
+                       "upstream (LSC reverse vignetting); the flat darkens "
+                       "them back")
+            fg = "#a05000"
+        elif ratio < 0.98:
+            verdict = (f"corners {dev_pct:+.1f}% vs centre — normal "
+                       "falloff; the flat brightens them")
+            fg = "#006000"
+        else:
+            verdict = (f"corners {dev_pct:+.1f}% vs centre — field already "
+                       "flat to ±2%")
+            fg = "#006000"
+        tk.Label(top, text=verdict, anchor="w", padx=6, pady=2, fg=fg,
+                 font=("TkDefaultFont", 9, "bold")).pack(fill="x")
 
     def on_view_dark(self):
         """Inspection window: the master dark auto-stretched, with every
@@ -2605,6 +2722,10 @@ class App:
                 else:
                     stars, bg, sigma = extract_stars(stack)
                 self.stars = stars
+                # corner-vs-centre background of the stack: pointed at an
+                # evenly lit field this is the live flat verification --
+                # toggle the correction and watch the ratio walk to 1.0
+                f_centre, f_corner, f_ratio = field_flatness(stack)
                 self.dbg.log(
                     "burst", kind="light", roi=roi_used,
                     exposure_units=cap.exposure,
@@ -2628,6 +2749,10 @@ class App:
                     stack=frame_stats(stack),
                     stars=len(stars), bg=round(bg, 3),
                     sigma=round(sigma, 4),
+                    field_centre=round(f_centre, 2),
+                    field_corner=round(f_corner, 2),
+                    field_corner_ratio=(round(f_ratio, 3)
+                                        if f_ratio is not None else None),
                     top_stars=[{k: s[k] for k in
                                 ("x", "y", "flux", "fwhm")}
                                for s in stars[:3]])
@@ -2635,7 +2760,7 @@ class App:
                             len(ring), maxn, cap.last_fps, bg, sigma,
                             hist_counts(last_raw, 0.0, 256.0),
                             hist_counts(stack, 0.0, 256.0),
-                            frame_stats(last_proc)["mad_sigma"]))
+                            frame_stats(last_proc)["mad_sigma"], f_ratio))
         except Exception as e:
             self.dbg.exc("error", where="light_worker")
             self.q.put(("log", f"capture failed: {e}"))
@@ -2783,7 +2908,7 @@ class App:
                      f"(stack frozen at {self.stack_n} frames)")
         elif kind == "light_update":
             (_, raw8, stack, stars, n, maxn, fps, bg, sigma,
-             hraw, hstack, sig1) = msg
+             hraw, hstack, sig1, f_ratio) = msg
             self.set_status(f"INTEGRATING {n}/{maxn} @ {fps:.1f} fps — "
                             f"{len(stars)} stars")
             self._show(self.canvas_live, raw8, "live")
@@ -2804,11 +2929,16 @@ class App:
             sN = 1.4826 * float(np.median(np.abs(ssmall - b1)))
             gain = (sigma / sN) if sN > 0 else 0.0
             # stretch readout: the ADU window mapped to black..white. A tiny
-            # span means the auto-stretch is amplifying a near-flat frame
+            # span means the auto-stretch is amplifying a near-flat frame.
+            # corners% is the corner/centre background of the stack -- on an
+            # evenly lit field this walking to 100% when 'flat correct' is
+            # on is the closed-loop verification the flat works
+            flat_note = (f"  ·  corners {f_ratio * 100:.0f}% of centre"
+                         if f_ratio is not None else "")
             self.lbl_stack.configure(
                 text=f"integrating: {n}/{maxn} frames @ {fps:.1f} fps  ·  "
                      f"stretch {st_lo:.2f}..{st_hi:.2f} ADU "
-                     f"(span {st_hi - st_lo:.2f})")
+                     f"(span {st_hi - st_lo:.2f}){flat_note}")
             # detection is already scoped to the ROI in the worker, so this
             # star list is the in-region set -- note that in the readout
             region_note = "  (in region)" if self.roi else ""

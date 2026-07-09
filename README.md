@@ -228,6 +228,16 @@ photometrically right when the processing path is linear) or **subtract**
 photometric, but it cannot over/under-correct on the gamma'd, black-clamped
 processing paths these cameras usually run).
 
+Flat **review/analysis** comes in two layers. **View flat** opens the gain
+map auto-stretched with its **radial gain profile** (the shape separates
+optical falloff, drooping toward the corners, from upstream LSC
+over-correction, rising toward them), the per-pixel noise the divide injects,
+and a corner-vs-centre verdict. During integration the stack's
+**corner/centre background ratio** is computed every burst and shown live
+(and logged per burst under `--debug`) — point the camera at an evenly lit
+field and toggle *flat correct*: the ratio walking to 100% is the
+closed-loop proof the flat is actually correcting the field.
+
 **Pause integration** freezes stacking while capture and display continue —
 for when the sensor is about to move, e.g. adjusting an equatorial mount's
 altitude/azimuth bolts. While paused, stars detected in the live frames are
