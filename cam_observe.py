@@ -16,13 +16,25 @@ the lens is capped, so the human says so):
            Existing files for the device+resolution are loaded automatically.
 
   LIGHT -- the camera can see photons. The raw stream is shown beside the
-           integrated stack: frames are dark-subtracted, defect-repaired,
-           optionally aligned by phase correlation, and integrated over a
+           integrated stack: frames are dark-subtracted, flat-corrected,
+           defect-repaired, optionally aligned by phase correlation, and
+           integrated over a
            ROLLING window of N frames (N visible and changeable). Stars are
            extracted from the stack (robust background + connected
            components -> centroid/flux/FWHM) and the stack can be written to
            FITS / npy and plate-solved with a local astrometry.net
            installation (solve-field), manually or on an auto-solve timer.
+
+           A master FLAT (camera aimed at an evenly illuminated field:
+           twilight sky, light panel, defocused white surface) can be
+           acquired here too: streamed per-pixel mean, dark-subtracted,
+           normalised to a median-1 gain map and saved per device as
+           flat_WxH.npy (+ metadata sidecar), auto-loaded per resolution
+           like the dark. Correction is applied per frame either by
+           division (true gain correction -- right on a linear path) or by
+           subtracting the flat's structure scaled to the frame's own
+           background (robust on gamma'd / black-clamped paths, at the
+           cost of not being photometric).
 
            "Pause integration" freezes stacking (capture and display keep
            running) for when the sensor is about to move -- e.g. adjusting an
@@ -67,7 +79,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.8"
+TOOL_VERSION = "0.9"
 
 
 # ----------------------------------------------------------------------------
@@ -287,6 +299,66 @@ def repair_defects(img, yx):
         neigh[k] = img[ny, nx]
     img[ys, xs] = np.median(neigh, axis=0)
     return img
+
+
+# Master-flat guards and clamps. A flat with a meaningful fraction of pixels
+# at the ceiling is saturated (the gain information there is destroyed); a
+# flat whose dark-subtracted median is tiny is mostly shot noise and would
+# imprint that noise on every corrected frame. The gain map is clamped so a
+# near-dead region (deep vignette corner, dust shadow at low signal) can
+# never turn a divide into a x5+ noise amplifier.
+FLAT_SAT_FRAC = 0.02        # reject: fraction of pixels >= 254.5 ADU
+FLAT_MIN_MEDIAN = 5.0       # reject: dark-subtracted median below this (ADU)
+FLAT_LOW_MEDIAN = 30.0      # warn: usable but noisy below this (ADU)
+FLAT_GAIN_MIN, FLAT_GAIN_MAX = 0.2, 5.0
+
+
+def build_flat(mean, dark=None):
+    """Normalise an averaged flat exposure into a median-1 gain map:
+    dark-subtract when a master dark is supplied, reject saturated or
+    signal-starved flats, clamp the gain into [FLAT_GAIN_MIN, FLAT_GAIN_MAX].
+    Returns (gain, reject_reason, info); gain is None when rejected, info
+    always carries the statistics."""
+    ceil_frac = float((mean >= 254.5).mean())
+    sig = mean - dark if dark is not None \
+        else np.asarray(mean, dtype=np.float64)
+    med = float(np.median(sig))
+    info = {"median_adu": round(med, 3),
+            "ceil_frac": round(ceil_frac, 4),
+            "dark_subtracted": dark is not None}
+    if ceil_frac > FLAT_SAT_FRAC:
+        return None, (f"{ceil_frac * 100:.1f}% of pixels saturated -- "
+                      "reduce exposure or illumination"), info
+    if med < FLAT_MIN_MEDIAN:
+        return None, (f"median signal {med:.1f} ADU is too low to "
+                      "normalise -- brighten the illumination or raise "
+                      "the exposure"), info
+    gain = sig / med
+    lo_frac = float((gain < FLAT_GAIN_MIN).mean())
+    gain = np.clip(gain, FLAT_GAIN_MIN, FLAT_GAIN_MAX)
+    info.update(clamped_low_frac=round(lo_frac, 4),
+                gain_p5=round(float(np.percentile(gain, 5)), 4),
+                gain_p95=round(float(np.percentile(gain, 95)), 4))
+    return gain, None, info
+
+
+def apply_flat(img, gain, mode):
+    """Remove the fixed illumination/gain pattern (vignetting, dust shadows)
+    using a normalised master flat.
+
+    divide   -- img / gain: true gain correction, photometrically right when
+                the processing path is linear.
+    subtract -- img - bg*(gain - 1): removes the flat's STRUCTURE scaled to
+                this frame's own background level, leaving the background
+                flat at bg. Star amplitudes are untouched, so it is not
+                photometric -- but it cannot over/under-correct on the
+                nonlinear (gamma'd, black-clamped) paths these cameras
+                usually run, where division assumes a linearity the data
+                does not have."""
+    if mode == "subtract":
+        bg = float(np.median(img))
+        return np.clip(img - bg * (gain - 1.0), 0.0, None)
+    return img / gain
 
 
 def extract_stars(img, nsigma=5.0, min_pix=2, max_pix=500, max_stars=100,
@@ -558,8 +630,8 @@ DEBUG_SCHEMA = {
              "exposure range, USB device tag",
     "controls": "full V4L2 control dump (name -> min/max/step/default/value) "
                 "at probe time",
-    "calibration_load": "master dark / defect map / metadata found (or not) "
-                        "for the selected resolution",
+    "calibration_load": "master dark / master flat / defect map / metadata "
+                        "found (or not) for the selected resolution",
     "ctrl_set": "a V4L2 control write and whether the device accepted it",
     "worker_start": "capture worker launched: kind and all processing "
                     "parameters in effect",
@@ -570,6 +642,11 @@ DEBUG_SCHEMA = {
                      "master statistics",
     "dark_done": "master dark finished: statistics and hot-pixel count",
     "dark_saved": "calibration files written to disk",
+    "flat_progress": "master-flat acquisition progress with accumulating "
+                     "mean statistics",
+    "flat_done": "master flat finished: normalisation statistics, or the "
+                 "rejection reason",
+    "flat_saved": "flat calibration files written to disk",
     "pause": "integration paused/resumed, and star-motion tracking summaries "
              "while paused",
     "solve_start": "plate solve launched: stack depth and full command line",
@@ -716,6 +793,8 @@ class App:
         self.master_dark = None     # float64 luma 0-255 at current resolution
         self.master_exp = None      # exposure units the master was built at
         self.defects = None         # np.ndarray [[y, x], ...]
+        self.master_flat = None     # normalised gain map (median 1) or None
+        self.flat_exp = None        # exposure units the flat was built at
 
         # stack state (written by the light worker; UI reads snapshots
         # passed through the queue)
@@ -897,6 +976,24 @@ class App:
                                       state="disabled")
         self.btn_viewdark.pack(side="left", padx=4)
 
+        # row 1b: master flat acquisition (LIGHT mode: aim at an evenly
+        # illuminated field -- twilight sky / light panel / defocused white)
+        r1b = tk.Frame(ctl); r1b.pack(fill="x", pady=2)
+        tk.Label(r1b, text="Flat frames:").pack(side="left")
+        self.var_flat_n = tk.IntVar(value=64)
+        tk.Spinbox(r1b, from_=8, to=1024, width=5,
+                   textvariable=self.var_flat_n).pack(side="left")
+        self.btn_flat = tk.Button(r1b, text="Acquire master flat",
+                                  command=self.on_acquire_flat,
+                                  state="disabled")
+        self.btn_flat.pack(side="left", padx=4)
+        self.lbl_flat = tk.Label(r1b, text="no master flat")
+        self.lbl_flat.pack(side="left", padx=4)
+        self.btn_viewflat = tk.Button(r1b, text="View flat",
+                                      command=self.on_view_flat,
+                                      state="disabled")
+        self.btn_viewflat.pack(side="left", padx=4)
+
         # row 2: integration controls
         r2 = tk.Frame(ctl); r2.pack(fill="x", pady=2)
         tk.Label(r2, text="Integrate (rolling):").pack(side="left")
@@ -910,6 +1007,16 @@ class App:
         self.var_align = tk.BooleanVar(value=True)
         tk.Checkbutton(r2, text="subtract dark",
                        variable=self.var_sub).pack(side="left", padx=2)
+        # flat toggle + how the flat is applied (divide = true gain
+        # correction on a linear path; subtract = background-scaled
+        # structure removal, safe on nonlinear paths)
+        self.var_flat = tk.BooleanVar(value=True)
+        tk.Checkbutton(r2, text="flat correct",
+                       variable=self.var_flat).pack(side="left")
+        self.var_flat_mode = tk.StringVar(value="divide")
+        ttk.Combobox(r2, textvariable=self.var_flat_mode, width=8,
+                     state="readonly",
+                     values=("divide", "subtract")).pack(side="left")
         tk.Checkbutton(r2, text="repair defects",
                        variable=self.var_fix).pack(side="left")
         tk.Checkbutton(r2, text="align (phase corr.)",
@@ -1642,6 +1749,7 @@ class App:
         self.on_res_change()
         self.btn_start.configure(state="normal")
         self.btn_dark.configure(state="normal")
+        self.btn_flat.configure(state="normal")
         nw, nh = self.sizes[-1]
         self.set_status(
             f"ready — {dev} {self.fourcc}, {len(self.sizes)} resolutions, "
@@ -1690,6 +1798,8 @@ class App:
         self.master_dark = None
         self.master_exp = None
         self.defects = None
+        self.master_flat = None
+        self.flat_exp = None
         self.pole_xy = None  # pole pixel position is resolution-specific
         self._reset_roi_state()  # ROI pixels are resolution-specific too
         self.on_reset_stack()
@@ -1735,14 +1845,41 @@ class App:
                 self.master_exp = meta.get("exposure_units")
             except Exception:
                 pass
+        fp = os.path.join(d, f"flat_{w}x{h}.npy")
+        fjp = os.path.join(d, f"flat_meta_{w}x{h}.json")
+        if os.path.exists(fp):
+            try:
+                f = np.load(fp)
+                if f.shape == (h, w):
+                    # defensive re-clamp: a hand-edited or stale file must
+                    # not smuggle NaN/0 into the per-frame divide
+                    self.master_flat = np.clip(
+                        np.nan_to_num(f.astype(np.float64), nan=1.0),
+                        FLAT_GAIN_MIN, FLAT_GAIN_MAX)
+                    self.log(f"loaded master flat {fp}")
+                else:
+                    self.log(f"{fp} shape {f.shape} does not match {w}x{h}; "
+                             "ignored")
+            except Exception as e:
+                self.log(f"could not load {fp}: {e}")
+        if os.path.exists(fjp):
+            try:
+                self.flat_exp = json.load(open(fjp)).get("exposure_units")
+            except Exception:
+                pass
         self.dbg.log(
             "calibration_load", resolution=f"{w}x{h}", dir=d,
             master_found=self.master_dark is not None,
             master_stats=(frame_stats(self.master_dark)
                           if self.master_dark is not None else None),
             master_exposure_units=self.master_exp,
-            defects=0 if self.defects is None else len(self.defects))
+            defects=0 if self.defects is None else len(self.defects),
+            flat_found=self.master_flat is not None,
+            flat_stats=(frame_stats(self.master_flat)
+                        if self.master_flat is not None else None),
+            flat_exposure_units=self.flat_exp)
         self._update_dark_label()
+        self._update_flat_label()
         # NB: the loaded master dark is NOT drawn into the integrated-stack
         # panel -- doing so looked like persisted stack data across restarts.
         # Use "View dark/defects" to inspect it; the panel stays blank until
@@ -1758,6 +1895,46 @@ class App:
             self.lbl_dark.configure(
                 text=f"master dark ready{exp}, {nd} defects")
             self.btn_viewdark.configure(state="normal")
+
+    def _update_flat_label(self):
+        if self.master_flat is None:
+            self.lbl_flat.configure(text="no master flat")
+            self.btn_viewflat.configure(state="disabled")
+        else:
+            exp = f" @ exp {self.flat_exp}" if self.flat_exp else ""
+            self.lbl_flat.configure(text=f"master flat ready{exp}")
+            self.btn_viewflat.configure(state="normal")
+
+    def on_view_flat(self):
+        """Inspection window: the normalised gain map auto-stretched -- the
+        vignette profile and any dust shadows should be obvious; a flat that
+        looks like pure noise was signal-starved and is worth re-acquiring."""
+        if self.master_flat is None:
+            return
+        w, h = self.current_size()
+        top = tk.Toplevel(self.root)
+        top.title(f"Master flat {w}x{h}")
+        vw, vh = self.canvas_w, self.canvas_h  # match current display size
+        cv = tk.Canvas(top, width=vw, height=vh, bg="#141414",
+                       highlightthickness=0)
+        cv.pack()
+        small, _ = downsample_to_fit(self.master_flat, vw, vh)
+        img8 = stretch_to_u8(small)
+        z, q = self._fit_scale(img8.shape[1], img8.shape[0], vw, vh)
+        photo = tk.PhotoImage(data=pgm_bytes(img8))
+        if z > 1:
+            photo = photo.zoom(z, z)
+        if q > 1:
+            photo = photo.subsample(q, q)
+        cv.create_image((vw - photo.width()) // 2,
+                        (vh - photo.height()) // 2, image=photo, anchor="nw")
+        top._photo = photo  # keep a reference or Tk drops the image
+        exp = f"{self.flat_exp} units" if self.flat_exp else "unknown"
+        info = (f"exposure {exp}  |  "
+                f"gain min {float(self.master_flat.min()):.3f} "
+                f"max {float(self.master_flat.max()):.3f}  |  "
+                "display auto-stretched")
+        tk.Label(top, text=info, anchor="w", padx=6, pady=4).pack(fill="x")
 
     def on_view_dark(self):
         """Inspection window: the master dark auto-stretched, with every
@@ -1858,15 +2035,32 @@ class App:
             sub = self.var_sub.get()
             fix = self.var_fix.get()
             align = self.var_align.get()
+            flt = self.var_flat.get()
+            fmode = self.var_flat_mode.get()
             if self.master_dark is not None and self.master_exp \
                     and exp != self.master_exp and sub:
                 self.log(f"NOTE: master dark was built at exposure "
                          f"{self.master_exp}, capturing at {exp} -- "
                          "subtraction will be biased")
+            if flt and self.master_flat is not None:
+                if self.flat_exp and exp != self.flat_exp:
+                    self.log(f"NOTE: master flat was built at exposure "
+                             f"{self.flat_exp}, capturing at {exp} -- if "
+                             "the ISP's amplification is nonlinear with "
+                             "exposure the flat won't fully cancel the "
+                             "shading; re-acquire at the observing exposure")
+                if not (sub and self.master_dark is not None):
+                    self.log("NOTE: flat correction without dark "
+                             "subtraction -- the flat was normalised on "
+                             "dark-subtracted data, so correcting raw "
+                             "frames distorts it, worst in the corners "
+                             "where the LSC has already amplified the "
+                             "pedestal")
             self.btn_pause.configure(state="normal")
             self.set_status("INTEGRATING — starting capture…")
             self.worker = threading.Thread(target=self._light_worker,
-                                           args=(dev, w, h, sub, fix, align),
+                                           args=(dev, w, h, sub, fix, align,
+                                                 flt, fmode),
                                            daemon=True)
         self.worker.start()
 
@@ -1925,6 +2119,51 @@ class App:
         self.lf_right.configure(text="Master dark (accumulating)")
         self.set_status(f"ACQUIRING MASTER DARK 0/{n} — capturing…")
         self.worker = threading.Thread(target=self._dark_worker,
+                                       args=(n, dev, w, h), daemon=True)
+        self.worker.start()
+
+    def on_acquire_flat(self):
+        if self.fourcc is None:
+            self.log("probe a device first")
+            return
+        if self.var_mode.get() != "light":
+            self.log("switch to LIGHT mode and point the camera at an "
+                     "evenly illuminated field (twilight sky, light panel, "
+                     "defocused white surface) first")
+            return
+        if self.busy():
+            self.on_stop()
+            self.worker.join(timeout=10)
+            if self.worker.is_alive():
+                # starting a second worker now would have two v4l2-ctl
+                # processes fighting over the device
+                self.log("previous capture is still shutting down -- "
+                         "try again in a moment")
+                self.set_status("waiting for previous capture to stop",
+                                fg="#ff8060")
+                return
+        dev = self.var_dev.get()
+        w, h = self.current_size()
+        if w is None:
+            self.log("no resolution selected -- probe a device first")
+            return
+        n = int(self.var_flat_n.get())
+        if self.master_dark is None:
+            self.log("NOTE: no master dark -- the flat will not be "
+                     "dark-subtracted, so dark structure folds into the "
+                     "gain map")
+        elif self.master_exp and self.exp_value != self.master_exp:
+            self.log(f"NOTE: master dark was built at exposure "
+                     f"{self.master_exp}, flat capturing at "
+                     f"{self.exp_value} -- the flat's dark subtraction "
+                     "will be biased")
+        self.stop_evt.clear()
+        self.btn_flat.configure(state="disabled")
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.lf_right.configure(text="Master flat (accumulating)")
+        self.set_status(f"ACQUIRING MASTER FLAT 0/{n} — capturing…")
+        self.worker = threading.Thread(target=self._flat_worker,
                                        args=(n, dev, w, h), daemon=True)
         self.worker.start()
 
@@ -2059,6 +2298,69 @@ class App:
             self.dbg.log("worker_end", kind="dark_acquire")
             self.q.put(("worker_done",))
 
+    def _flat_worker(self, total, dev, w, h):
+        """Master-flat acquisition: streaming per-pixel mean of an evenly
+        illuminated field, then normalisation into a median-1 gain map
+        (dark-subtracted when a master dark is loaded)."""
+        exp = self.exp_value
+        master = self.master_dark   # snapshot for the dark subtraction
+        self.dbg.log("worker_start", kind="flat_acquire", device=dev,
+                     exposure_units=exp, frames_requested=total,
+                     resolution=f"{w}x{h}", fourcc=self.fourcc,
+                     master_dark_loaded=master is not None,
+                     master_dark_exposure_units=self.master_exp)
+        cap = None
+        try:
+            cap = self.make_capture(dev, w, h)
+            cc.set_ctrl(dev, "auto_exposure", 1)
+            cc.set_ctrl(dev, "exposure_time_absolute", exp)
+            mean = None
+            count = 0
+            while count < total and not self.stop_evt.is_set():
+                burst = min(16, total - count)
+                path, _, _ = cap.capture_run(burst, discard=1,
+                                             timeout=30.0, verbose=False)
+                last = None
+                for fr in cap.iter_luma(path, burst, discard=1):
+                    count += 1
+                    if mean is None:
+                        mean = np.zeros_like(fr)
+                    mean += (fr - mean) / count
+                    last = fr
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                # downsampled COPIES: the UI must not read arrays this loop
+                # keeps mutating, and full-res frames are queue bloat anyway
+                msmall, _ = downsample_to_fit(mean, self.canvas_w,
+                                              self.canvas_h)
+                lsmall, _ = downsample_to_fit(last, self.canvas_w,
+                                              self.canvas_h)
+                self.dbg.log("flat_progress", frames=count, of=total,
+                             capture_s=round(cap.last_capture_s, 2),
+                             fps=round(cap.last_fps, 2),
+                             master=frame_stats(mean))
+                self.q.put(("flat_progress", count, total,
+                            msmall.copy(), lsmall.copy()))
+            if mean is None:
+                self.q.put(("log", "flat acquisition produced no frames"))
+                return
+            gain, reject, info = build_flat(mean, master)
+            self.dbg.log("flat_done", frames=count, exposure_units=exp,
+                         rejected=reject,
+                         gain=(frame_stats(gain) if gain is not None
+                               else None), **info)
+            self.q.put(("flat_done", gain, reject, info, exp, count))
+        except Exception as e:
+            self.dbg.exc("error", where="flat_worker")
+            self.q.put(("log", f"flat acquisition failed: {e}"))
+        finally:
+            if cap is not None:
+                cap.close()
+            self.dbg.log("worker_end", kind="flat_acquire")
+            self.q.put(("worker_done",))
+
     def _dark_preview_worker(self, dev, w, h):
         """Continuous DARK-mode preview: raw stream + dark-corrected residual
         at a fixed stretch (ideally complete blackness), with residual stats
@@ -2126,12 +2428,14 @@ class App:
             self.dbg.log("worker_end", kind="dark_preview")
             self.q.put(("worker_done",))
 
-    def _light_worker(self, dev, w, h, sub, fix, align):
+    def _light_worker(self, dev, w, h, sub, fix, align, flt, fmode):
         # dev/w/h and the checkbox states arrive as plain values snapshotted
         # on the UI thread (on_start) -- no Tk variable access in here
         master = self.master_dark
+        flat = self.master_flat
         defects = self.defects
         sub = sub and master is not None
+        flt = flt and flat is not None
         fix = fix and defects is not None and len(defects) > 0
         burst = 6
         # rolling integration: ring buffer of the last N processed frames
@@ -2146,6 +2450,8 @@ class App:
                      exposure_units=self.exp_value,
                      resolution=f"{w}x{h}", fourcc=self.fourcc,
                      subtract_dark=sub, repair_defects=fix, align=align,
+                     flat_correct=flt, flat_mode=fmode if flt else None,
+                     flat_exposure_units=self.flat_exp,
                      window_max=self.stack_max_value,
                      master_exposure_units=self.master_exp,
                      defects=0 if defects is None else len(defects))
@@ -2183,6 +2489,8 @@ class App:
                     proc = fr
                     if sub:
                         proc = np.clip(fr - master, 0.0, None)
+                    if flt:
+                        proc = apply_flat(proc, flat, fmode)
                     if fix:
                         proc = repair_defects(proc.copy(), defects)
                     last_raw = fr
@@ -2419,6 +2727,39 @@ class App:
             self.lf_right.configure(text="Dark-corrected residual")
             self.set_status(f"master dark complete: {count} frames, "
                             f"{len(coords)} hot pixels — saved", fg="#80ff80")
+        elif kind == "flat_progress":
+            _, count, total, msmall, lsmall = msg
+            self.prg["maximum"] = total
+            self.prg["value"] = count
+            self.set_status(f"ACQUIRING MASTER FLAT {count}/{total}")
+            self._show(self.canvas_live, stretch_to_u8(lsmall), "live")
+            self._show(self.canvas_stack, stretch_to_u8(msmall), "stack")
+        elif kind == "flat_done":
+            _, gain, reject, info, exp, count = msg
+            self._set_mode_banner()  # restore the right-canvas label
+            if gain is None:
+                # same refusal policy as the dark: a saturated or
+                # signal-starved flat is not a gain measurement, and
+                # installing it would corrupt every corrected frame
+                self.log(f"master flat REJECTED: {reject} -- nothing "
+                         "installed or saved")
+                self.set_status("master flat rejected — nothing saved",
+                                fg="#ff8060")
+                return
+            if info["median_adu"] < FLAT_LOW_MEDIAN:
+                self.log(f"NOTE: flat signal is low (median "
+                         f"{info['median_adu']:.0f} ADU) -- the gain map "
+                         "will be noisy; brighter illumination or a longer "
+                         "exposure would help")
+            self.master_flat = gain
+            self.flat_exp = exp
+            self._save_flat(gain, exp, count, info)
+            self._update_flat_label()
+            self.log(f"master flat: {count} frames, median "
+                     f"{info['median_adu']:.0f} ADU, gain 5-95% "
+                     f"[{info['gain_p5']:.3f}..{info['gain_p95']:.3f}]")
+            self.set_status(f"master flat complete: {count} frames — saved",
+                            fg="#80ff80")
         elif kind == "pause_update":
             _, raw8, pairs, stride, summary, fps = msg
             self.set_status(f"PAUSED — tracking star motion @ {fps:.1f} fps",
@@ -2525,6 +2866,8 @@ class App:
         elif kind == "worker_done":
             self.btn_dark.configure(
                 state="normal" if self.fourcc else "disabled")
+            self.btn_flat.configure(
+                state="normal" if self.fourcc else "disabled")
             self.btn_start.configure(
                 state="normal" if self.fourcc else "disabled")
             self.btn_stop.configure(state="disabled")
@@ -2560,6 +2903,26 @@ class App:
         self.dbg.log("dark_saved", master=mp, defects=dp, meta=jp,
                      hot_pixels=int(len(coords)), exposure_units=exp)
         self.log(f"saved {mp}, {dp}, {jp}")
+
+    def _save_flat(self, gain, exp, count, info):
+        w, h = self.current_size()
+        d = self.data_dir()
+        os.makedirs(d, exist_ok=True)
+        fp = os.path.join(d, f"flat_{w}x{h}.npy")
+        np.save(fp, gain.astype(np.float32))  # median-1 gain map
+        jp = os.path.join(d, f"flat_meta_{w}x{h}.json")
+        with open(jp, "w") as fh:
+            json.dump({"exposure_units": exp, "frames": count,
+                       "median_adu": info["median_adu"],
+                       "dark_subtracted": info["dark_subtracted"],
+                       "gain_p5": info["gain_p5"],
+                       "gain_p95": info["gain_p95"],
+                       "timestamp_utc":
+                           datetime.now(timezone.utc).isoformat()}, fh,
+                      indent=2)
+        self.dbg.log("flat_saved", flat=fp, meta=jp, exposure_units=exp,
+                     frames=count)
+        self.log(f"saved {fp}, {jp}")
 
 
 def main():

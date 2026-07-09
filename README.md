@@ -206,12 +206,27 @@ the lens is capped, so the human says so via a banner toggle:
   `defects_WxH.txt`, plus a `dark_meta_WxH.json` sidecar recording the
   exposure). Existing files for the device + resolution load automatically.
 - **LIGHT mode** — the raw stream beside the **integrated stack**:
-  dark-subtract → defect-repair → optional translation alignment (phase
-  correlation) → a **rolling integration window of N frames**, with N visible
-  and changeable and the `k/N` count displayed live. Stars are extracted from
-  the stack (robust MAD background, connected components → sub-pixel
-  centroids, flux, FWHM) and overlaid on the display, with a noise readout —
-  the figure of merit when mining the noise floor with no stars at all.
+  dark-subtract → flat-correct → defect-repair → optional translation
+  alignment (phase correlation) → a **rolling integration window of N
+  frames**, with N visible and changeable and the `k/N` count displayed live.
+  Stars are extracted from the stack (robust MAD background, connected
+  components → sub-pixel centroids, flux, FWHM) and overlaid on the display,
+  with a noise readout — the figure of merit when mining the noise floor
+  with no stars at all.
+
+**Flat-field correction** — in LIGHT mode, aim the camera at an evenly
+illuminated field (twilight sky, light panel, defocused white surface) and
+acquire a **master flat**: a streamed per-pixel mean, dark-subtracted when a
+master dark is loaded, normalised to a median-1 gain map and saved per device
+(`flat_WxH.npy` + `flat_meta_WxH.json`), auto-loaded per resolution like the
+dark. Saturated or signal-starved flats are rejected outright (they are not a
+gain measurement), and the gain map is clamped so a dead vignette corner can
+never turn the correction into a noise amplifier. A **flat correct** toggle
+applies it per frame in one of two modes: **divide** (true gain correction —
+photometrically right when the processing path is linear) or **subtract**
+(removes the flat's structure scaled to each frame's own background — not
+photometric, but it cannot over/under-correct on the gamma'd, black-clamped
+processing paths these cameras usually run).
 
 **Pause integration** freezes stacking while capture and display continue —
 for when the sensor is about to move, e.g. adjusting an equatorial mount's
