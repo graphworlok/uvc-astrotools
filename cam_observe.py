@@ -40,7 +40,12 @@ the lens is capped, so the human says so):
            upstream LSC over-correction; during integration the stack's
            corner/centre background ratio is reported live, so toggling
            the correction on an evenly lit field shows directly whether
-           the frame flattens.
+           the frame flattens. Acquisition pre-flights the signal level
+           and holds -- telling the user which way to adjust the light --
+           until the median is in the usable band; an opt-in auto-exposure
+           search instead bisects the exposure to mid-scale (flagged,
+           since a flat not shot at the observing exposure may not fully
+           cancel a nonlinear ISP's shading).
 
            "Pause integration" freezes stacking (capture and display keep
            running) for when the sensor is about to move -- e.g. adjusting an
@@ -85,7 +90,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.10"
+TOOL_VERSION = "0.11"
 
 
 # ----------------------------------------------------------------------------
@@ -314,6 +319,13 @@ def repair_defects(img, yx):
 # near-dead region (deep vignette corner, dust shadow at low signal) can
 # never turn a divide into a x5+ noise amplifier.
 FLAT_SAT_FRAC = 0.02        # reject: fraction of pixels >= 254.5 ADU
+# Flat signal guidance bands (median ADU of the raw flat frame). OK_* is the
+# gate the pre-flight loop waits for before accumulating -- outside it the
+# tool tells the user which way to adjust the illumination rather than
+# building a flat that would only be rejected afterwards. TARGET_* is the
+# tighter mid-scale band the (opt-in) auto-exposure search aims for.
+FLAT_OK_LO, FLAT_OK_HI = 40.0, 220.0
+FLAT_TARGET_LO, FLAT_TARGET_HI = 100.0, 160.0
 FLAT_MIN_MEDIAN = 5.0       # reject: dark-subtracted median below this (ADU)
 FLAT_LOW_MEDIAN = 30.0      # warn: usable but noisy below this (ADU)
 FLAT_GAIN_MIN, FLAT_GAIN_MAX = 0.2, 5.0
@@ -696,7 +708,11 @@ DEBUG_SCHEMA = {
     "dark_done": "master dark finished: statistics and hot-pixel count",
     "dark_saved": "calibration files written to disk",
     "flat_progress": "master-flat acquisition progress with accumulating "
-                     "mean statistics",
+                     "mean statistics and live signal level",
+    "flat_wait": "pre-flight illumination guidance: signal out of the "
+                 "usable band, waiting for the user to adjust the light",
+    "flat_autoexp": "one iteration of the opt-in auto-exposure search for "
+                    "a mid-scale flat signal",
     "flat_done": "master flat finished: normalisation statistics, or the "
                  "rejection reason",
     "flat_saved": "flat calibration files written to disk",
@@ -1040,6 +1056,13 @@ class App:
                                   command=self.on_acquire_flat,
                                   state="disabled")
         self.btn_flat.pack(side="left", padx=4)
+        # opt-in: search the exposure for mid-scale signal. Off by default
+        # because the flat SHOULD be shot at the observing exposure (the
+        # ISP's amplification may be nonlinear with exposure) -- the right
+        # knob is normally the illumination, which pre-flight guides
+        self.var_flat_autoexp = tk.BooleanVar(value=False)
+        tk.Checkbutton(r1b, text="auto exposure",
+                       variable=self.var_flat_autoexp).pack(side="left")
         self.lbl_flat = tk.Label(r1b, text="no master flat")
         self.lbl_flat.pack(side="left", padx=4)
         self.btn_viewflat = tk.Button(r1b, text="View flat",
@@ -2265,6 +2288,15 @@ class App:
             self.log("no resolution selected -- probe a device first")
             return
         n = int(self.var_flat_n.get())
+        autoexp = bool(self.var_flat_autoexp.get())
+        exp_rng = ((self.exp_rng.get("min", 1) or 1,
+                    self.exp_rng.get("max", 65535) or 65535)
+                   if self.exp_rng else (1, 65535))
+        if autoexp:
+            self.log("NOTE: auto-exposure flat -- the chosen exposure will "
+                     "generally NOT match the observing exposure; if the "
+                     "ISP's amplification is nonlinear with exposure the "
+                     "flat may not fully cancel the shading")
         if self.master_dark is None:
             self.log("NOTE: no master dark -- the flat will not be "
                      "dark-subtracted, so dark structure folds into the "
@@ -2281,7 +2313,8 @@ class App:
         self.lf_right.configure(text="Master flat (accumulating)")
         self.set_status(f"ACQUIRING MASTER FLAT 0/{n} — capturing…")
         self.worker = threading.Thread(target=self._flat_worker,
-                                       args=(n, dev, w, h), daemon=True)
+                                       args=(n, dev, w, h, autoexp,
+                                             exp_rng), daemon=True)
         self.worker.start()
 
     def on_save_fits(self):
@@ -2415,15 +2448,20 @@ class App:
             self.dbg.log("worker_end", kind="dark_acquire")
             self.q.put(("worker_done",))
 
-    def _flat_worker(self, total, dev, w, h):
-        """Master-flat acquisition: streaming per-pixel mean of an evenly
-        illuminated field, then normalisation into a median-1 gain map
-        (dark-subtracted when a master dark is loaded)."""
+    def _flat_worker(self, total, dev, w, h, autoexp, exp_rng):
+        """Master-flat acquisition: optional auto-exposure search to
+        mid-scale signal (explicit opt-in -- normally the flat should be
+        shot at the observing exposure and the ILLUMINATION adjusted), then
+        a pre-flight loop that holds until the signal is in the usable band
+        (guiding the user which way to adjust the light), then a streaming
+        per-pixel mean normalised into a median-1 gain map (dark-subtracted
+        when a master dark is loaded)."""
         exp = self.exp_value
         master = self.master_dark   # snapshot for the dark subtraction
         self.dbg.log("worker_start", kind="flat_acquire", device=dev,
                      exposure_units=exp, frames_requested=total,
                      resolution=f"{w}x{h}", fourcc=self.fourcc,
+                     auto_exposure_search=autoexp,
                      master_dark_loaded=master is not None,
                      master_dark_exposure_units=self.master_exp)
         cap = None
@@ -2431,6 +2469,88 @@ class App:
             cap = self.make_capture(dev, w, h)
             cc.set_ctrl(dev, "auto_exposure", 1)
             cc.set_ctrl(dev, "exposure_time_absolute", exp)
+
+            def measure(nburst=4):
+                """One short burst -> (last_frame, median, clipped_frac)."""
+                path, _, _ = cap.capture_run(nburst, discard=1,
+                                             timeout=30.0, verbose=False)
+                last = None
+                for fr in cap.iter_luma(path, nburst, discard=1):
+                    last = fr
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                if last is None:
+                    return None, 0.0, 0.0
+                return (last, float(np.median(last)),
+                        float((last >= 254.5).mean()))
+
+            def small_or_none(frame):
+                if frame is None:
+                    return None
+                s, _ = downsample_to_fit(frame, self.canvas_w,
+                                         self.canvas_h)
+                return s.copy()
+
+            if autoexp:
+                # bisect the exposure range for a mid-scale median; the
+                # response is monotonic in exposure and clipping counts as
+                # bright. 17 iterations fully resolve 1..65535, so even a
+                # hopelessly bright source converges to the range floor
+                # (the pre-flight loop then says what to do about it);
+                # normal cases break out of the band check much earlier.
+                lo, hi = int(exp_rng[0]), int(exp_rng[1])
+                cur = exp
+                for _ in range(17):
+                    if self.stop_evt.is_set():
+                        return
+                    cur = max(lo, min(hi, (lo + hi) // 2))
+                    cap.exposure = cur
+                    last, med, cf = measure()
+                    self.dbg.log("flat_autoexp", exposure_units=cur,
+                                 median=round(med, 2),
+                                 clip_frac=round(cf, 4), window=[lo, hi])
+                    self.q.put(("flat_wait", med, cf,
+                                f"auto-exposure search: {cur} units",
+                                small_or_none(last)))
+                    if last is None:
+                        continue
+                    if cf > FLAT_SAT_FRAC or med > FLAT_TARGET_HI:
+                        hi = cur - 1
+                    elif med < FLAT_TARGET_LO:
+                        lo = cur + 1
+                    else:
+                        break
+                    if lo > hi:
+                        break
+                exp = cur
+                cap.exposure = exp
+                note = (f" (observing exposure is {self.exp_value} -- "
+                        "mismatch will be flagged at capture start)"
+                        if exp != self.exp_value else "")
+                self.q.put(("log",
+                            f"auto exposure for flat: {exp} units{note}"))
+
+            # pre-flight: hold here until the signal is usable, telling the
+            # user which way to adjust the light -- never accumulate a flat
+            # that the normaliser would only reject afterwards
+            while not self.stop_evt.is_set():
+                last, med, cf = measure()
+                if last is None:
+                    continue
+                if cf > FLAT_SAT_FRAC or med > FLAT_OK_HI:
+                    guide = "too bright / clipping -- dim the illumination"
+                elif med < FLAT_OK_LO:
+                    guide = "too dim -- brighten the illumination"
+                else:
+                    break
+                self.dbg.log("flat_wait", median=round(med, 2),
+                             clip_frac=round(cf, 4), guide=guide)
+                self.q.put(("flat_wait", med, cf, guide,
+                            small_or_none(last)))
+            if self.stop_evt.is_set():
+                return
             mean = None
             count = 0
             while count < total and not self.stop_evt.is_set():
@@ -2454,12 +2574,15 @@ class App:
                                               self.canvas_h)
                 lsmall, _ = downsample_to_fit(last, self.canvas_w,
                                               self.canvas_h)
+                med = float(np.median(last))
+                cf = float((last >= 254.5).mean())
                 self.dbg.log("flat_progress", frames=count, of=total,
                              capture_s=round(cap.last_capture_s, 2),
                              fps=round(cap.last_fps, 2),
+                             median=round(med, 2), clip_frac=round(cf, 4),
                              master=frame_stats(mean))
                 self.q.put(("flat_progress", count, total,
-                            msmall.copy(), lsmall.copy()))
+                            msmall.copy(), lsmall.copy(), med, cf))
             if mean is None:
                 self.q.put(("log", "flat acquisition produced no frames"))
                 return
@@ -2852,11 +2975,26 @@ class App:
             self.lf_right.configure(text="Dark-corrected residual")
             self.set_status(f"master dark complete: {count} frames, "
                             f"{len(coords)} hot pixels — saved", fg="#80ff80")
+        elif kind == "flat_wait":
+            _, med, cf, guide, lsmall = msg
+            self.set_status(f"FLAT PRE-FLIGHT — median {med:.0f} ADU, "
+                            f"clip {cf * 100:.1f}%: {guide}", fg="#ffd000")
+            if lsmall is not None:
+                self._show(self.canvas_live, stretch_to_u8(lsmall), "live")
         elif kind == "flat_progress":
-            _, count, total, msmall, lsmall = msg
+            _, count, total, msmall, lsmall, med, cf = msg
             self.prg["maximum"] = total
             self.prg["value"] = count
-            self.set_status(f"ACQUIRING MASTER FLAT {count}/{total}")
+            # illumination drifting out of band mid-acquisition is worth
+            # shouting about while there is still time to fix it
+            note = ""
+            if cf > FLAT_SAT_FRAC or med > FLAT_OK_HI:
+                note = " — TOO BRIGHT (illumination drifted?)"
+            elif med < FLAT_OK_LO:
+                note = " — TOO DIM (illumination drifted?)"
+            self.set_status(f"ACQUIRING MASTER FLAT {count}/{total} — "
+                            f"median {med:.0f} ADU{note}",
+                            fg="#ff8060" if note else "#80c0ff")
             self._show(self.canvas_live, stretch_to_u8(lsmall), "live")
             self._show(self.canvas_stack, stretch_to_u8(msmall), "stack")
         elif kind == "flat_done":

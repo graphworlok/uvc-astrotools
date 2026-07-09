@@ -228,6 +228,18 @@ photometrically right when the processing path is linear) or **subtract**
 photometric, but it cannot over/under-correct on the gamma'd, black-clamped
 processing paths these cameras usually run).
 
+Flat acquisition **pre-flights the signal level**: it holds before
+accumulating — telling you which way to adjust the illumination (median ADU
+and clip fraction live in the status line) — until the signal sits in the
+usable band, so a flat that the normaliser would only reject can never be
+built. The exposure itself is deliberately *not* changed: the flat should be
+shot at the observing exposure (a nonlinear ISP amplification won't cancel
+otherwise), so the illumination is the right knob. When you can't control
+the light source (twilight sky), an opt-in **auto exposure** checkbox
+instead bisects the exposure range to a mid-scale median — accepted with a
+logged warning, and the flat/observing exposure mismatch NOTE fires at
+capture start.
+
 Flat **review/analysis** comes in two layers. **View flat** opens the gain
 map auto-stretched with its **radial gain profile** (the shape separates
 optical falloff, drooping toward the corners, from upstream LSC
