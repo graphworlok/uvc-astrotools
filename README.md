@@ -234,11 +234,18 @@ and clip fraction live in the status line) — until the signal sits in the
 usable band, so a flat that the normaliser would only reject can never be
 built. The exposure itself is deliberately *not* changed: the flat should be
 shot at the observing exposure (a nonlinear ISP amplification won't cancel
-otherwise), so the illumination is the right knob. When you can't control
-the light source (twilight sky), an opt-in **auto exposure** checkbox
-instead bisects the exposure range to a mid-scale median — accepted with a
-logged warning, and the flat/observing exposure mismatch NOTE fires at
-capture start.
+otherwise), so the illumination is the right knob — and the tool can turn
+that knob itself: a **Flat panel** button opens a uniform grey window
+(fullscreen-capable, level 0–255, movable to any attached screen) to aim the
+camera at, and with **auto level** enabled the acquisition servos the panel
+brightness into the target band before accumulating. Point the camera at the
+screen (slightly defocused, or through a paper diffuser, to even out pixel
+structure and backlight non-uniformity), press Acquire, and the flat builds
+itself with every camera setting untouched. When you can't control the light
+source at all (twilight sky), an opt-in **auto exposure** checkbox instead
+bisects the exposure range to a mid-scale median — accepted with a logged
+warning, and the flat/observing exposure mismatch NOTE fires at capture
+start.
 
 Flat **review/analysis** comes in two layers. **View flat** opens the gain
 map auto-stretched with its **radial gain profile** (the shape separates

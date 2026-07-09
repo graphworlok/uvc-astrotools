@@ -45,7 +45,11 @@ the lens is capped, so the human says so):
            until the median is in the usable band; an opt-in auto-exposure
            search instead bisects the exposure to mid-scale (flagged,
            since a flat not shot at the observing exposure may not fully
-           cancel a nonlinear ISP's shading).
+           cancel a nonlinear ISP's shading). A built-in software flat
+           panel (a uniform grey window on any attached screen) makes the
+           illumination itself a knob the tool can turn: with auto level,
+           acquisition servos the panel brightness into the band -- fully
+           automatic flats with no camera setting touched.
 
            "Pause integration" freezes stacking (capture and display keep
            running) for when the sensor is about to move -- e.g. adjusting an
@@ -90,7 +94,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.11"
+TOOL_VERSION = "0.12"
 
 
 # ----------------------------------------------------------------------------
@@ -713,6 +717,8 @@ DEBUG_SCHEMA = {
                  "usable band, waiting for the user to adjust the light",
     "flat_autoexp": "one iteration of the opt-in auto-exposure search for "
                     "a mid-scale flat signal",
+    "flat_panel_level": "one iteration of the software flat panel's "
+                        "auto-level servo",
     "flat_done": "master flat finished: normalisation statistics, or the "
                  "rejection reason",
     "flat_saved": "flat calibration files written to disk",
@@ -864,6 +870,7 @@ class App:
         self.defects = None         # np.ndarray [[y, x], ...]
         self.master_flat = None     # normalised gain map (median 1) or None
         self.flat_exp = None        # exposure units the flat was built at
+        self.panel_win = None       # software flat panel window, if open
 
         # stack state (written by the light worker; UI reads snapshots
         # passed through the queue)
@@ -1069,6 +1076,20 @@ class App:
                                       command=self.on_view_flat,
                                       state="disabled")
         self.btn_viewflat.pack(side="left", padx=4)
+        # software flat panel: a uniform grey window on any attached screen
+        # is a light source whose level the TOOL can turn -- no camera
+        # setting has to change to hit the target signal band
+        self.btn_panel = tk.Button(r1b, text="Flat panel",
+                                   command=self.on_flat_panel)
+        self.btn_panel.pack(side="left", padx=(12, 2))
+        tk.Label(r1b, text="level:").pack(side="left")
+        self.var_panel_level = tk.IntVar(value=180)
+        self.var_panel_level.trace_add("write", self._apply_panel_level)
+        tk.Spinbox(r1b, from_=0, to=255, width=4,
+                   textvariable=self.var_panel_level).pack(side="left")
+        self.var_panel_auto = tk.BooleanVar(value=True)
+        tk.Checkbutton(r1b, text="auto level",
+                       variable=self.var_panel_auto).pack(side="left")
 
         # row 2: integration controls
         r2 = tk.Frame(ctl); r2.pack(fill="x", pady=2)
@@ -1972,6 +1993,55 @@ class App:
                 text=f"master dark ready{exp}, {nd} defects")
             self.btn_viewdark.configure(state="normal")
 
+    def _apply_panel_level(self, *a):
+        if self.panel_win is None or not self.panel_win.winfo_exists():
+            return
+        try:
+            v = max(0, min(255, int(self.var_panel_level.get())))
+        except (tk.TclError, ValueError):
+            return
+        self.panel_win.configure(bg=f"#{v:02x}{v:02x}{v:02x}")
+
+    def on_flat_panel(self):
+        """Software flat panel: a uniform grey window -- put it on any
+        attached screen and aim the camera at it (slightly defocused, or
+        through a paper diffuser, to even out pixel structure and backlight
+        non-uniformity). Its level is a knob the tool itself can turn, so
+        the flat signal can be servoed into the target band without
+        touching a single camera setting."""
+        if self.panel_win is not None and self.panel_win.winfo_exists():
+            self._raise_popout(self.panel_win)
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Flat panel — Up/Down level, F11 or double-click "
+                  "fullscreen, Esc closes")
+        win.geometry("640x480+180+120")
+        self.panel_win = win
+        self._apply_panel_level()
+
+        def bump(d):
+            try:
+                v = int(self.var_panel_level.get())
+            except (tk.TclError, ValueError):
+                v = 180
+            self.var_panel_level.set(max(0, min(255, v + d)))
+
+        def toggle_fs(_e=None):
+            win.attributes("-fullscreen",
+                           not win.attributes("-fullscreen"))
+
+        win.bind("<Up>", lambda e: bump(+5))
+        win.bind("<Down>", lambda e: bump(-5))
+        win.bind("<F11>", toggle_fs)
+        win.bind("<Double-Button-1>", toggle_fs)
+        win.bind("<Escape>", lambda e: win.destroy())
+        self._raise_popout(win)
+        self.dbg.log("ui", action="flat_panel_open",
+                     level=self.var_panel_level.get())
+        self.log("flat panel open -- aim the camera at it (slight defocus "
+                 "or a paper diffuser evens out screen structure); Up/Down "
+                 "adjusts level, F11/double-click toggles fullscreen")
+
     def _update_flat_label(self):
         if self.master_flat is None:
             self.lbl_flat.configure(text="no master flat")
@@ -2289,9 +2359,16 @@ class App:
             return
         n = int(self.var_flat_n.get())
         autoexp = bool(self.var_flat_autoexp.get())
+        panel_auto = (bool(self.var_panel_auto.get())
+                      and self.panel_win is not None
+                      and self.panel_win.winfo_exists())
         exp_rng = ((self.exp_rng.get("min", 1) or 1,
                     self.exp_rng.get("max", 65535) or 65535)
                    if self.exp_rng else (1, 65535))
+        if panel_auto:
+            self.log("flat panel auto-level: the tool will drive the panel "
+                     "brightness into the target band (no camera setting "
+                     "is changed)")
         if autoexp:
             self.log("NOTE: auto-exposure flat -- the chosen exposure will "
                      "generally NOT match the observing exposure; if the "
@@ -2314,7 +2391,8 @@ class App:
         self.set_status(f"ACQUIRING MASTER FLAT 0/{n} — capturing…")
         self.worker = threading.Thread(target=self._flat_worker,
                                        args=(n, dev, w, h, autoexp,
-                                             exp_rng), daemon=True)
+                                             exp_rng, panel_auto),
+                                       daemon=True)
         self.worker.start()
 
     def on_save_fits(self):
@@ -2448,14 +2526,16 @@ class App:
             self.dbg.log("worker_end", kind="dark_acquire")
             self.q.put(("worker_done",))
 
-    def _flat_worker(self, total, dev, w, h, autoexp, exp_rng):
-        """Master-flat acquisition: optional auto-exposure search to
-        mid-scale signal (explicit opt-in -- normally the flat should be
-        shot at the observing exposure and the ILLUMINATION adjusted), then
-        a pre-flight loop that holds until the signal is in the usable band
-        (guiding the user which way to adjust the light), then a streaming
-        per-pixel mean normalised into a median-1 gain map (dark-subtracted
-        when a master dark is loaded)."""
+    def _flat_worker(self, total, dev, w, h, autoexp, exp_rng, panel_auto):
+        """Master-flat acquisition. Signal-level automation in order of
+        preference: the software flat panel's auto-level servo (adjusts the
+        ILLUMINATION -- no camera setting changes), else the opt-in
+        auto-exposure search (explicit trade-off: the flat is then not shot
+        at the observing exposure), else a pre-flight loop that holds until
+        the signal is in the usable band, guiding the user which way to
+        adjust the light. Then a streaming per-pixel mean is normalised
+        into a median-1 gain map (dark-subtracted when a master dark is
+        loaded)."""
         exp = self.exp_value
         master = self.master_dark   # snapshot for the dark subtraction
         self.dbg.log("worker_start", kind="flat_acquire", device=dev,
@@ -2492,6 +2572,46 @@ class App:
                 s, _ = downsample_to_fit(frame, self.canvas_w,
                                          self.canvas_h)
                 return s.copy()
+
+            if panel_auto and autoexp:
+                self.q.put(("log", "flat panel auto-level active -- "
+                            "auto-exposure search skipped (exposure stays "
+                            "at the observing value)"))
+                autoexp = False
+
+            if panel_auto:
+                # illumination servo: bisect the panel grey level (display
+                # response is nonlinear but monotonic) for a mid-scale
+                # median. The level change is applied by the UI thread via
+                # the queue; the short sleep lets the screen repaint before
+                # the next measurement.
+                lo_l, hi_l = 0, 255
+                for _ in range(9):
+                    if self.stop_evt.is_set():
+                        return
+                    cur_l = (lo_l + hi_l) // 2
+                    self.q.put(("panel_level", cur_l))
+                    time.sleep(0.35)
+                    last, med, cf = measure()
+                    self.dbg.log("flat_panel_level", level=cur_l,
+                                 median=round(med, 2),
+                                 clip_frac=round(cf, 4),
+                                 window=[lo_l, hi_l])
+                    self.q.put(("flat_wait", med, cf,
+                                f"auto panel level: {cur_l}",
+                                small_or_none(last)))
+                    if last is None:
+                        continue
+                    if cf > FLAT_SAT_FRAC or med > FLAT_TARGET_HI:
+                        hi_l = cur_l - 1
+                    elif med < FLAT_TARGET_LO:
+                        lo_l = cur_l + 1
+                    else:
+                        break
+                    if lo_l > hi_l:
+                        # panel range exhausted: the wait loop below says
+                        # what to do (move closer / open aperture / etc.)
+                        break
 
             if autoexp:
                 # bisect the exposure range for a mid-scale median; the
@@ -2975,6 +3095,10 @@ class App:
             self.lf_right.configure(text="Dark-corrected residual")
             self.set_status(f"master dark complete: {count} frames, "
                             f"{len(coords)} hot pixels — saved", fg="#80ff80")
+        elif kind == "panel_level":
+            # the flat worker's illumination servo: setting the Tk variable
+            # repaints the panel via its write trace
+            self.var_panel_level.set(int(msg[1]))
         elif kind == "flat_wait":
             _, med, cf, guide, lsmall = msg
             self.set_status(f"FLAT PRE-FLIGHT — median {med:.0f} ADU, "
