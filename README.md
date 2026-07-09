@@ -214,6 +214,21 @@ the lens is capped, so the human says so via a banner toggle:
   with a noise readout — the figure of merit when mining the noise floor
   with no stars at all.
 
+**Static-camera star confirmation** — detection assumes a fixed mount: real
+stars persist burst after burst and drift slowly and predictably, noise
+doesn't. Every detection feeds an α-β-filtered track with velocity
+prediction, and only tracks confirmed over several consecutive bursts are
+reported (to the overlay, the auto-solve gate, and the pause-mode motion
+reference). That lets the detection threshold run *lower* — steered
+adaptively toward a user-set **"Visible stars ≈ N"** count (down to 3.5σ,
+backing off if candidates swamp the target) — finding fainter real stars
+without false positives, since unconfirmed candidates are never shown. The
+status line reports `confirmed / candidates @ threshold`. Both the raw and
+stack views also pop out into **dedicated live windows** (click the raw
+view, double-click the stack view): resizable, fully overlaid, and their
+size feeds the capture downsampling target, so a large window genuinely
+receives more resolution.
+
 **Flat-field correction** — in LIGHT mode, aim the camera at an evenly
 illuminated field (twilight sky, light panel, defocused white surface) and
 acquire a **master flat**: a streamed per-pixel mean, dark-subtracted when a

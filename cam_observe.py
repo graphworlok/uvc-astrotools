@@ -21,9 +21,20 @@ the lens is capped, so the human says so):
            integrated over a
            ROLLING window of N frames (N visible and changeable). Stars are
            extracted from the stack (robust background + connected
-           components -> centroid/flux/FWHM) and the stack can be written to
-           FITS / npy and plate-solved with a local astrometry.net
-           installation (solve-field), manually or on an auto-solve timer.
+           components -> centroid/flux/FWHM) at a threshold that adapts
+           toward the user's declared "visible stars" count, and every
+           candidate must be CONFIRMED by a temporal tracker before it is
+           reported: on a static camera real stars persist burst to burst
+           and drift slowly and predictably (alpha-beta filtered tracks
+           with velocity prediction), while noise doesn't survive
+           consecutive bursts -- so the detector can dig fainter without
+           false stars reaching the display, the solver gate, or the
+           pause reference. The stack can be written to FITS / npy and
+           plate-solved with a local astrometry.net installation
+           (solve-field), manually or on an auto-solve timer. The raw and
+           stack views each pop out into a dedicated resizable window
+           (click / double-click), whose size feeds the capture
+           downsampling so a bigger window shows real resolution.
 
            A master FLAT (camera aimed at an evenly illuminated field:
            twilight sky, light panel, defocused white surface) can be
@@ -101,7 +112,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.13"
+TOOL_VERSION = "0.14"
 
 
 # ----------------------------------------------------------------------------
@@ -507,6 +518,90 @@ def extract_stars(img, nsigma=5.0, min_pix=2, max_pix=500, max_stars=100,
     return stars[:max_stars], bg, sigma
 
 
+class StarTracker:
+    """Temporal confirmation of star detections for a static (or slowly
+    drifting) camera. On a fixed mount stars persist burst after burst and
+    move slowly and predictably (sidereal drift, or ~zero when alignment
+    cancels it); noise spikes and residual-pattern flickers do not. Each
+    detection therefore feeds an alpha-beta-filtered track, and only tracks
+    seen in `confirm`+ bursts are reported -- so the detector can run at a
+    LOWER threshold (finding faint real stars) without single-burst noise
+    ever reaching the display, the solver gate, or the pause reference.
+    The per-track velocity estimate makes next-burst matching predictive,
+    and `miss_max` coasting tolerates clouds and scintillation dropouts."""
+
+    ALPHA = 0.5     # position correction gain
+    BETA = 0.15     # velocity correction gain (px/s per px of residual)
+
+    def __init__(self, confirm=3, gate=8.0, miss_max=4, max_tracks=400):
+        self.confirm = confirm
+        self.gate = gate
+        self.miss_max = miss_max
+        self.max_tracks = max_tracks
+        self.tracks = []
+        self.t_last = None
+
+    def update(self, dets, t):
+        """Feed one burst's raw detections; returns the confirmed star
+        list (dicts with x/y/flux/fwhm/npix plus hits/speed), brightest
+        first. Tracks not matched this burst coast on their prediction."""
+        dt = 0.0 if self.t_last is None else max(t - self.t_last, 1e-3)
+        self.t_last = t
+        for tr in self.tracks:
+            tr["px"] = tr["x"] + tr["vx"] * dt
+            tr["py"] = tr["y"] + tr["vy"] * dt
+        used = set()
+        # brightest tracks claim their detections first: a faint new
+        # neighbour can't steal a bright star's measurement
+        for tr in sorted(self.tracks, key=lambda d: -d["flux"]):
+            best_j = None
+            best_d = self.gate
+            for j, s in enumerate(dets):
+                if j in used:
+                    continue
+                d = math.hypot(s["x"] - tr["px"], s["y"] - tr["py"])
+                if d < best_d:
+                    best_d = d
+                    best_j = j
+            if best_j is None:
+                tr["misses"] += 1
+                tr["x"], tr["y"] = tr["px"], tr["py"]   # coast
+                continue
+            used.add(best_j)
+            s = dets[best_j]
+            rx = s["x"] - tr["px"]
+            ry = s["y"] - tr["py"]
+            tr["x"] = tr["px"] + self.ALPHA * rx
+            tr["y"] = tr["py"] + self.ALPHA * ry
+            if dt > 0:
+                tr["vx"] += self.BETA * rx / dt
+                tr["vy"] += self.BETA * ry / dt
+            tr["flux"] = 0.7 * tr["flux"] + 0.3 * s["flux"]
+            tr["fwhm"] = s["fwhm"]
+            tr["npix"] = s.get("npix", tr.get("npix", 0))
+            tr["hits"] += 1
+            tr["misses"] = 0
+        self.tracks = [tr for tr in self.tracks
+                       if tr["misses"] <= self.miss_max]
+        for j, s in enumerate(dets):
+            if j in used:
+                continue
+            if len(self.tracks) >= self.max_tracks:
+                break
+            self.tracks.append(dict(x=s["x"], y=s["y"], vx=0.0, vy=0.0,
+                                    flux=s["flux"], fwhm=s["fwhm"],
+                                    npix=s.get("npix", 0),
+                                    hits=1, misses=0))
+        conf = [dict(x=tr["x"], y=tr["y"], flux=tr["flux"],
+                     fwhm=round(tr["fwhm"], 2), npix=tr["npix"],
+                     hits=tr["hits"],
+                     speed=round(math.hypot(tr["vx"], tr["vy"]), 3))
+                for tr in self.tracks
+                if tr["hits"] >= self.confirm and tr["misses"] == 0]
+        conf.sort(key=lambda s: -s["flux"])
+        return conf
+
+
 def match_stars(ref_stars, cur_stars, max_dist=80.0):
     """Greedy nearest-neighbour matching of current star detections to a
     reference list. Returns [(rx, ry, cx, cy), ...] for matched pairs --
@@ -711,9 +806,10 @@ DEBUG_SCHEMA = {
                     "parameters in effect",
     "worker_end": "capture worker exited",
     "burst": "one capture burst: timing, fps, frame statistics before/after "
-             "calibration, alignment shift, integration depth, star count, "
-             "and the stack's corner/centre background ratio (the live "
-             "flat-field verification on an evenly lit field)",
+             "calibration, alignment shift, integration depth, raw vs "
+             "track-confirmed star counts with the adaptive detection "
+             "threshold, and the stack's corner/centre background ratio "
+             "(the live flat-field verification on an evenly lit field)",
     "dark_progress": "master-dark acquisition progress with accumulating "
                      "master statistics",
     "dark_done": "master dark finished: statistics and hot-pixel count",
@@ -900,6 +996,7 @@ class App:
         self.dev_tag = ""
         self.exp_value = 1024      # mirrored from the Tk var on the UI thread
         self.stack_max_value = 32  # so workers never touch Tk variables
+        self.star_target_value = 30  # ~how many stars the user says are visible
         self.reset_on_resume = True
 
         # calibration state
@@ -933,6 +1030,9 @@ class App:
         self._last_hist_series = []   # cached so a popout can redraw on resize
         self._popouts = {}        # kind -> Canvas in an expanded popout window
         self._popout_wins = {}    # kind -> Toplevel
+        self._img_popouts = {}    # "live"/"stack" -> Canvas (image windows)
+        self._img_popout_wins = {}
+        self._main_cw, self._main_ch = CANVAS_W, CANVAS_H
 
         # "known-good" solve region: when dark/defect correction can't clean
         # the whole frame, the user drags a rectangle on the LIGHT stack view
@@ -970,7 +1070,8 @@ class App:
         # panels expand; the rational scaler refits the image each update
         disp = tk.Frame(self.root)
         disp.pack(fill="both", expand=True, padx=4, pady=4)
-        self.lf_left = tk.LabelFrame(disp, text="Raw stream")
+        self.lf_left = tk.LabelFrame(disp,
+                                     text="Raw stream (click to pop out)")
         self.lf_left.pack(side="left", padx=2, fill="both", expand=True)
         self.canvas_live = tk.Canvas(self.lf_left, width=CANVAS_W,
                                      height=CANVAS_H, bg="#141414",
@@ -983,6 +1084,12 @@ class App:
                                       highlightthickness=0)
         self.canvas_stack.pack(fill="both", expand=True)
         self.canvas_live.bind("<Configure>", self._on_canvas_resize)
+        # dedicated live image windows: single click on the raw view,
+        # double-click on the stack view (single click there is ROI drag)
+        self.canvas_live.bind("<Button-1>",
+                              lambda e: self._popout_image("live"))
+        self.canvas_stack.bind("<Double-Button-1>",
+                               lambda e: self._popout_image("stack"))
         # drag a known-good solve region on the stack view
         self.canvas_stack.bind("<ButtonPress-1>", self._on_roi_press)
         self.canvas_stack.bind("<B1-Motion>", self._on_roi_drag)
@@ -1204,6 +1311,15 @@ class App:
 
         # integration status
         r2b = tk.Frame(lf_int); r2b.pack(fill="x", pady=1)
+        # roughly how many stars the user judges visible: detection adapts
+        # its threshold toward this count, with the track filter keeping
+        # the lowered threshold honest
+        tk.Label(r2b, text="Visible stars ≈").pack(side="left", padx=(4, 0))
+        self.var_star_target = tk.IntVar(value=self.star_target_value)
+        self.var_star_target.trace_add("write", self._on_star_target_change)
+        tk.Spinbox(r2b, from_=1, to=300, width=4,
+                   textvariable=self.var_star_target).pack(side="left",
+                                                           padx=(0, 8))
         self.lbl_stack = tk.Label(r2b, text="integrating: 0 frames")
         self.lbl_stack.pack(side="left", padx=4)
         self.lbl_stars = tk.Label(r2b, text="stars: -")
@@ -1284,7 +1400,25 @@ class App:
         # workers downsample to this target; _show always refits the actual
         # canvas, so a mid-capture resize just upscales until the next burst
         if event.width > 50 and event.height > 50:
-            self.canvas_w, self.canvas_h = event.width, event.height
+            self._main_cw, self._main_ch = event.width, event.height
+            self._update_display_target()
+
+    def _update_display_target(self):
+        """Workers downsample to the LARGEST open view, so a big dedicated
+        image window actually receives the extra resolution."""
+        cw, ch = self._main_cw, self._main_ch
+        for cv in self._img_popouts.values():
+            if cv.winfo_exists():
+                cw = max(cw, cv.winfo_width())
+                ch = max(ch, cv.winfo_height())
+        self.canvas_w = max(cw, CANVAS_W)
+        self.canvas_h = max(ch, CANVAS_H)
+
+    def _on_star_target_change(self, *a):
+        try:
+            self.star_target_value = max(1, int(self.var_star_target.get()))
+        except (tk.TclError, ValueError):
+            pass
 
     def _on_exp_change(self, *a):
         try:
@@ -1303,7 +1437,8 @@ class App:
         text, bg, fg = DARK_BANNER if dark else LIGHT_BANNER
         self.banner.configure(text=text, bg=bg, fg=fg)
         self.lf_right.configure(
-            text="Dark-corrected residual" if dark else "Integrated stack")
+            text=("Dark-corrected residual" if dark
+                  else "Integrated stack") + " (double-click to pop out)")
         # the Start button says what Start will actually do in this mode
         self.btn_start.configure(text="▶  Start dark preview" if dark
                                  else "▶  Start integrating")
@@ -1488,6 +1623,37 @@ class App:
         self._raise_popout(win)
         self.dbg.log("ui", action="graph_popout", graph=kind)
 
+    def _popout_image(self, which):
+        """Dedicated live window for one of the image views ('live' raw
+        stream / 'stack'), for observing at a useful size: resizable, keeps
+        updating with every burst (with the star/vector/pole overlays), and
+        its size feeds the worker's downsample target so a bigger window
+        genuinely shows more resolution. Display-only: ROI selection stays
+        on the embedded stack view."""
+        win = self._img_popout_wins.get(which)
+        if win is not None and win.winfo_exists():
+            self._raise_popout(win)
+            return
+        titles = {"live": "Raw stream — live",
+                  "stack": "Stack / residual — live"}
+        win = tk.Toplevel(self.root)
+        win.title(titles[which] + " (drag edges to resize)")
+        win.geometry("900x680+120+80")
+        cv = tk.Canvas(win, bg="#141414", highlightthickness=0)
+        cv.pack(fill="both", expand=True)
+        self._img_popouts[which] = cv
+        self._img_popout_wins[which] = win
+        cv.bind("<Configure>", lambda e: self._update_display_target())
+
+        def on_close():
+            self._img_popouts.pop(which, None)
+            self._img_popout_wins.pop(which, None)
+            self._update_display_target()
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        self._raise_popout(win)
+        self.dbg.log("ui", action="image_popout", view=which)
+
     @staticmethod
     def _raise_popout(win):
         """Force a popout to the front -- new Toplevels can otherwise open
@@ -1641,6 +1807,17 @@ class App:
 
     def _show(self, canvas, img8, which, stars=None, stride=1, vectors=None,
               cross=None):
+        """Draw onto the embedded canvas, and mirror to this view's
+        dedicated image window when one is open."""
+        self._render_image(canvas, img8, which, stars, stride, vectors,
+                           cross, main=True)
+        pop = self._img_popouts.get(which)
+        if pop is not None and pop.winfo_exists():
+            self._render_image(pop, img8, which, stars, stride, vectors,
+                               cross, main=False)
+
+    def _render_image(self, canvas, img8, which, stars, stride, vectors,
+                      cross, main):
         h, w = img8.shape
         cw = canvas.winfo_width()
         ch = canvas.winfo_height()
@@ -1682,9 +1859,12 @@ class App:
                 canvas.create_text(x, y - 20, text="pole", fill="#ff50ff",
                                    font=("TkDefaultFont", 8, "bold"))
         # known-good solve region: record the transform so canvas clicks map
-        # back to full-res pixels, and keep the box drawn across frame redraws
+        # back to full-res pixels, and keep the box drawn across frame
+        # redraws. Only the embedded canvas takes ROI drags; the popout
+        # mirror still shows the committed region.
         if which == "stack" and self.var_mode.get() == "light":
-            self._xform_stack = (ox, oy, s, stride)
+            if main:
+                self._xform_stack = (ox, oy, s, stride)
             if self.roi is not None:
                 rx0, ry0, rx1, ry1 = self.roi
                 canvas.create_rectangle(
@@ -1695,13 +1875,15 @@ class App:
                                    ry0 / stride * s + oy - 2, anchor="sw",
                                    text="solve region", fill="#00e5ff",
                                    font=("TkDefaultFont", 8, "bold"))
-            if self._roi_drag is not None:
+            if main and self._roi_drag is not None:
                 canvas.create_rectangle(*self._roi_drag, outline="#00e5ff",
                                         dash=(4, 3), tags="roidrag")
-        if which == "live":
-            self._photo_live = photo
-        else:
-            self._photo_stack = photo
+        canvas._photo = photo   # per-canvas reference or Tk drops the image
+        if main:
+            if which == "live":
+                self._photo_live = photo
+            else:
+                self._photo_stack = photo
 
     # ---------------- known-good solve region (ROI) ----------------
 
@@ -3033,6 +3215,12 @@ class App:
         pause_ref_stars = None
         was_paused = False
         warned_drift = False   # one-shot UI warning for magnitude rejections
+        # static-camera star pipeline: run the detector at an adaptive
+        # threshold steered toward the user's "visible stars" count, and
+        # let the temporal tracker confirm which candidates persist --
+        # noise doesn't survive consecutive bursts, real stars do
+        tracker = StarTracker()
+        nsigma_cur = 5.0
         self.dbg.log("worker_start", kind="light", device=dev,
                      exposure_units=self.exp_value,
                      resolution=f"{w}x{h}", fourcc=self.fourcc,
@@ -3220,6 +3408,8 @@ class App:
                 # background/noise come from the clean region and edge junk
                 # can't masquerade as stars. Coords are shifted back to
                 # full-frame so overlays and the solver line up.
+                target = max(1, self.star_target_value)
+                cap_n = max(60, target * 3)
                 roi = self.roi
                 roi_used = None
                 if roi is not None:
@@ -3229,16 +3419,30 @@ class App:
                     rx1 = max(0, min(roi[2], sw))
                     ry1 = max(0, min(roi[3], sh))
                     if rx1 - rx0 >= 16 and ry1 - ry0 >= 16:
-                        stars, bg, sigma = extract_stars(stack[ry0:ry1,
-                                                               rx0:rx1])
-                        for s in stars:
+                        cand, bg, sigma = extract_stars(
+                            stack[ry0:ry1, rx0:rx1], nsigma=nsigma_cur,
+                            max_stars=cap_n)
+                        for s in cand:
                             s["x"] += rx0
                             s["y"] += ry0
                         roi_used = [rx0, ry0, rx1, ry1]
                     else:
-                        stars, bg, sigma = extract_stars(stack)
+                        cand, bg, sigma = extract_stars(
+                            stack, nsigma=nsigma_cur, max_stars=cap_n)
                 else:
-                    stars, bg, sigma = extract_stars(stack)
+                    cand, bg, sigma = extract_stars(
+                        stack, nsigma=nsigma_cur, max_stars=cap_n)
+                # steer the threshold toward the declared visible-star
+                # count: dig deeper (never below 3.5σ) while short of it,
+                # back off when candidates swamp it. The tracker keeps a
+                # low threshold honest -- unconfirmed candidates are never
+                # reported.
+                n_raw = len(cand)
+                if n_raw < target and nsigma_cur > 3.5:
+                    nsigma_cur = max(3.5, nsigma_cur - 0.3)
+                elif n_raw > 3 * target and nsigma_cur < 8.0:
+                    nsigma_cur = min(8.0, nsigma_cur + 0.5)
+                stars = tracker.update(cand, time.monotonic())
                 self.stars = stars
                 # corner-vs-centre background of the stack: pointed at an
                 # evenly lit field this is the live flat verification --
@@ -3265,7 +3469,10 @@ class App:
                                 if last_conf is not None else None),
                     raw=frame_stats(last_raw), proc=frame_stats(last_proc),
                     stack=frame_stats(stack),
-                    stars=len(stars), bg=round(bg, 3),
+                    stars=len(stars), stars_raw=n_raw,
+                    nsigma=round(nsigma_cur, 2),
+                    tracks=len(tracker.tracks),
+                    star_target=target, bg=round(bg, 3),
                     sigma=round(sigma, 4),
                     field_centre=round(f_centre, 2),
                     field_corner=round(f_corner, 2),
@@ -3278,7 +3485,8 @@ class App:
                             len(ring), maxn, cap.last_fps, bg, sigma,
                             hist_counts(last_raw, 0.0, 256.0),
                             hist_counts(stack, 0.0, 256.0),
-                            frame_stats(last_proc)["mad_sigma"], f_ratio))
+                            frame_stats(last_proc)["mad_sigma"], f_ratio,
+                            n_raw, nsigma_cur))
         except Exception as e:
             self.dbg.exc("error", where="light_worker")
             self.q.put(("log", f"capture failed: {e}"))
@@ -3445,7 +3653,7 @@ class App:
                      f"(stack frozen at {self.stack_n} frames)")
         elif kind == "light_update":
             (_, raw8, stack, stars, n, maxn, fps, bg, sigma,
-             hraw, hstack, sig1, f_ratio) = msg
+             hraw, hstack, sig1, f_ratio, n_raw, nsig) = msg
             self.set_status(f"INTEGRATING {n}/{maxn} @ {fps:.1f} fps — "
                             f"{len(stars)} stars")
             self._show(self.canvas_live, raw8, "live")
@@ -3482,12 +3690,14 @@ class App:
             if stars:
                 s0 = stars[0]
                 self.lbl_stars.configure(
-                    text=f"stars: {len(stars)} (brightest flux "
-                         f"{s0['flux']:.0f}, FWHM {s0['fwhm']}px) "
+                    text=f"stars: {len(stars)} confirmed / {n_raw} cand "
+                         f"@ {nsig:.1f}σ (brightest flux {s0['flux']:.0f}, "
+                         f"FWHM {s0['fwhm']}px) "
                          f"bg {bg:.1f} σ {sigma:.2f}{region_note}")
             else:
                 self.lbl_stars.configure(
-                    text=f"stars: 0  bg {bg:.1f} σ {sigma:.2f}{region_note}")
+                    text=f"stars: 0 confirmed / {n_raw} cand @ {nsig:.1f}σ"
+                         f"  bg {bg:.1f} σ {sigma:.2f}{region_note}")
             self.btn_solve.configure(
                 state="disabled" if self.solving else "normal")
             self.btn_fits.configure(state="normal")
