@@ -65,7 +65,11 @@ the lens is capped, so the human says so):
            a browser on any device -- a larger, better screen than the
            capture machine's own -- becomes the panel, driven by the same
            servo (read-only endpoint; the network can only ask what shade
-           to show).
+           to show). Remote panels long-poll for triggered refresh (level
+           changes land immediately, not on a poll grid) and ACK each
+           painted level, so the servo waits on confirmation rather than
+           a blind sleep. Display gamma spreads the 8-bit level across a
+           wide luminance range; disable the device's auto-brightness.
 
            "Pause integration" freezes stacking (capture and display keep
            running) for when the sensor is about to move -- e.g. adjusting an
@@ -109,6 +113,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 from collections import deque
 from datetime import datetime, timezone
 
@@ -119,7 +124,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.15"
+TOOL_VERSION = "0.16"
 
 
 # ----------------------------------------------------------------------------
@@ -800,10 +805,13 @@ def pole_offset_text(ra, dec):
 # Remote flat panel: serve the panel to any browser on the network
 # ----------------------------------------------------------------------------
 
-# Self-contained page: full-viewport grey surface polling /level ~4x a
-# second, tap for fullscreen + screen wake lock, cursor hidden. A tablet or
-# a big desktop monitor becomes the flat panel; the auto-level servo drives
-# it exactly like the local Tk window.
+# Self-contained page. Triggered refresh: long-polls /level (the server
+# holds the request until the level changes, so updates land immediately,
+# not on a poll grid) and ACKS each applied level via /shown so the
+# auto-level servo can wait for confirmation instead of sleeping blind.
+# Levels are plain 8-bit greys; display gamma already spreads them across
+# a wide luminance range. Tap for fullscreen + screen wake lock; cursor
+# hidden; disable the device's auto-brightness.
 PANEL_HTML = """<!doctype html><html><head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cam_observe flat panel</title>
@@ -812,23 +820,25 @@ PANEL_HTML = """<!doctype html><html><head>
 #hint{position:fixed;bottom:10px;width:100%;text-align:center;color:#444;
 font:14px sans-serif}</style></head>
 <body><div id="p"></div>
-<div id="hint">cam_observe flat panel &mdash; tap for fullscreen; lock this
-device's screen brightness</div>
+<div id="hint">cam_observe flat panel &mdash; tap for fullscreen; disable
+this device's auto-brightness</div>
 <script>
-let lvl=-1;
-async function poll(){
-  try{
-    const r=await fetch('/level',{cache:'no-store'});
-    const j=await r.json();
-    if(j.level!==lvl){
-      lvl=j.level;
-      const h=lvl.toString(16).padStart(2,'0');
-      document.getElementById('p').style.background='#'+h+h+h;
-    }
-  }catch(e){}
-  setTimeout(poll,250);
+let lvl=null;
+function render(L){
+  const h=L.toString(16).padStart(2,'0');
+  document.getElementById('p').style.background='#'+h+h+h;
+  fetch('/shown?level='+L,{cache:'no-store'}).catch(()=>{});
 }
-poll();
+async function loop(){
+  try{
+    const q=(lvl===null)?'':'&last='+lvl;
+    const r=await fetch('/level?wait=25'+q,{cache:'no-store'});
+    const j=await r.json();
+    if(j.level!==lvl){lvl=j.level;render(lvl);}
+  }catch(e){await new Promise(t=>setTimeout(t,1000));}
+  loop();
+}
+loop();
 let wl=null;
 async function wake(){
   try{
@@ -883,16 +893,50 @@ class PanelServer:
         self.get_level = get_level
         self.port = port
         self.last_poll = 0.0
+        self.last_shown = float("nan")   # last level a browser ACKed
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path.startswith("/level"):
+                u = urllib.parse.urlparse(self.path)
+                qs = urllib.parse.parse_qs(u.query)
+                if u.path == "/level":
                     outer.last_poll = time.monotonic()
+                    # triggered refresh: with wait+last, hold the request
+                    # until the level moves (or timeout) -- the browser
+                    # sees changes immediately, not on a poll grid
+                    try:
+                        wait = min(float(qs.get("wait", ["0"])[0]), 30.0)
+                        last = float(qs.get("last", ["nan"])[0])
+                    except ValueError:
+                        wait, last = 0.0, float("nan")
+                    if wait > 0 and last == last:      # last is not NaN
+                        deadline = time.monotonic() + wait
+                        while (float(outer.get_level()) == last
+                               and time.monotonic() < deadline):
+                            # a held request IS an active client: keep the
+                            # timestamp fresh so active_client() stays true
+                            # while the browser quietly holds the poll
+                            outer.last_poll = time.monotonic()
+                            time.sleep(0.05)
+                        outer.last_poll = time.monotonic()
                     body = json.dumps(
-                        {"level": int(outer.get_level())}).encode()
+                        {"level": int(round(float(
+                            outer.get_level())))}).encode()
                     ctype = "application/json"
-                elif self.path == "/" or self.path.startswith("/index"):
+                elif u.path == "/shown":
+                    # the browser confirms a level is actually painted;
+                    # the auto-level servo waits on this instead of a
+                    # blind sleep
+                    try:
+                        outer.last_shown = float(
+                            qs.get("level", ["nan"])[0])
+                    except ValueError:
+                        pass
+                    outer.last_poll = time.monotonic()
+                    body = b'{"ok":1}'
+                    ctype = "application/json"
+                elif u.path == "/" or u.path.startswith("/index"):
                     body = PANEL_HTML.encode("utf-8")
                     ctype = "text/html; charset=utf-8"
                 else:
@@ -2432,8 +2476,8 @@ class App:
             v = max(0, min(255, int(self.var_panel_level.get())))
         except (tk.TclError, ValueError):
             return
-        # mirror FIRST: the HTTP server and workers read this plain int, so
-        # remote panels track the level even with no local window open
+        # mirror FIRST: the HTTP server and workers read this plain int,
+        # so remote panels track the level even with no local window open
         self.panel_level_value = v
         if self.panel_win is not None and self.panel_win.winfo_exists():
             self.panel_win.configure(bg=f"#{v:02x}{v:02x}{v:02x}")
@@ -2504,8 +2548,8 @@ class App:
             or [f"http://<this-machine>:{port}/"]
         for u in urls:
             self.log(f"flat panel serving at {u} -- open it in a browser "
-                     "on the display device, tap for fullscreen, and lock "
-                     "that device's screen brightness")
+                     "on the display device, tap for fullscreen, and "
+                     "disable that device's auto-brightness")
         self.set_status(f"flat panel serving on port {port} — open "
                         f"{urls[0]} on the display device", fg="#80ff80")
         self.dbg.log("ui", action="panel_server", state="started",
@@ -2995,6 +3039,25 @@ class App:
              "roi": self.roi,
              "stars": [dict(s) for s in self.stars[:20]]})
 
+    def _panel_settle(self, commanded):
+        """Block (in the flat worker) until the commanded panel level is
+        actually on screen. A remote browser panel ACKs each painted level
+        via /shown, so wait for that confirmation plus a short
+        render-to-photons margin; with only the local Tk window a fixed
+        UI-hop delay suffices. Called from the worker thread -- no Tk."""
+        srv = self.panel_server
+        if srv is not None and srv.active_client():
+            deadline = time.monotonic() + 2.5
+            while (time.monotonic() < deadline
+                   and not self.stop_evt.is_set()):
+                shown = srv.last_shown
+                if not math.isnan(shown) and abs(shown - commanded) <= 0.01:
+                    break
+                time.sleep(0.05)
+            time.sleep(0.2)
+        else:
+            time.sleep(0.35)
+
     # ---------------- workers (no Tk calls in here) ----------------
 
     def _dark_worker(self, total, dev, w, h):
@@ -3146,12 +3209,7 @@ class App:
                         return
                     cur_l = (lo_l + hi_l) // 2
                     self.q.put(("panel_level", cur_l))
-                    # settle: a remote browser panel needs poll (~250ms) +
-                    # render on top of the UI hop the local window needs
-                    srv = self.panel_server
-                    time.sleep(1.0 if (srv is not None
-                                       and srv.active_client())
-                               else 0.35)
+                    self._panel_settle(cur_l)
                     last, med, cf = measure()
                     self.dbg.log("flat_panel_level", level=cur_l,
                                  median=round(med, 2),
@@ -3766,7 +3824,8 @@ class App:
                             f"{len(coords)} hot pixels — saved", fg="#80ff80")
         elif kind == "panel_level":
             # the flat worker's illumination servo: setting the Tk variable
-            # repaints the panel via its write trace
+            # repaints the panel via its write trace (and mirrors the value
+            # for HTTP panels)
             self.var_panel_level.set(int(msg[1]))
         elif kind == "flat_wait":
             _, med, cf, guide, lsmall = msg

@@ -260,11 +260,18 @@ itself with every camera setting untouched. The panel isn't limited to the
 capture machine's own screen: **Serve to browser** starts a small HTTP
 server (`--panel-port`, default 8799) whose page turns any browser — a
 large desktop monitor, a tablet clamped in front of the objective — into
-the same servo-driven panel (poll-based, tap for fullscreen with a screen
-wake lock; lock the display device's brightness). The endpoint is read-only
-by design: the network can only ask what shade to display. When a remote
-panel is being polled, the auto-level servo allows extra settle time per
-step for the poll + render latency. When you can't control the light
+the same servo-driven panel (tap for fullscreen with a screen wake lock).
+The endpoint is read-only by design: the network can only ask what shade to
+display. Remote panels **long-poll** — the server holds the request until
+the level changes, so updates land immediately rather than on a poll grid —
+and **acknowledge** each painted level, so the auto-level servo waits for
+confirmation (plus a render-to-photons margin) instead of sleeping blind.
+Display gamma spreads the 8-bit grey level across a wide luminance range
+(level 1/255 ≈ 5×10⁻⁶ of full white on a γ2.2 panel), so in most setups the
+display's hardware brightness needn't be adjusted — just disable its
+auto-brightness, which would otherwise drift with ambient light
+mid-acquisition. (A web page cannot control backlight hardware — no such
+browser API exists.) When you can't control the light
 source at all (twilight sky), an opt-in **auto exposure** checkbox instead
 bisects the exposure range to a mid-scale median — accepted with a logged
 warning, and the flat/observing exposure mismatch NOTE fires at capture
