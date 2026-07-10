@@ -256,7 +256,15 @@ camera at, and with **auto level** enabled the acquisition servos the panel
 brightness into the target band before accumulating. Point the camera at the
 screen (slightly defocused, or through a paper diffuser, to even out pixel
 structure and backlight non-uniformity), press Acquire, and the flat builds
-itself with every camera setting untouched. When you can't control the light
+itself with every camera setting untouched. The panel isn't limited to the
+capture machine's own screen: **Serve to browser** starts a small HTTP
+server (`--panel-port`, default 8799) whose page turns any browser — a
+large desktop monitor, a tablet clamped in front of the objective — into
+the same servo-driven panel (poll-based, tap for fullscreen with a screen
+wake lock; lock the display device's brightness). The endpoint is read-only
+by design: the network can only ask what shade to display. When a remote
+panel is being polled, the auto-level servo allows extra settle time per
+step for the poll + render latency. When you can't control the light
 source at all (twilight sky), an opt-in **auto exposure** checkbox instead
 bisects the exposure range to a mid-scale median — accepted with a logged
 warning, and the flat/observing exposure mismatch NOTE fires at capture

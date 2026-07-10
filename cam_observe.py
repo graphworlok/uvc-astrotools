@@ -60,7 +60,12 @@ the lens is capped, so the human says so):
            panel (a uniform grey window on any attached screen) makes the
            illumination itself a knob the tool can turn: with auto level,
            acquisition servos the panel brightness into the band -- fully
-           automatic flats with no camera setting touched.
+           automatic flats with no camera setting touched. The panel can
+           also be SERVED over HTTP ("Serve to browser", --panel-port) so
+           a browser on any device -- a larger, better screen than the
+           capture machine's own -- becomes the panel, driven by the same
+           servo (read-only endpoint; the network can only ask what shade
+           to show).
 
            "Pause integration" freezes stacking (capture and display keep
            running) for when the sensor is about to move -- e.g. adjusting an
@@ -89,6 +94,7 @@ Usage:
 
 import argparse
 import glob
+import http.server
 import json
 import math
 import os
@@ -96,6 +102,7 @@ import platform
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -112,7 +119,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.14"
+TOOL_VERSION = "0.15"
 
 
 # ----------------------------------------------------------------------------
@@ -790,6 +797,133 @@ def pole_offset_text(ra, dec):
 
 
 # ----------------------------------------------------------------------------
+# Remote flat panel: serve the panel to any browser on the network
+# ----------------------------------------------------------------------------
+
+# Self-contained page: full-viewport grey surface polling /level ~4x a
+# second, tap for fullscreen + screen wake lock, cursor hidden. A tablet or
+# a big desktop monitor becomes the flat panel; the auto-level servo drives
+# it exactly like the local Tk window.
+PANEL_HTML = """<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cam_observe flat panel</title>
+<style>html,body{margin:0;height:100%;background:#000;cursor:none}
+#p{position:fixed;inset:0;background:#000}
+#hint{position:fixed;bottom:10px;width:100%;text-align:center;color:#444;
+font:14px sans-serif}</style></head>
+<body><div id="p"></div>
+<div id="hint">cam_observe flat panel &mdash; tap for fullscreen; lock this
+device's screen brightness</div>
+<script>
+let lvl=-1;
+async function poll(){
+  try{
+    const r=await fetch('/level',{cache:'no-store'});
+    const j=await r.json();
+    if(j.level!==lvl){
+      lvl=j.level;
+      const h=lvl.toString(16).padStart(2,'0');
+      document.getElementById('p').style.background='#'+h+h+h;
+    }
+  }catch(e){}
+  setTimeout(poll,250);
+}
+poll();
+let wl=null;
+async function wake(){
+  try{
+    if(navigator.wakeLock&&!wl){
+      wl=await navigator.wakeLock.request('screen');
+      wl.addEventListener('release',()=>{wl=null;});
+    }
+  }catch(e){}
+}
+document.addEventListener('visibilitychange',
+  ()=>{if(!document.hidden)wake();});
+document.body.addEventListener('click',()=>{
+  wake();
+  const e=document.documentElement;
+  if(e.requestFullscreen)e.requestFullscreen().catch(()=>{});
+  document.getElementById('hint').style.display='none';
+});
+</script></body></html>"""
+
+
+def local_ips():
+    """Best-effort list of this machine's LAN IPv4 addresses, for showing
+    usable panel URLs."""
+    ips = set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))     # no packet sent; just picks a route
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            ip = info[4][0]
+            if "." in ip and not ip.startswith("127."):
+                ips.add(ip)
+    except OSError:
+        pass
+    return sorted(ips)
+
+
+class PanelServer:
+    """Serves the software flat panel over HTTP so a browser on ANY device
+    -- a big desktop monitor, a tablet clamped in front of the objective --
+    can be the illumination source. GET / is the panel page, GET /level the
+    current grey level as JSON. Read-only by design: nothing on the network
+    can change tool state, it can only ask what shade to display. The
+    last-poll timestamp tells the auto-level servo a remote display is
+    following, so it allows extra settle time per step."""
+
+    def __init__(self, get_level, port):
+        self.get_level = get_level
+        self.port = port
+        self.last_poll = 0.0
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.startswith("/level"):
+                    outer.last_poll = time.monotonic()
+                    body = json.dumps(
+                        {"level": int(outer.get_level())}).encode()
+                    ctype = "application/json"
+                elif self.path == "/" or self.path.startswith("/index"):
+                    body = PANEL_HTML.encode("utf-8")
+                    ctype = "text/html; charset=utf-8"
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):   # keep stdout quiet
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port),
+                                                     Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    def active_client(self, within=5.0):
+        """True when some browser polled the level recently."""
+        return time.monotonic() - self.last_poll < within
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+# ----------------------------------------------------------------------------
 # Debug / diagnostics (--debug): JSONL aimed at LLM consumption
 # ----------------------------------------------------------------------------
 
@@ -1006,6 +1140,8 @@ class App:
         self.master_flat = None     # normalised gain map (median 1) or None
         self.flat_exp = None        # exposure units the flat was built at
         self.panel_win = None       # software flat panel window, if open
+        self.panel_server = None    # HTTP panel server, if serving
+        self.panel_level_value = 180  # mirrored for workers + HTTP thread
 
         # stack state (written by the light worker; UI reads snapshots
         # passed through the queue)
@@ -1266,6 +1402,11 @@ class App:
         self.var_panel_auto = tk.BooleanVar(value=True)
         tk.Checkbutton(r1b, text="auto level",
                        variable=self.var_panel_auto).pack(side="left")
+        # serve the panel to any browser on the network: a bigger, better
+        # screen than the capture machine's own becomes the light source
+        self.btn_serve = tk.Button(r1b, text="Serve to browser",
+                                   command=self.on_panel_server)
+        self.btn_serve.pack(side="left", padx=(8, 2))
 
         # integration: what the LIGHT worker does with each frame
         lf_int = tk.LabelFrame(ctl, text="Integration (LIGHT mode)")
@@ -2287,13 +2428,15 @@ class App:
             self.btn_viewdark.configure(state="normal")
 
     def _apply_panel_level(self, *a):
-        if self.panel_win is None or not self.panel_win.winfo_exists():
-            return
         try:
             v = max(0, min(255, int(self.var_panel_level.get())))
         except (tk.TclError, ValueError):
             return
-        self.panel_win.configure(bg=f"#{v:02x}{v:02x}{v:02x}")
+        # mirror FIRST: the HTTP server and workers read this plain int, so
+        # remote panels track the level even with no local window open
+        self.panel_level_value = v
+        if self.panel_win is not None and self.panel_win.winfo_exists():
+            self.panel_win.configure(bg=f"#{v:02x}{v:02x}{v:02x}")
 
     def on_flat_panel(self):
         """Software flat panel: a uniform grey window -- put it on any
@@ -2334,6 +2477,39 @@ class App:
         self.log("flat panel open -- aim the camera at it (slight defocus "
                  "or a paper diffuser evens out screen structure); Up/Down "
                  "adjusts level, F11/double-click toggles fullscreen")
+
+    def on_panel_server(self):
+        """Toggle the HTTP flat panel: serve the panel page to any browser
+        on the network, so a larger/better screen than the capture
+        machine's own can be the illumination source."""
+        if self.panel_server is not None:
+            self.panel_server.stop()
+            self.panel_server = None
+            self.btn_serve.configure(relief="raised",
+                                     text="Serve to browser")
+            self.log("panel HTTP server stopped")
+            self.dbg.log("ui", action="panel_server", state="stopped")
+            return
+        port = self.args.panel_port
+        try:
+            self.panel_server = PanelServer(
+                lambda: self.panel_level_value, port)
+        except OSError as e:
+            self.log(f"could not start the panel server on port {port}: "
+                     f"{e} (choose another with --panel-port)")
+            self.set_status("panel server failed to start", fg="#ff8060")
+            return
+        self.btn_serve.configure(relief="sunken", text=f"Serving :{port}")
+        urls = [f"http://{ip}:{port}/" for ip in local_ips()] \
+            or [f"http://<this-machine>:{port}/"]
+        for u in urls:
+            self.log(f"flat panel serving at {u} -- open it in a browser "
+                     "on the display device, tap for fullscreen, and lock "
+                     "that device's screen brightness")
+        self.set_status(f"flat panel serving on port {port} — open "
+                        f"{urls[0]} on the display device", fg="#80ff80")
+        self.dbg.log("ui", action="panel_server", state="started",
+                     port=port, urls=urls)
 
     def _update_flat_label(self):
         if self.master_flat is None:
@@ -2652,9 +2828,14 @@ class App:
             return
         n = int(self.var_flat_n.get())
         autoexp = bool(self.var_flat_autoexp.get())
-        panel_auto = (bool(self.var_panel_auto.get())
-                      and self.panel_win is not None
+        # a panel is "present" if the local window is open OR some browser
+        # is actively polling the served panel page
+        panel_open = (self.panel_win is not None
                       and self.panel_win.winfo_exists())
+        panel_http = (self.panel_server is not None
+                      and self.panel_server.active_client())
+        panel_auto = bool(self.var_panel_auto.get()) \
+            and (panel_open or panel_http)
         exp_rng = ((self.exp_rng.get("min", 1) or 1,
                     self.exp_rng.get("max", 65535) or 65535)
                    if self.exp_rng else (1, 65535))
@@ -2965,7 +3146,12 @@ class App:
                         return
                     cur_l = (lo_l + hi_l) // 2
                     self.q.put(("panel_level", cur_l))
-                    time.sleep(0.35)
+                    # settle: a remote browser panel needs poll (~250ms) +
+                    # render on top of the UI hop the local window needs
+                    srv = self.panel_server
+                    time.sleep(1.0 if (srv is not None
+                                       and srv.active_client())
+                               else 0.35)
                     last, med, cf = measure()
                     self.dbg.log("flat_panel_level", level=cur_l,
                                  median=round(med, 2),
@@ -3807,6 +3993,9 @@ def main():
                          "cam_manager.py)")
     ap.add_argument("--solver", default="solve-field",
                     help="path to astrometry.net's solve-field")
+    ap.add_argument("--panel-port", type=int, default=8799,
+                    help="TCP port for the browser flat panel "
+                         "('Serve to browser'; default 8799)")
     ap.add_argument("--debug", action="store_true",
                     help="write JSONL diagnostics suitable for LLM "
                          "consumption (one self-describing event per line; "
