@@ -31,7 +31,10 @@ the lens is capped, so the human says so):
            false stars reaching the display, the solver gate, or the
            pause reference. The stack can be written to FITS / npy and
            plate-solved with a local astrometry.net installation
-           (solve-field), manually or on an auto-solve timer. The raw and
+           (solve-field), manually or on an auto-solve timer; every solve
+           attempt is archived to solves.jsonl in the per-device data dir
+           (context, full solver output, WCS parsed + raw base64),
+           independent of --debug. The raw and
            stack views each pop out into a dedicated resizable window
            (click / double-click), whose size feeds the capture
            downsampling so a bigger window shows real resolution.
@@ -97,6 +100,7 @@ Usage:
 """
 
 import argparse
+import base64
 import glob
 import http.server
 import json
@@ -124,7 +128,7 @@ from tkinter import ttk
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
 
-TOOL_VERSION = "0.16"
+TOOL_VERSION = "0.17"
 
 
 # ----------------------------------------------------------------------------
@@ -709,16 +713,27 @@ def pole_pixel_from_wcs(raw):
 def solve_field(stack, solve_path, scale_low, scale_high, timeout=180,
                 dbg=None):
     """Write the stack to FITS in a temp dir and run solve-field on it.
-    Returns (ok, message, info) where info carries parsed ra/dec/rotation
-    in degrees when available. Blocking -- call from a worker thread."""
+    Returns (ok, message, info, record): info carries parsed
+    ra/dec/rotation in degrees when available; record carries everything
+    worth persisting about the ATTEMPT, success or failure -- command
+    line, rc, duration, the solver's complete output, the WCS solution
+    (numeric cards parsed AND the raw header block base64d, so any FITS
+    library can reconstruct it), and an inventory of the files solve-field
+    produced. The temp dir itself is deleted; the big per-star artefacts
+    (.axy/.corr/.rdls) are only inventoried, since re-solving a saved
+    stack regenerates them. Blocking -- call from a worker thread."""
     if dbg is None:
         dbg = NullDebug()
+    record = {"solver": solve_path, "scale_low": scale_low,
+              "scale_high": scale_high, "timeout_s": timeout}
     exe = shutil.which(solve_path)
     if not exe:
         dbg.log("solve_end", ok=False, reason="solve-field not on PATH",
                 solver=solve_path)
+        record.update(solved=False, reason="solve-field not found")
         return False, f"solve-field not found at '{solve_path}' -- install " \
-                      "astrometry.net (and index files) or fix the path", {}
+                      "astrometry.net (and index files) or fix the path", \
+            {}, record
     tmp = tempfile.mkdtemp(prefix="camobs_solve_")
     fits = os.path.join(tmp, "stack.fits")
     t0 = time.monotonic()
@@ -731,12 +746,16 @@ def solve_field(stack, solve_path, scale_low, scale_high, timeout=180,
             cmd += ["--scale-units", "arcsecperpix",
                     "--scale-low", str(scale_low),
                     "--scale-high", str(scale_high)]
+        record["cmd"] = cmd
+        record["stack_stats"] = frame_stats(stack)
+        record["stack_shape"] = list(stack.shape)
         dbg.log("solve_start", cmd=cmd, stack=frame_stats(stack),
                 shape=list(stack.shape))
         r = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=timeout)
         out = (r.stdout or "") + (r.stderr or "")
         solved = os.path.exists(os.path.join(tmp, "stack.solved"))
+        record.update(rc=r.returncode, solved=solved, output=out)
         info = {}
         m = re.search(r"Field center: \(RA,Dec\) = \(([-0-9.]+), ([-0-9.]+)\)"
                       r" deg", out)
@@ -754,11 +773,20 @@ def solve_field(stack, solve_path, scale_low, scale_high, timeout=180,
         if solved and os.path.exists(wcs_path):
             try:
                 with open(wcs_path, "rb") as fh:
-                    pp = pole_pixel_from_wcs(fh.read())
+                    wcs_raw = fh.read()
+                record["wcs_cards"] = _parse_wcs_cards(wcs_raw)
+                record["wcs_b64"] = base64.b64encode(wcs_raw).decode("ascii")
+                pp = pole_pixel_from_wcs(wcs_raw)
                 if pp:
                     info["pole_xy"] = [round(pp[0], 1), round(pp[1], 1)]
             except Exception:
                 pass
+        try:
+            record["tmp_files"] = {
+                f: os.path.getsize(os.path.join(tmp, f))
+                for f in sorted(os.listdir(tmp))}
+        except OSError:
+            pass
         lines = []
         for pat in (r"Field center: \(RA,Dec\) = \([^)]*\) deg",
                     r"Field center: \(RA H:M:S, Dec D:M:S\) = \([^)]*\)",
@@ -768,22 +796,27 @@ def solve_field(stack, solve_path, scale_low, scale_high, timeout=180,
             if m:
                 lines.append(m.group(0))
         dur = round(time.monotonic() - t0, 2)
+        record["duration_s"] = dur
         if solved and lines:
             dbg.log("solve_end", ok=True, duration_s=dur, parsed=info,
                     rc=r.returncode)
-            return True, "\n".join(lines), info
+            return True, "\n".join(lines), info, record
         if solved:
             dbg.log("solve_end", ok=True, duration_s=dur, parsed=info,
                     rc=r.returncode, note="no centre line parsed")
-            return True, "solved (no centre line found in output?)", info
+            return True, "solved (no centre line found in output?)", \
+                info, record
         dbg.log("solve_end", ok=False, duration_s=dur, rc=r.returncode,
                 output_tail=out[-1500:])
         return False, "did not solve -- need more stars, better scale " \
-                      "hints, or matching index files", {}
+                      "hints, or matching index files", {}, record
     except subprocess.TimeoutExpired:
-        dbg.log("solve_end", ok=False, duration_s=round(
-            time.monotonic() - t0, 2), reason=f"timeout after {timeout}s")
-        return False, f"solve-field timed out after {timeout}s", {}
+        dur = round(time.monotonic() - t0, 2)
+        dbg.log("solve_end", ok=False, duration_s=dur,
+                reason=f"timeout after {timeout}s")
+        record.update(solved=False, duration_s=dur,
+                      reason=f"timeout after {timeout}s")
+        return False, f"solve-field timed out after {timeout}s", {}, record
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1008,6 +1041,8 @@ DEBUG_SCHEMA = {
     "solve_start": "plate solve launched: stack depth and full command line",
     "solve_end": "plate solve result: parsed RA/Dec/rotation, or failure "
                  "with the tail of solve-field's output",
+    "solve_saved": "a solve attempt was appended to the always-on "
+                   "solves.jsonl archive in the per-device data dir",
     "error": "exception with full traceback",
     "ui": "a user action in the GUI",
     "deepdive": "a full per-frame diagnostic dump was written to disk "
@@ -1197,6 +1232,7 @@ class App:
         self._photo_stack = None
 
         self.solving = False
+        self._solve_auto = False
         self.last_solve_t = 0.0
         self.status_base = "starting…"
         self.last_evt_t = time.monotonic()
@@ -2952,6 +2988,7 @@ class App:
             self.log("solving an unsubtracted stack -- hot pixels may "
                      "masquerade as stars")
         self.solving = True
+        self._solve_auto = auto
         self.last_solve_t = time.monotonic()
         self.btn_solve.configure(state="disabled")
         self.log("plate solving..." + (" (auto)" if auto else "")
@@ -3952,9 +3989,10 @@ class App:
                         > float(self.var_solve_interval.get())):
                 self._trigger_solve(auto=True)
         elif kind == "solved":
-            ok, text, info = msg[1]
+            ok, text, info, record = msg[1]
             self.solving = False
             self.log(("SOLVED:\n" if ok else "solve failed: ") + text)
+            self._append_solve_record(ok, text, info, record)
             if ok and "ra" in info:
                 pos = (f"sky position: RA {info['ra']:.4f}° "
                        f"Dec {info['dec']:+.4f}°")
@@ -4040,6 +4078,42 @@ class App:
         self.dbg.log("flat_saved", flat=fp, meta=jp, exposure_units=exp,
                      frames=count)
         self.log(f"saved {fp}, {jp}")
+
+    def _append_solve_record(self, ok, text, info, record):
+        """Always-on solve archive, independent of --debug: every solve
+        ATTEMPT (success or failure) appended as one JSON line to
+        solves.jsonl in the per-device data dir -- session context, the
+        solver's full output, and the WCS both parsed and as the raw
+        base64 header -- so a night's astrometry is reviewable long after
+        the GUI log is gone. Grep 'solves.jsonl' for '\"solved\": true'."""
+        w, h = self.current_size()
+        rec = {"t": datetime.now(timezone.utc).isoformat(),
+               "tool_version": TOOL_VERSION,
+               "ok": ok, "message": text,
+               "auto_solve": self._solve_auto,
+               "device": self.var_dev.get(),
+               "resolution": f"{w}x{h}" if w else None,
+               "exposure_units": self.exp_value,
+               "stack_frames": self.stack_n,
+               "stars_confirmed": len(self.stars),
+               "roi": self.roi,
+               "solve_crop_origin": self._solve_roi,
+               "master_dark_exposure_units": self.master_exp,
+               "flat_exposure_units": self.flat_exp,
+               "parsed": info}
+        if ok and "ra" in info and "dec" in info:
+            rec["pole_offset"] = pole_offset_text(info["ra"], info["dec"])
+        rec.update(record)
+        path = os.path.join(self.data_dir(), "solves.jsonl")
+        try:
+            os.makedirs(self.data_dir(), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, default=DebugLog._default) + "\n")
+        except OSError as e:
+            self.log(f"could not append the solve record: {e}")
+            return
+        self.dbg.log("solve_saved", path=path, ok=ok)
+        self.log(f"solve record appended to {path}")
 
 
 def main():

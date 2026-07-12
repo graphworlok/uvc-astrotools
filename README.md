@@ -322,6 +322,16 @@ The UVC processing controls the device actually exposes (gain, gamma,
 brightness, contrast, sharpness, saturation) are presented with their real
 ranges after probing and applied live; exposure is adjustable mid-capture.
 
+Every solve attempt — success or failure, manual or auto — is **archived
+independently of `--debug`** as one JSON line in the per-device data dir's
+`solves.jsonl`: timestamp, session context (stack depth, exposure, ROI,
+confirmed star count, calibration exposures), the full command line and
+solver output, duration, and the WCS solution both parsed and as the raw
+base64 FITS header block (any FITS/WCS library can reconstruct it). Grep it
+for `"solved": true`, or pull fields with `jq`/`python -c`. The bulky
+per-star artefacts (`.axy`/`.corr`/`.rdls`) are inventoried by name and
+size but not copied — re-solving a saved stack regenerates them.
+
 Plate solving runs a local astrometry.net (`solve-field`) on the stack
 (written as linear 16-bit FITS), manually or on an auto-solve timer once
 enough stars are present, and reports RA/Dec field centre, rotation, and the
