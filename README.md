@@ -277,6 +277,19 @@ bisects the exposure range to a mid-scale median — accepted with a logged
 warning, and the flat/observing exposure mismatch NOTE fires at capture
 start.
 
+A **test image** page rides the same plumbing: basic test patterns — a line
+grid with a centre crosshair (geometry/distortion/FOV), a checkerboard
+(focus/contrast), a 36-spoke Siemens star (focus through progressively finer
+detail toward the centre) — with **level** (0–255), **scale** (feature size
+in px) and **invert** (dark-on-bright) knobs in the *Test image* row.
+**Test window** opens it locally (Up/Down level, F11/double-click
+fullscreen, Esc closes), and when *Serve to browser* is running the same
+patterns are at **`/test`** on the panel port, so any browser-equipped
+screen becomes the target. Remote pages use the same triggered-refresh
+method as the flat panel, keyed on a revision counter — pattern or knob
+changes repaint immediately, each painted revision is acknowledged, and the
+endpoint stays read-only.
+
 Flat **review/analysis** comes in two layers. **View flat** opens the gain
 map auto-stretched with its **radial gain profile** (the shape separates
 optical falloff, drooping toward the corners, from upstream LSC

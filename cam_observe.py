@@ -74,6 +74,14 @@ the lens is capped, so the human says so):
            a blind sleep. Display gamma spreads the 8-bit level across a
            wide luminance range; disable the device's auto-brightness.
 
+           A TEST IMAGE page rides the same plumbing: basic test patterns
+           (line grid, checkerboard, Siemens star) with level/scale/invert
+           knobs, shown in a local window ("Test window") and served by
+           the same HTTP server at /test -- aim the camera at it to check
+           focus, geometry/distortion, or scaling. Remote pages long-poll
+           a revision counter (pattern changes land immediately) and ACK
+           each painted revision, exactly like the flat panel.
+
            "Pause integration" freezes stacking (capture and display keep
            running) for when the sensor is about to move -- e.g. adjusting an
            equatorial mount's altitude/azimuth. While paused, stars detected
@@ -127,6 +135,7 @@ from tkinter import ttk
 
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
+import cam_skymodel as sky
 
 TOOL_VERSION = "0.17"
 
@@ -611,6 +620,7 @@ class StarTracker:
         conf = [dict(x=tr["x"], y=tr["y"], flux=tr["flux"],
                      fwhm=round(tr["fwhm"], 2), npix=tr["npix"],
                      hits=tr["hits"],
+                     vx=round(tr["vx"], 4), vy=round(tr["vy"], 4),
                      speed=round(math.hypot(tr["vx"], tr["vy"]), 3))
                 for tr in self.tracks
                 if tr["hits"] >= self.confirm and tr["misses"] == 0]
@@ -891,6 +901,92 @@ document.body.addEventListener('click',()=>{
 });
 </script></body></html>"""
 
+# Test image page, served at /test on the same server: basic test patterns
+# (line grid, checkerboard, Siemens star) drawn on a full-window canvas.
+# Same triggered-refresh method as the flat panel, keyed on a revision
+# counter instead of a grey level: long-poll /pattern (held until the rev
+# moves), ACK each painted rev via /pattern_shown. Read-only, fullscreen +
+# wake lock on tap.
+TEST_HTML = """<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cam_observe test image</title>
+<style>html,body{margin:0;height:100%;background:#000;cursor:none;
+overflow:hidden}
+canvas{position:fixed;inset:0}
+#hint{position:fixed;bottom:10px;width:100%;text-align:center;color:#444;
+font:14px sans-serif}</style></head>
+<body><canvas id="c"></canvas>
+<div id="hint">cam_observe test image &mdash; tap for fullscreen; disable
+this device's auto-brightness</div>
+<script>
+let st=null;
+function draw(p){
+  const c=document.getElementById('c');
+  c.width=innerWidth;c.height=innerHeight;
+  const w=c.width,h=c.height,x=c.getContext('2d');
+  const lv=p.level,bg=p.invert?lv:0,fg=p.invert?0:lv;
+  x.fillStyle='rgb('+bg+','+bg+','+bg+')';x.fillRect(0,0,w,h);
+  const f='rgb('+fg+','+fg+','+fg+')';
+  x.fillStyle=f;x.strokeStyle=f;
+  const s=p.scale,cx=w/2,cy=h/2;
+  if(p.kind==='grid'){
+    x.lineWidth=1;x.beginPath();
+    for(let gx=cx%s;gx<=w;gx+=s){x.moveTo(gx+.5,0);x.lineTo(gx+.5,h);}
+    for(let gy=cy%s;gy<=h;gy+=s){x.moveTo(0,gy+.5);x.lineTo(w,gy+.5);}
+    x.stroke();
+    x.lineWidth=3;x.beginPath();
+    x.moveTo(cx-s,cy);x.lineTo(cx+s,cy);
+    x.moveTo(cx,cy-s);x.lineTo(cx,cy+s);x.stroke();
+  }else if(p.kind==='checker'){
+    for(let gy=0,ry=0;gy<h;gy+=s,ry++)
+      for(let gx=(ry%2)*s;gx<w;gx+=2*s)
+        x.fillRect(gx,gy,s,s);
+  }else if(p.kind==='siemens'){
+    const n=36,r=Math.min(w,h)/2-8;
+    for(let i=0;i<n;i++){
+      const a0=i*2*Math.PI/n;
+      x.beginPath();x.moveTo(cx,cy);
+      x.arc(cx,cy,r,a0,a0+Math.PI/n);x.closePath();x.fill();
+    }
+  }
+  fetch('/pattern_shown?rev='+p.rev,{cache:'no-store'}).catch(()=>{});
+}
+async function loop(){
+  try{
+    const q=(st===null)?'':'&last='+st.rev;
+    const r=await fetch('/pattern?wait=25'+q,{cache:'no-store'});
+    const j=await r.json();
+    if(st===null||j.rev!==st.rev){st=j;draw(st);}
+  }catch(e){await new Promise(t=>setTimeout(t,1000));}
+  loop();
+}
+loop();
+window.addEventListener('resize',()=>{if(st)draw(st);});
+let wl=null;
+async function wake(){
+  try{
+    if(navigator.wakeLock&&!wl){
+      wl=await navigator.wakeLock.request('screen');
+      wl.addEventListener('release',()=>{wl=null;});
+    }
+  }catch(e){}
+}
+document.addEventListener('visibilitychange',
+  ()=>{if(!document.hidden)wake();});
+document.body.addEventListener('click',()=>{
+  wake();
+  const e=document.documentElement;
+  if(e.requestFullscreen)e.requestFullscreen().catch(()=>{});
+  document.getElementById('hint').style.display='none';
+});
+</script></body></html>"""
+
+
+def _grey(v):
+    """8-bit grey level -> Tk colour string."""
+    v = int(v)
+    return f"#{v:02x}{v:02x}{v:02x}"
+
 
 def local_ips():
     """Best-effort list of this machine's LAN IPv4 addresses, for showing
@@ -917,16 +1013,20 @@ class PanelServer:
     """Serves the software flat panel over HTTP so a browser on ANY device
     -- a big desktop monitor, a tablet clamped in front of the objective --
     can be the illumination source. GET / is the panel page, GET /level the
-    current grey level as JSON. Read-only by design: nothing on the network
-    can change tool state, it can only ask what shade to display. The
+    current grey level as JSON. GET /test is the test image page, driven by
+    /pattern (current pattern params + revision as JSON, long-pollable) and
+    acknowledged via /pattern_shown. Read-only by design: nothing on the
+    network can change tool state, it can only ask what to display. The
     last-poll timestamp tells the auto-level servo a remote display is
     following, so it allows extra settle time per step."""
 
-    def __init__(self, get_level, port):
+    def __init__(self, get_level, get_pattern, port):
         self.get_level = get_level
+        self.get_pattern = get_pattern   # -> dict incl. a "rev" counter
         self.port = port
         self.last_poll = 0.0
         self.last_shown = float("nan")   # last level a browser ACKed
+        self.last_pattern_shown = -1     # last pattern rev a browser ACKed
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -969,6 +1069,37 @@ class PanelServer:
                     outer.last_poll = time.monotonic()
                     body = b'{"ok":1}'
                     ctype = "application/json"
+                elif u.path == "/pattern":
+                    outer.last_poll = time.monotonic()
+                    # same triggered refresh as /level, keyed on the
+                    # pattern's revision counter
+                    try:
+                        wait = min(float(qs.get("wait", ["0"])[0]), 30.0)
+                        last = int(qs.get("last", ["-1"])[0])
+                    except ValueError:
+                        wait, last = 0.0, -1
+                    if wait > 0 and last >= 0:
+                        deadline = time.monotonic() + wait
+                        while (int(outer.get_pattern()["rev"]) == last
+                               and time.monotonic() < deadline):
+                            outer.last_poll = time.monotonic()
+                            time.sleep(0.05)
+                        outer.last_poll = time.monotonic()
+                    body = json.dumps(outer.get_pattern()).encode()
+                    ctype = "application/json"
+                elif u.path == "/pattern_shown":
+                    # the browser confirms a pattern revision is painted
+                    try:
+                        outer.last_pattern_shown = int(
+                            qs.get("rev", ["-1"])[0])
+                    except ValueError:
+                        pass
+                    outer.last_poll = time.monotonic()
+                    body = b'{"ok":1}'
+                    ctype = "application/json"
+                elif u.path == "/test":
+                    body = TEST_HTML.encode("utf-8")
+                    ctype = "text/html; charset=utf-8"
                 elif u.path == "/" or u.path.startswith("/index"):
                     body = PANEL_HTML.encode("utf-8")
                     ctype = "text/html; charset=utf-8"
@@ -1221,12 +1352,39 @@ class App:
         self.panel_win = None       # software flat panel window, if open
         self.panel_server = None    # HTTP panel server, if serving
         self.panel_level_value = 180  # mirrored for workers + HTTP thread
+        self.test_win = None        # test image window, if open
+        self.test_canvas = None
+        self._test_redraw_job = None
+        # test pattern params mirrored for the HTTP thread; replaced whole
+        # (never mutated) so a reader always sees a consistent params+rev
+        # set, and the rev bump is what remote pages long-poll on
+        self.test_state_value = {"rev": 0, "kind": "grid", "level": 200,
+                                 "scale": 32, "invert": False}
 
         # stack state (written by the light worker; UI reads snapshots
         # passed through the queue)
         self.stack_sum = None
         self.stack_n = 0
         self.stars = []
+
+        # sky prior: armed by a successful solve when the polar-cap
+        # catalogue (make_catalog.py) is present in the root data dir.
+        # Workers read the reference; re-arming replaces the object
+        # (atomic assignment, same publication idiom as the stack)
+        self.sky_prior = None
+        # RA-axis pixel: where the mount's rotation axis pierces the
+        # frame, calibrated from solves either side of an RA rotation
+        # (auto, sidereal-compensated) and persisted per device. THE
+        # steering target: axis onto pole = polar aligned
+        self.axis_xy = None
+        self._armed_prev = None      # (t, wcs, shape) of previous arming
+        self.last_sigma = None       # latest stack noise, for the planner
+        # significant tracked moves (refit dx, dy): raw material for the
+        # bolt-vector auto-calibration. Worker appends, UI thread reads --
+        # deque appends are atomic under the GIL
+        self.move_samples = deque(maxlen=200)
+        self.bolt_vectors = None     # (u_vec, v_vec) once known
+        self.star_names = None       # name -> (ra, dec), loaded on arm
 
         self._photo_live = None     # keep references or Tk drops the images
         self._photo_stack = None
@@ -1487,6 +1645,35 @@ class App:
         self.btn_serve = tk.Button(r1b, text="Serve to browser",
                                    command=self.on_panel_server)
         self.btn_serve.pack(side="left", padx=(8, 2))
+
+        # test image: basic test patterns on the same panel plumbing --
+        # local window or any browser at /test on the served port -- for
+        # focus, geometry/distortion and scaling checks
+        r1c = tk.Frame(lf_cal); r1c.pack(fill="x", pady=1)
+        tk.Label(r1c, text="Test image:", width=17,
+                 anchor="w").pack(side="left")
+        self.var_test_kind = tk.StringVar(value="grid")
+        self.var_test_kind.trace_add("write", self._apply_test_params)
+        ttk.Combobox(r1c, textvariable=self.var_test_kind, width=8,
+                     state="readonly",
+                     values=("grid", "checker", "siemens")).pack(side="left")
+        tk.Label(r1c, text="level:").pack(side="left", padx=(6, 0))
+        self.var_test_level = tk.IntVar(value=200)
+        self.var_test_level.trace_add("write", self._apply_test_params)
+        tk.Spinbox(r1c, from_=0, to=255, width=4,
+                   textvariable=self.var_test_level).pack(side="left")
+        tk.Label(r1c, text="scale:").pack(side="left", padx=(6, 0))
+        self.var_test_scale = tk.IntVar(value=32)
+        self.var_test_scale.trace_add("write", self._apply_test_params)
+        tk.Spinbox(r1c, from_=4, to=256, width=4,
+                   textvariable=self.var_test_scale).pack(side="left")
+        self.var_test_invert = tk.BooleanVar(value=False)
+        self.var_test_invert.trace_add("write", self._apply_test_params)
+        tk.Checkbutton(r1c, text="invert",
+                       variable=self.var_test_invert).pack(side="left")
+        self.btn_test = tk.Button(r1c, text="Test window",
+                                  command=self.on_test_image)
+        self.btn_test.pack(side="left", padx=(8, 2))
 
         # integration: what the LIGHT worker does with each frame
         lf_int = tk.LabelFrame(ctl, text="Integration (LIGHT mode)")
@@ -2027,18 +2214,19 @@ class App:
             x += 8 + 6 * len(label)
 
     def _show(self, canvas, img8, which, stars=None, stride=1, vectors=None,
-              cross=None):
+              cross=None, ghosts=None, cross2=None):
         """Draw onto the embedded canvas, and mirror to this view's
         dedicated image window when one is open."""
         self._render_image(canvas, img8, which, stars, stride, vectors,
-                           cross, main=True)
+                           cross, main=True, ghosts=ghosts, cross2=cross2)
         pop = self._img_popouts.get(which)
         if pop is not None and pop.winfo_exists():
             self._render_image(pop, img8, which, stars, stride, vectors,
-                               cross, main=False)
+                               cross, main=False, ghosts=ghosts,
+                               cross2=cross2)
 
     def _render_image(self, canvas, img8, which, stars, stride, vectors,
-                      cross, main):
+                      cross, main, ghosts=None, cross2=None):
         h, w = img8.shape
         cw = canvas.winfo_width()
         ch = canvas.winfo_height()
@@ -2061,6 +2249,32 @@ class App:
                 y = st["y"] / stride * s + oy
                 canvas.create_oval(x - 6, y - 6, x + 6, y + 6,
                                    outline="#00ff60")
+                # catalogue identity from the sky prior, when claimed
+                label = st.get("cat_name") or (
+                    f"m{st['cat_mag']}" if "cat_mag" in st else None)
+                if label:
+                    canvas.create_text(x, y + 14, text=label,
+                                       fill="#00c050",
+                                       font=("TkDefaultFont", 7))
+        if ghosts:
+            # sky-prior expectations: dim diamonds where catalogue stars
+            # SHOULD be (in frame, unclaimed) and edge markers for stars
+            # about to arrive if the frame keeps walking its way
+            iw = img8.shape[1] * stride
+            ih = img8.shape[0] * stride
+            for g in ghosts[:30]:
+                gx = min(max(g["x"], 0.0), iw - 1.0)
+                gy = min(max(g["y"], 0.0), ih - 1.0)
+                x = gx / stride * s + ox
+                y = gy / stride * s + oy
+                col = "#3a7a9a" if g.get("kind") == "pred" else "#9a7a3a"
+                canvas.create_line(x, y - 7, x + 7, y, fill=col)
+                canvas.create_line(x + 7, y, x, y + 7, fill=col)
+                canvas.create_line(x, y + 7, x - 7, y, fill=col)
+                canvas.create_line(x - 7, y, x, y - 7, fill=col)
+                tag = g.get("name") or f"m{g['mag']:.1f}"
+                canvas.create_text(x, y - 12, text=tag, fill=col,
+                                   font=("TkDefaultFont", 7))
         if vectors:
             for rx, ry, cx, cy in vectors[:50]:
                 canvas.create_line(rx / stride * s + ox, ry / stride * s + oy,
@@ -2078,6 +2292,18 @@ class App:
                 canvas.create_oval(x - 7, y - 7, x + 7, y + 7,
                                    outline="#ff50ff", width=2)
                 canvas.create_text(x, y - 20, text="pole", fill="#ff50ff",
+                                   font=("TkDefaultFont", 8, "bold"))
+        if cross2:
+            # calibrated RA-axis pixel: the steering target. Alignment
+            # is complete when this sits on the pole marker
+            x = cross2[0] / stride * s + ox
+            y = cross2[1] / stride * s + oy
+            if -20 <= x <= cw + 20 and -20 <= y <= ch + 20:
+                canvas.create_line(x - 10, y - 10, x + 10, y + 10,
+                                   fill="#ffa000", width=2)
+                canvas.create_line(x - 10, y + 10, x + 10, y - 10,
+                                   fill="#ffa000", width=2)
+                canvas.create_text(x, y + 18, text="axis", fill="#ffa000",
                                    font=("TkDefaultFont", 8, "bold"))
         # known-good solve region: record the transform so canvas clicks map
         # back to full-res pixels, and keep the box drawn across frame
@@ -2573,7 +2799,8 @@ class App:
         port = self.args.panel_port
         try:
             self.panel_server = PanelServer(
-                lambda: self.panel_level_value, port)
+                lambda: self.panel_level_value,
+                lambda: self.test_state_value, port)
         except OSError as e:
             self.log(f"could not start the panel server on port {port}: "
                      f"{e} (choose another with --panel-port)")
@@ -2586,10 +2813,122 @@ class App:
             self.log(f"flat panel serving at {u} -- open it in a browser "
                      "on the display device, tap for fullscreen, and "
                      "disable that device's auto-brightness")
+        self.log(f"test image page at {urls[0]}test -- same server, "
+                 "driven by the Test image row's pattern/level/scale")
         self.set_status(f"flat panel serving on port {port} — open "
                         f"{urls[0]} on the display device", fg="#80ff80")
         self.dbg.log("ui", action="panel_server", state="started",
                      port=port, urls=urls)
+
+    # ---------------- test image ----------------
+
+    def _apply_test_params(self, *a):
+        try:
+            kind = self.var_test_kind.get()
+            lvl = max(0, min(255, int(self.var_test_level.get())))
+            scl = max(4, min(256, int(self.var_test_scale.get())))
+            inv = bool(self.var_test_invert.get())
+        except (tk.TclError, ValueError):
+            return
+        cur = self.test_state_value
+        if (kind, lvl, scl, inv) == (cur["kind"], cur["level"],
+                                     cur["scale"], cur["invert"]):
+            return
+        # replace the dict whole (mirror FIRST, like the panel level): the
+        # HTTP thread reads this attribute, and the rev bump is what wakes
+        # a remote page's long-poll
+        self.test_state_value = {"rev": cur["rev"] + 1, "kind": kind,
+                                 "level": lvl, "scale": scl, "invert": inv}
+        self._redraw_test()
+
+    def on_test_image(self):
+        """Test image window: basic test patterns (line grid, checkerboard,
+        Siemens star) on any attached screen -- aim the camera at it to
+        check focus, geometry/distortion or scaling. The same patterns are
+        served at /test when the panel HTTP server is running."""
+        if self.test_win is not None and self.test_win.winfo_exists():
+            self._raise_popout(self.test_win)
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Test image — Up/Down level, F11 or double-click "
+                  "fullscreen, Esc closes")
+        win.geometry("640x480+200+140")
+        cv = tk.Canvas(win, highlightthickness=0, bg="#000000")
+        cv.pack(fill="both", expand=True)
+        self.test_win, self.test_canvas = win, cv
+
+        def bump(d):
+            try:
+                v = int(self.var_test_level.get())
+            except (tk.TclError, ValueError):
+                v = 200
+            self.var_test_level.set(max(0, min(255, v + d)))
+
+        def toggle_fs(_e=None):
+            win.attributes("-fullscreen",
+                           not win.attributes("-fullscreen"))
+
+        win.bind("<Up>", lambda e: bump(+5))
+        win.bind("<Down>", lambda e: bump(-5))
+        win.bind("<F11>", toggle_fs)
+        win.bind("<Double-Button-1>", toggle_fs)
+        win.bind("<Escape>", lambda e: win.destroy())
+        cv.bind("<Configure>", self._redraw_test)
+        self._raise_popout(win)
+        p = self.test_state_value
+        self.dbg.log("ui", action="test_image_open", kind=p["kind"],
+                     level=p["level"], scale=p["scale"], invert=p["invert"])
+        self.log("test image open -- grid / checker / siemens selectable "
+                 "in the Test image row; Up/Down adjusts level, "
+                 "F11/double-click toggles fullscreen")
+
+    def _redraw_test(self, *a):
+        """Coalesce redraw triggers (resize streams <Configure> events,
+        spinbox edits fire per keystroke) into one deferred draw."""
+        if self.test_win is None or not self.test_win.winfo_exists():
+            return
+        if self._test_redraw_job is not None:
+            self.root.after_cancel(self._test_redraw_job)
+        self._test_redraw_job = self.root.after(40, self._redraw_test_now)
+
+    def _redraw_test_now(self):
+        self._test_redraw_job = None
+        win, cv = self.test_win, self.test_canvas
+        if win is None or not win.winfo_exists():
+            return
+        p = self.test_state_value
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 2 or h < 2:
+            return
+        lv = p["level"]
+        bg = _grey(lv if p["invert"] else 0)
+        fg = _grey(0 if p["invert"] else lv)
+        cv.delete("all")
+        cv.configure(bg=bg)
+        s = p["scale"]
+        cx, cy = w / 2, h / 2
+        if p["kind"] == "grid":
+            for gx in range(int(cx) % s, w + 1, s):
+                cv.create_line(gx, 0, gx, h, fill=fg)
+            for gy in range(int(cy) % s, h + 1, s):
+                cv.create_line(0, gy, w, gy, fill=fg)
+            cv.create_line(cx - s, cy, cx + s, cy, fill=fg, width=3)
+            cv.create_line(cx, cy - s, cx, cy + s, fill=fg, width=3)
+        elif p["kind"] == "checker":
+            # Tk canvas bogs down past a few thousand items; grow the
+            # cell before fullscreen resolutions push the count there
+            se = max(s, int(math.sqrt(w * h / 8000)) + 1)
+            for ry, gy in enumerate(range(0, h, se)):
+                for gx in range((ry % 2) * se, w, 2 * se):
+                    cv.create_rectangle(gx, gy, gx + se, gy + se,
+                                        fill=fg, outline="")
+        elif p["kind"] == "siemens":
+            n = 36
+            r = min(w, h) / 2 - 8
+            box = (cx - r, cy - r, cx + r, cy + r)
+            for i in range(n):
+                cv.create_arc(*box, start=i * 360.0 / n,
+                              extent=180.0 / n, fill=fg, outline="")
 
     def _update_flat_label(self):
         if self.master_flat is None:
@@ -3502,6 +3841,12 @@ class App:
         # noise doesn't survive consecutive bursts, real stars do
         tracker = StarTracker()
         nsigma_cur = 5.0
+        # transient path: detections the sky prior can NOT explain feed a
+        # second, faster tracker (2-burst confirmation, wide gate for
+        # movers), and its confirmed tracks are classified against the
+        # prior's velocity field -- static artifact / sidereal uncatalogued
+        # / genuine transient -- and archived to transients.jsonl
+        transient_tracker = StarTracker(confirm=2, gate=30.0, miss_max=2)
         self.dbg.log("worker_start", kind="light", device=dev,
                      exposure_units=self.exp_value,
                      resolution=f"{w}x{h}", fourcc=self.fourcc,
@@ -3724,6 +4069,200 @@ class App:
                 elif n_raw > 3 * target and nsigma_cur < 8.0:
                     nsigma_cur = min(8.0, nsigma_cur + 0.5)
                 stars = tracker.update(cand, time.monotonic())
+                # sky-prior classification: label confirmed stars with
+                # their catalogue identity, flag the unexpected. The gate
+                # demands position AND (when a response is fitted) flux
+                # plausibility -- 3x the fit rms in dex. missed > 0 with
+                # matched == 0 usually means clouds or a stale anchor
+                prior = self.sky_prior
+                prior_stats = None
+                ghosts = None
+                if prior is not None and stars:
+                    try:
+                        now = time.time()
+                        pred = prior.predict(now, stack.shape)
+                        dex = (3.0 * prior.response["rms"]
+                               if prior.response else None)
+                        matched, unexpected, missed = sky.gate_stars(
+                            stars, pred, gate_px=8.0, max_dex=dex)
+                        reacq = False
+                        if (not matched and len(stars) >= 4
+                                and len(pred["x"]) >= 4):
+                            # lock lost -- typically an alt/az bolt move
+                            # while paused. Re-acquire with a wide
+                            # positional gate and no flux gate; the refit
+                            # below absorbs the move into the anchor
+                            matched, unexpected, missed = sky.gate_stars(
+                                stars, pred, gate_px=120.0, max_dex=None)
+                            reacq = bool(matched)
+                        # incremental tracking: fold the burst's matched
+                        # pairs back into the anchor. Slow flex and drift
+                        # are absorbed continuously; a refused fit (thin
+                        # or non-rigid) leaves the old anchor standing
+                        new_prior, fit = sky.refit_from_matches(
+                            prior, stars, pred, matched, now)
+                        if new_prior is not None:
+                            self.sky_prior = new_prior
+                            prior = new_prior
+                            self.dbg.log("wcs_fit", reacquired=reacq,
+                                         **fit)
+                            # significant displacements feed the bolt
+                            # auto-calibration (a slow-flex correction is
+                            # too small to attribute; a bolt turn isn't)
+                            if math.hypot(fit["dx"], fit["dy"]) >= 12.0:
+                                self.move_samples.append(
+                                    (fit["dx"], fit["dy"]))
+                            if reacq:
+                                self.q.put((
+                                    "log",
+                                    "sky prior re-acquired after a move: "
+                                    f"{fit['n']} stars, shift "
+                                    f"({fit['dx']:+.0f},{fit['dy']:+.0f})"
+                                    f"px, {fit['dtheta_deg']:+.3f} deg"))
+                        names = self.star_names or {}
+                        for di, pi, dist, derr in matched:
+                            stars[di]["cat_mag"] = round(
+                                float(pred["mag"][pi]), 2)
+                            stars[di]["cat_dist"] = round(dist, 2)
+                            if derr is not None:
+                                stars[di]["cat_dex"] = derr
+                            if names:
+                                nm = sky.nearest_name(
+                                    names, float(pred["ra"][pi]),
+                                    float(pred["dec"][pi]))
+                                if nm:
+                                    stars[di]["cat_name"] = nm
+                        # ghosts: where unclaimed catalogue stars should
+                        # be (missed, in frame) and what's just outside
+                        # the edge -- the about-to-arrive set
+                        ghosts = []
+                        for pi in missed[:20]:
+                            g = {"x": float(pred["x"][pi]),
+                                 "y": float(pred["y"][pi]),
+                                 "mag": float(pred["mag"][pi]),
+                                 "kind": "pred"}
+                            if names:
+                                nm = sky.nearest_name(
+                                    names, float(pred["ra"][pi]),
+                                    float(pred["dec"][pi]))
+                                if nm:
+                                    g["name"] = nm
+                            ghosts.append(g)
+                        arr = prior.predict(now, stack.shape,
+                                            margin=250.0)
+                        sh, sw = stack.shape
+                        n_arr = 0
+                        for k in range(len(arr["x"])):
+                            ax, ay = float(arr["x"][k]), float(arr["y"][k])
+                            if 0 <= ax < sw and 0 <= ay < sh:
+                                continue          # already in frame
+                            g = {"x": ax, "y": ay,
+                                 "mag": float(arr["mag"][k]),
+                                 "kind": "arrival"}
+                            if names:
+                                nm = sky.nearest_name(
+                                    names, float(arr["ra"][k]),
+                                    float(arr["dec"][k]))
+                                if nm:
+                                    g["name"] = nm
+                            ghosts.append(g)
+                            n_arr += 1
+                            if n_arr >= 10:
+                                break
+                        # generative residual: stack minus predicted
+                        # stars minus row background should be noise; a
+                        # structured excess is cloud/dew/flex/artifact
+                        # generative residual metric on a stride-2
+                        # subsample (full-res medians would cost ~0.5s a
+                        # burst at 4K for no extra insight): stack minus
+                        # predicted stars, per-row median removed (the
+                        # banding), should be pure noise -- hot_frac
+                        # rising is cloud, dew, flex, or an artifact the
+                        # calibration hasn't captured
+                        residual_stats = None
+                        if pred["flux"] is not None:
+                            fw = (float(np.median(
+                                [s["fwhm"] for s in stars]))
+                                if stars else 2.5)
+                            synth = sky.synthesize_stars(
+                                pred, stack.shape, fwhm_px=fw)
+                            resid = (stack - synth)[::2, ::2]
+                            rows = np.median(resid, axis=1)
+                            flat = resid - rows[:, None]
+                            rmed = float(np.median(flat))
+                            rmad = 1.4826 * float(np.median(
+                                np.abs(flat - rmed)))
+                            hot = float((np.abs(flat - rmed)
+                                         > 4.0 * max(rmad, 1e-6)).mean())
+                            residual_stats = {"mad": round(rmad, 3),
+                                              "hot_frac": round(hot, 5)}
+                        prior_stats = {"predicted": int(len(pred["x"])),
+                                       "matched": len(matched),
+                                       "unexpected": len(unexpected),
+                                       "missed": len(missed),
+                                       "reacquired": reacq,
+                                       "residual": residual_stats,
+                                       "refit": fit if new_prior else None}
+                        # transient path: whatever the catalogue cannot
+                        # claim goes to the second tracker; its confirmed
+                        # tracks get classified against the velocity field
+                        udets = [stars[j] for j in unexpected]
+                        t_conf = transient_tracker.update(
+                            udets, time.monotonic())
+                        for tr in t_conf:
+                            cls, v_sid = sky.classify_track(
+                                prior, now, tr["x"], tr["y"],
+                                tr["vx"], tr["vy"])
+                            # first confirmation + sparse heartbeat, so a
+                            # hot pixel doesn't write a line every burst
+                            # all night
+                            if tr["hits"] == 2 or tr["hits"] % 30 == 0:
+                                rec = {"t": datetime.now(
+                                           timezone.utc).isoformat(),
+                                       "class": cls,
+                                       "x": round(tr["x"], 1),
+                                       "y": round(tr["y"], 1),
+                                       "vx": tr["vx"], "vy": tr["vy"],
+                                       "speed_px_s": tr["speed"],
+                                       "sidereal_px_s": round(v_sid, 4),
+                                       "flux": round(tr["flux"], 1),
+                                       "fwhm": tr["fwhm"],
+                                       "hits": tr["hits"]}
+                                # sky coordinates + motion, so the
+                                # offline TLE matcher (match_tle.py) can
+                                # put names to visitors
+                                try:
+                                    wnow = prior.wcs_at(now)
+                                    ra1, de1 = wnow.pix_to_sky(
+                                        tr["x"], tr["y"])
+                                    ra2, de2 = wnow.pix_to_sky(
+                                        tr["x"] + tr["vx"],
+                                        tr["y"] + tr["vy"])
+                                    dra = ((float(ra2) - float(ra1)
+                                            + 180.0) % 360.0 - 180.0) \
+                                        * math.cos(math.radians(
+                                            float(de1)))
+                                    dde = float(de2) - float(de1)
+                                    rec["ra"] = round(float(ra1), 5)
+                                    rec["dec"] = round(float(de1), 5)
+                                    rec["speed_arcsec_s"] = round(
+                                        math.hypot(dra, dde) * 3600.0, 2)
+                                    rec["pa_deg"] = round(
+                                        math.degrees(math.atan2(
+                                            dra, dde)) % 360.0, 1)
+                                except Exception:
+                                    pass
+                                self._append_transient(rec)
+                                if cls == "transient":
+                                    self.q.put((
+                                        "log",
+                                        "TRANSIENT: "
+                                        f"({tr['x']:.0f},{tr['y']:.0f}) "
+                                        f"moving {tr['speed']:.2f}px/s "
+                                        f"(sidereal here {v_sid:.3f}), "
+                                        f"flux {tr['flux']:.0f}"))
+                    except Exception:
+                        self.dbg.exc("error", where="sky_prior_gate")
                 self.stars = stars
                 # corner-vs-centre background of the stack: pointed at an
                 # evenly lit field this is the live flat verification --
@@ -3751,6 +4290,7 @@ class App:
                     raw=frame_stats(last_raw), proc=frame_stats(last_proc),
                     stack=frame_stats(stack),
                     stars=len(stars), stars_raw=n_raw,
+                    prior=prior_stats,
                     nsigma=round(nsigma_cur, 2),
                     tracks=len(tracker.tracks),
                     star_target=target, bg=round(bg, 3),
@@ -3767,7 +4307,7 @@ class App:
                             hist_counts(last_raw, 0.0, 256.0),
                             hist_counts(stack, 0.0, 256.0),
                             frame_stats(last_proc)["mad_sigma"], f_ratio,
-                            n_raw, nsigma_cur))
+                            n_raw, nsigma_cur, ghosts))
         except Exception as e:
             self.dbg.exc("error", where="light_worker")
             self.q.put(("log", f"capture failed: {e}"))
@@ -3935,7 +4475,8 @@ class App:
                      f"(stack frozen at {self.stack_n} frames)")
         elif kind == "light_update":
             (_, raw8, stack, stars, n, maxn, fps, bg, sigma,
-             hraw, hstack, sig1, f_ratio, n_raw, nsig) = msg
+             hraw, hstack, sig1, f_ratio, n_raw, nsig, ghosts) = msg
+            self.last_sigma = sigma      # feeds the hop planner's mag limit
             self.set_status(f"INTEGRATING {n}/{maxn} @ {fps:.1f} fps — "
                             f"{len(stars)} stars")
             self._show(self.canvas_live, raw8, "live")
@@ -3943,7 +4484,8 @@ class App:
                                                self.canvas_h)
             stack8, st_lo, st_hi = stretch_to_u8(ssmall, return_bounds=True)
             self._show(self.canvas_stack, stack8, "stack",
-                       stars=stars, stride=stride, cross=self.pole_xy)
+                       stars=stars, stride=stride, cross=self.pole_xy,
+                       ghosts=ghosts, cross2=self.axis_xy)
             self._draw_hist([(hraw, "#7a8aa0", 0.0, 256.0, "raw"),
                              (hstack, "#00d050", 0.0, 256.0, "stack")])
             if not self.noise_hist or n > self.noise_hist[-1][0]:
@@ -4018,6 +4560,180 @@ class App:
                     self.log(f"pole at pixel ({px:.0f},{py:.0f})"
                              + ("" if inside else " (outside the frame; "
                                 "crosshair appears when it comes into view)"))
+                # arm/refresh the sky prior: with a WCS and the polar-cap
+                # catalogue, every catalogue star's position (and, with a
+                # fitted response, flux) is predictable from the clock --
+                # the burst pipeline then labels confirmed stars with
+                # their catalogue identity and flags the unexpected
+                if record.get("wcs_cards"):
+                    try:
+                        wcs = sky.TanWCS.from_cards(record["wcs_cards"])
+                        if self._solve_roi:
+                            # solved on a crop: shift CRPIX to full frame
+                            wcs = wcs.compose_rigid(
+                                0.0, self._solve_roi[0], self._solve_roi[1])
+                        cat = sky.load_catalog(self.args.data_dir, wcs.dec0)
+                        w, h = self.current_size()
+                        if cat is not None:
+                            resp = (sky.load_response(self.data_dir(), w, h)
+                                    if w else None)
+                            self.sky_prior = sky.SkyPrior(
+                                wcs, time.time(), cat, response=resp)
+                            n = len(self.sky_prior.predict(
+                                time.time(), (h, w))["x"]) if w else 0
+                            self.log(
+                                f"sky prior armed: {n} catalogue stars "
+                                f"predicted in frame"
+                                + ("" if resp else
+                                   " (no flux response fitted yet)"))
+                            self.dbg.log("sky_prior", armed=True,
+                                         predicted=n,
+                                         response=resp is not None)
+                        # RA-axis calibration: two armed solves either
+                        # side of a shaft rotation locate the axis pixel.
+                        # The previous WCS is first advanced to now, so
+                        # sidereal field rotation (about the POLE) can't
+                        # masquerade as shaft rotation (about the AXIS) --
+                        # an hour idle between solves would otherwise
+                        # "calibrate" the axis onto the pole pixel
+                        now_t = time.time()
+                        if w:
+                            if self.star_names is None:
+                                self.star_names = sky.load_star_names(
+                                    self.args.data_dir)
+                            if self.bolt_vectors is None:
+                                self.bolt_vectors = sky.load_bolts(
+                                    self.data_dir(), w, h)
+                            if self.bolt_vectors is None \
+                                    and len(self.move_samples) >= 6:
+                                bv = sky.cluster_move_axes(
+                                    list(self.move_samples))
+                                if bv is not None:
+                                    sky.save_bolts(bv[0], bv[1],
+                                                   len(self.move_samples),
+                                                   self.data_dir(), w, h)
+                                    self.bolt_vectors = bv
+                                    self.log(
+                                        "bolt axes auto-calibrated from "
+                                        f"{len(self.move_samples)} tracked "
+                                        f"moves: u=({bv[0][0]:+.2f},"
+                                        f"{bv[0][1]:+.2f}) v=({bv[1][0]:+.2f},"
+                                        f"{bv[1][1]:+.2f})")
+                            if self.axis_xy is None:
+                                ax = sky.load_axis(self.data_dir(), w, h)
+                                if ax:
+                                    self.axis_xy = ax["axis_xy"]
+                                    col = sky.collimation(
+                                        self.axis_xy, (h, w),
+                                        wcs.scale_arcsec_per_px())
+                                    self.log(
+                                        "RA-axis pixel loaded: "
+                                        f"({self.axis_xy[0]:.0f},"
+                                        f"{self.axis_xy[1]:.0f}) -- "
+                                        f"collimation {col['arcmin']:.1f}"
+                                        f"' toward {col['clock']} o'clock")
+                            prev = self._armed_prev
+                            if prev is not None and prev[2] == (h, w):
+                                ref = prev[1].advance_sidereal(
+                                    now_t - prev[0])
+                                axis, rot, r = sky.estimate_axis(
+                                    ref, wcs, (h, w))
+                                if axis is not None:
+                                    sky.save_axis(axis, rot, r,
+                                                  self.data_dir(), w, h)
+                                    self.axis_xy = list(axis)
+                                    self.log(
+                                        "RA-axis calibrated from "
+                                        f"{rot:+.0f} deg rotation: pixel "
+                                        f"({axis[0]:.0f},{axis[1]:.0f}), "
+                                        f"fit rms {r:.2f}px")
+                                    col = sky.collimation(
+                                        axis, (h, w),
+                                        wcs.scale_arcsec_per_px())
+                                    self.log(
+                                        "collimation: RA axis is "
+                                        f"{col['arcmin']:.1f} arcmin from "
+                                        f"sensor centre toward "
+                                        f"{col['clock']} o'clock "
+                                        "(frame-up = 12; fixed on the "
+                                        "scope body since the camera "
+                                        "rotates with the shaft)")
+                                    self.dbg.log("axis_calibrated",
+                                                 axis=list(axis),
+                                                 rot_deg=round(rot, 2),
+                                                 rms=round(r, 3),
+                                                 collimation=col)
+                                else:
+                                    self.dbg.log("axis_skip", reason=r,
+                                                 rot_deg=round(rot, 2))
+                            self._armed_prev = (now_t, wcs, (h, w))
+                            # the number that matters: axis -> pole
+                            # separation IS the polar alignment error
+                            if self.axis_xy and self.pole_xy:
+                                sep_px = math.hypot(
+                                    self.axis_xy[0] - self.pole_xy[0],
+                                    self.axis_xy[1] - self.pole_xy[1])
+                                arcmin = (sep_px
+                                          * wcs.scale_arcsec_per_px()
+                                          / 60.0)
+                                self.log("polar-axis error: "
+                                         f"{arcmin:.1f} arcmin "
+                                         f"({sep_px:.0f}px axis->pole)")
+                                self.dbg.log("polar_error",
+                                             arcmin=round(arcmin, 2),
+                                             px=round(sep_px, 1))
+                            # star-hop guidance when the pole is off
+                            # frame: a route of single-bolt legs, each
+                            # keeping enough detectable stars in frame
+                            # that tracking never has to leap blind.
+                            # Directions are frame-relative until bolt
+                            # vectors are calibrated
+                            pxy = self.pole_xy
+                            if (self.sky_prior is not None and pxy and w
+                                    and not (0 <= pxy[0] < w
+                                             and 0 <= pxy[1] < h)):
+                                if self.sky_prior.response is not None \
+                                        and self.last_sigma:
+                                    mlim = sky.mag_limit_from_noise(
+                                        self.sky_prior.response,
+                                        self.last_sigma)
+                                else:
+                                    mlim = 8.0   # conservative default
+                                bv = self.bolt_vectors
+                                plan = sky.plan_hops(
+                                    self.sky_prior, time.time(), (h, w),
+                                    mag_limit=mlim,
+                                    u_vec=bv[0] if bv else None,
+                                    v_vec=bv[1] if bv else None)
+                                self.dbg.log("hop_plan", **{
+                                    k: v for k, v in plan.items()
+                                    if k != "legs"},
+                                    n_legs=len(plan.get("legs", [])))
+                                if plan.get("reachable"):
+                                    self.log(
+                                        f"hop plan to the pole (limit "
+                                        f"mag {plan['mag_limit']}, "
+                                        f"{len(plan['legs'])} leg(s), "
+                                        f"blind {plan['blind_px']}px):")
+                                    for i, leg in enumerate(plan["legs"]):
+                                        a = leg["anchor"]
+                                        self.log(
+                                            f"  {i + 1}. {leg['bolt']} "
+                                            f"{'+' if leg['direction'] > 0 else '-'}"
+                                            f"{abs(leg['move_px'][0]) + abs(leg['move_px'][1]):.0f}px"
+                                            + (" BLIND" if leg["blind"]
+                                               else f", {leg['stars_at_end']}"
+                                               " stars")
+                                            + (f", anchor mag {a['mag']}"
+                                               f" -> ({a['x']:.0f},"
+                                               f"{a['y']:.0f})"
+                                               if a else ""))
+                                else:
+                                    self.log("hop plan: no route -- "
+                                             + plan.get("reason", "?"))
+                    except Exception as e:
+                        self.dbg.exc("error", where="sky_prior_arm")
+                        self.log(f"sky prior not armed: {e}")
             elif not ok:
                 self.lbl_solve.configure(
                     text="sky position: " + text.splitlines()[0],
@@ -4079,6 +4795,20 @@ class App:
                      frames=count)
         self.log(f"saved {fp}, {jp}")
 
+    def _append_transient(self, rec):
+        """Archive one transient-track observation to transients.jsonl in
+        the per-device data dir. Called from the light worker directly --
+        touches no Tk state, same rule as _deepdive_write. Everything the
+        sky model cannot explain ends up here with calibrated numbers:
+        a measurement, not a sighting."""
+        path = os.path.join(self.data_dir(), "transients.jsonl")
+        try:
+            os.makedirs(self.data_dir(), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        except OSError as e:
+            self.dbg.log("error", where="append_transient", err=str(e))
+
     def _append_solve_record(self, ok, text, info, record):
         """Always-on solve archive, independent of --debug: every solve
         ATTEMPT (success or failure) appended as one JSON line to
@@ -4127,8 +4857,9 @@ def main():
     ap.add_argument("--solver", default="solve-field",
                     help="path to astrometry.net's solve-field")
     ap.add_argument("--panel-port", type=int, default=8799,
-                    help="TCP port for the browser flat panel "
-                         "('Serve to browser'; default 8799)")
+                    help="TCP port for the browser flat panel and test "
+                         "image ('Serve to browser'; / is the flat panel, "
+                         "/test the test image; default 8799)")
     ap.add_argument("--debug", action="store_true",
                     help="write JSONL diagnostics suitable for LLM "
                          "consumption (one self-describing event per line; "
