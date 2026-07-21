@@ -353,6 +353,36 @@ coaxial to an equatorial's RA axis, that offset is the live polar-alignment
 number while adjusting the mount. (Fitting the mechanical rotation centre
 from solves at several RA-axis rotations is the planned refinement on top.)
 
+A second, independent use of the same solve is **pointing tracking** for a
+camera aimed anywhere — not just the polar cap `make_catalog.py` covers,
+e.g. a wide-angle finder riding along on the mount. One solve arms a
+catalogue-free WCS anchor; every burst after that is kept current purely by
+**matching this burst's stars against the previous burst's** (nearest pixel
+neighbour) and folding the fitted rigid transform (rotation + translation)
+back onto the anchor — the same trimmed-outlier rigid fit the catalogue path
+uses, just fed frame-to-frame star motion instead of catalogue predictions,
+so it needs no re-solve and no catalogue coverage to stay live. The current
+frame-centre RA/Dec is drawn on the stack view (a small crosshair + text)
+and, when the **Stellarium UDP** row is armed, streamed out as
+`MessageCurrentPosition` packets (Stellarium Telescope Protocol v1.0 —
+24-byte little-endian LENGTH/TYPE/TIME/RA/DEC/STATUS, verified against the
+canonical spec) so Stellarium's own sky chart can show a live reticle
+tracking wherever the camera is pointed. Stellarium's Telescope Control
+plugin only speaks TCP, so a small UDP→TCP relay sits between this tool and
+Stellarium — no Stellarium plugin or rebuild needed, stock Stellarium:
+
+```sh
+# Windows (ncat, from nmap)
+ncat -l -p 10001 --sh-exec "ncat --udp -l -p 5005"
+# Linux/macOS (socat)
+socat TCP-LISTEN:10001,fork UDP-RECVFROM:5005,fork
+```
+
+then in Stellarium: *Telescope Control* → configure a new telescope →
+"External software or a remote computer" → host `127.0.0.1`, port `10001`
+(the port Stellarium itself connects to; `--stellarium-port`/the UDP port
+row is where *this tool* sends, default 5005 — the relay bridges the two).
+
 ```sh
 python3 cam_observe.py --device /dev/video0 --data-dir ~/.local/share/PHD2
 ```

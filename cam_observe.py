@@ -119,6 +119,7 @@ import queue
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -628,43 +629,6 @@ class StarTracker:
         return conf
 
 
-def match_stars(ref_stars, cur_stars, max_dist=80.0):
-    """Greedy nearest-neighbour matching of current star detections to a
-    reference list. Returns [(rx, ry, cx, cy), ...] for matched pairs --
-    the motion vectors drawn while integration is paused."""
-    pairs = []
-    used = set()
-    for r in ref_stars:
-        best_j = None
-        best_d = max_dist
-        for j, c in enumerate(cur_stars):
-            if j in used:
-                continue
-            d = math.hypot(c["x"] - r["x"], c["y"] - r["y"])
-            if d < best_d:
-                best_d = d
-                best_j = j
-        if best_j is not None:
-            used.add(best_j)
-            c = cur_stars[best_j]
-            pairs.append((r["x"], r["y"], c["x"], c["y"]))
-    return pairs
-
-
-def motion_summary(pairs):
-    """Median displacement of matched star pairs: (dx, dy, magnitude,
-    direction in degrees with 0=right(+x), 90=up)."""
-    if not pairs:
-        return None
-    dxs = np.array([p[2] - p[0] for p in pairs])
-    dys = np.array([p[3] - p[1] for p in pairs])
-    mdx = float(np.median(dxs))
-    mdy = float(np.median(dys))
-    mag = math.hypot(mdx, mdy)
-    ang = math.degrees(math.atan2(-mdy, mdx)) % 360.0  # screen y is down
-    return mdx, mdy, mag, ang
-
-
 def hist_counts(img, lo, hi, bins=128):
     """Histogram counts for the display panel."""
     return np.histogram(img, bins=bins, range=(lo, hi))[0]
@@ -842,6 +806,20 @@ def pole_offset_text(ra, dec):
     if sep_deg < 1.0:
         return f"{sep_deg * 60.0:.1f} arcmin from {pole}"
     return f"{sep_deg:.3f} deg from {pole}"
+
+
+def radec_text(ra_deg, dec_deg):
+    """RA/Dec degrees -> 'RA HHhMMmSSs  Dec +DD*MM'' for the live
+    pointing readout -- the units astronomy conventionally reads in."""
+    h = (ra_deg % 360.0) / 15.0
+    hh = int(h)
+    mm = int((h - hh) * 60.0)
+    ss = int(round((((h - hh) * 60.0) - mm) * 60.0))
+    sign = "+" if dec_deg >= 0 else "-"
+    d = abs(dec_deg)
+    dd = int(d)
+    dm = int(round((d - dd) * 60.0))
+    return f"RA {hh:02d}h{mm:02d}m{ss:02d}s  Dec {sign}{dd:02d}°{dm:02d}'"
 
 
 # ----------------------------------------------------------------------------
@@ -1131,6 +1109,42 @@ class PanelServer:
         self.httpd.server_close()
 
 
+def encode_stellarium_packet(ra_deg, dec_deg, t=None):
+    """MessageCurrentPosition, Stellarium Telescope Protocol v1.0 (server
+    -> client position report; verified against the canonical spec,
+    Johannes Gajdosik 2006): 24 bytes, little-endian --
+    LENGTH(u16)=24, TYPE(u16)=0, TIME(i64 microseconds since epoch,
+    unused by Stellarium but sent for correctness), RA(u32, full circle
+    = 2**32), DEC(i32, +/-90deg = +/-0x40000000), STATUS(i32)=0."""
+    t_us = int((t if t is not None else time.time()) * 1_000_000)
+    ra = round(ra_deg / 360.0 * 2 ** 32) % 2 ** 32
+    dec = round(dec_deg / 90.0 * 0x40000000)
+    return struct.pack("<HHqIii", 24, 0, t_us, ra, dec, 0)
+
+
+class StellariumUDPSender:
+    """Fire-and-forget UDP position feed for Stellarium's Telescope
+    Control plugin. Stellarium itself only speaks TCP (its telescope
+    protocol is TCP-only) -- point a UDP->TCP relay (ncat/socat, see
+    README) at the port Stellarium connects to, and send these datagrams
+    at the relay's UDP side. No listening, no thread: one UDP socket, one
+    sendto() per update, called directly from the capture worker."""
+
+    def __init__(self, host, port):
+        self.addr = (host, port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def send(self, ra_deg, dec_deg):
+        try:
+            self.sock.sendto(encode_stellarium_packet(ra_deg, dec_deg),
+                             self.addr)
+        except OSError:
+            pass   # unreachable/no route -- never break the capture loop
+
+    def close(self):
+        self.sock.close()
+
+
 # ----------------------------------------------------------------------------
 # Debug / diagnostics (--debug): JSONL aimed at LLM consumption
 # ----------------------------------------------------------------------------
@@ -1385,6 +1399,16 @@ class App:
         self.move_samples = deque(maxlen=200)
         self.bolt_vectors = None     # (u_vec, v_vec) once known
         self.star_names = None       # name -> (ra, dec), loaded on arm
+
+        # pointing anchor: catalogue-free twin of sky_prior, for a camera
+        # aimed anywhere (not just where make_catalog.py has coverage --
+        # e.g. a wide-angle "which way is the mount pointing" camera).
+        # Kept current by frame-to-frame star motion, not catalogue
+        # predictions; see cam_skymodel.PointingAnchor/refit_pointing
+        self.pointing_anchor = None
+        self._pointing_prev_stars = None  # last burst's confirmed stars
+        self.pointing_radec = None        # (ra_deg, dec_deg), latest
+        self.stellarium_sender = None     # StellariumUDPSender, if enabled
 
         self._photo_live = None     # keep references or Tk drops the images
         self._photo_stack = None
@@ -1674,6 +1698,26 @@ class App:
         self.btn_test = tk.Button(r1c, text="Test window",
                                   command=self.on_test_image)
         self.btn_test.pack(side="left", padx=(8, 2))
+
+        # Stellarium: stream the catalogue-free pointing anchor's RA/Dec
+        # as UDP MessageCurrentPosition packets -- a UDP->TCP relay
+        # (ncat/socat, see README) feeds Stellarium's own Telescope
+        # Control plugin, so its sky chart shows a live reticle tracking
+        # wherever this camera is pointed. Needs one "Solve" first.
+        r1d = tk.Frame(lf_cal); r1d.pack(fill="x", pady=1)
+        tk.Label(r1d, text="Stellarium UDP:", width=17,
+                 anchor="w").pack(side="left")
+        tk.Label(r1d, text="host:").pack(side="left")
+        self.var_stel_host = tk.StringVar(value=self.args.stellarium_host)
+        tk.Entry(r1d, textvariable=self.var_stel_host,
+                width=12).pack(side="left")
+        tk.Label(r1d, text="port:").pack(side="left", padx=(6, 0))
+        self.var_stel_port = tk.IntVar(value=self.args.stellarium_port)
+        tk.Entry(r1d, textvariable=self.var_stel_port,
+                width=6).pack(side="left")
+        self.btn_stellarium = tk.Button(r1d, text="Send to Stellarium",
+                                        command=self.on_stellarium_toggle)
+        self.btn_stellarium.pack(side="left", padx=(8, 2))
 
         # integration: what the LIGHT worker does with each frame
         lf_int = tk.LabelFrame(ctl, text="Integration (LIGHT mode)")
@@ -2214,19 +2258,21 @@ class App:
             x += 8 + 6 * len(label)
 
     def _show(self, canvas, img8, which, stars=None, stride=1, vectors=None,
-              cross=None, ghosts=None, cross2=None):
+              cross=None, ghosts=None, cross2=None, pointing_radec=None):
         """Draw onto the embedded canvas, and mirror to this view's
         dedicated image window when one is open."""
         self._render_image(canvas, img8, which, stars, stride, vectors,
-                           cross, main=True, ghosts=ghosts, cross2=cross2)
+                           cross, main=True, ghosts=ghosts, cross2=cross2,
+                           pointing_radec=pointing_radec)
         pop = self._img_popouts.get(which)
         if pop is not None and pop.winfo_exists():
             self._render_image(pop, img8, which, stars, stride, vectors,
                                cross, main=False, ghosts=ghosts,
-                               cross2=cross2)
+                               cross2=cross2, pointing_radec=pointing_radec)
 
     def _render_image(self, canvas, img8, which, stars, stride, vectors,
-                      cross, main, ghosts=None, cross2=None):
+                      cross, main, ghosts=None, cross2=None,
+                      pointing_radec=None):
         h, w = img8.shape
         cw = canvas.winfo_width()
         ch = canvas.winfo_height()
@@ -2305,6 +2351,17 @@ class App:
                                    fill="#ffa000", width=2)
                 canvas.create_text(x, y + 18, text="axis", fill="#ffa000",
                                    font=("TkDefaultFont", 8, "bold"))
+        if pointing_radec:
+            # catalogue-free pointing anchor's frame-centre RA/Dec --
+            # always the canvas centre, since that's what it reports
+            cx, cy = cw / 2.0, ch / 2.0
+            canvas.create_line(cx - 10, cy, cx + 10, cy, fill="#40d0ff",
+                               width=1)
+            canvas.create_line(cx, cy - 10, cx, cy + 10, fill="#40d0ff",
+                               width=1)
+            canvas.create_text(cx, cy + 22, text=radec_text(*pointing_radec),
+                               fill="#40d0ff",
+                               font=("TkDefaultFont", 8, "bold"))
         # known-good solve region: record the transform so canvas clicks map
         # back to full-res pixels, and keep the box drawn across frame
         # redraws. Only the embedded canvas takes ROI drags; the popout
@@ -2819,6 +2876,37 @@ class App:
                         f"{urls[0]} on the display device", fg="#80ff80")
         self.dbg.log("ui", action="panel_server", state="started",
                      port=port, urls=urls)
+
+    def on_stellarium_toggle(self):
+        """Toggle the Stellarium UDP position feed on/off."""
+        if self.stellarium_sender is not None:
+            self.stellarium_sender.close()
+            self.stellarium_sender = None
+            self.btn_stellarium.configure(relief="raised",
+                                          text="Send to Stellarium")
+            self.log("Stellarium UDP feed stopped")
+            self.dbg.log("ui", action="stellarium_sender", state="stopped")
+            return
+        host = self.var_stel_host.get().strip() or self.args.stellarium_host
+        try:
+            port = int(self.var_stel_port.get())
+        except (tk.TclError, ValueError):
+            port = self.args.stellarium_port
+        try:
+            self.stellarium_sender = StellariumUDPSender(host, port)
+        except OSError as e:
+            self.log(f"could not start the Stellarium UDP feed to "
+                     f"{host}:{port}: {e}")
+            self.set_status("Stellarium feed failed to start", fg="#ff8060")
+            return
+        self.btn_stellarium.configure(relief="sunken",
+                                      text=f"Sending -> {host}:{port}")
+        self.log(f"Stellarium UDP feed sending to {host}:{port} -- relay "
+                 "it to Stellarium's Telescope Control (TCP) with "
+                 "ncat/socat (see README); needs one Solve to have a "
+                 "pointing anchor to send")
+        self.dbg.log("ui", action="stellarium_sender", state="started",
+                     host=host, port=port)
 
     # ---------------- test image ----------------
 
@@ -4012,8 +4100,8 @@ class App:
                     # the pre-pause stack positions, draw the vectors
                     cur, _, _ = extract_stars(last_proc, nsigma=4.5,
                                               max_stars=40)
-                    pairs = match_stars(pause_ref_stars or [], cur)
-                    summary = motion_summary(pairs)
+                    pairs = sky.match_stars(pause_ref_stars or [], cur)
+                    summary = sky.motion_summary(pairs)
                     self.dbg.log("pause", state="tracking",
                                  detected=len(cur), matched=len(pairs),
                                  motion=(dict(zip(
@@ -4069,6 +4157,28 @@ class App:
                 elif n_raw > 3 * target and nsigma_cur < 8.0:
                     nsigma_cur = min(8.0, nsigma_cur + 0.5)
                 stars = tracker.update(cand, time.monotonic())
+                # catalogue-free pointing anchor: independent of sky_prior
+                # below (which needs polar-cap catalogue coverage) --
+                # tracks frame-to-frame star motion so ANY camera's
+                # pointing stays known between solves. Feeds the live
+                # RA/Dec annotation and the Stellarium UDP feed.
+                if self.pointing_anchor is not None:
+                    now_p = time.time()
+                    if self._pointing_prev_stars:
+                        new_anchor, pinfo = sky.refit_pointing(
+                            self.pointing_anchor, self._pointing_prev_stars,
+                            stars, now_p)
+                        if new_anchor is not None:
+                            self.pointing_anchor = new_anchor
+                            self.dbg.log("pointing_fit", **pinfo)
+                    self._pointing_prev_stars = stars
+                    wcs_p = self.pointing_anchor.wcs_at(now_p)
+                    sh, sw = stack.shape
+                    ra_c, dec_c = wcs_p.pix_to_sky(sw / 2.0, sh / 2.0)
+                    self.pointing_radec = (float(ra_c), float(dec_c))
+                    sender = self.stellarium_sender
+                    if sender is not None:
+                        sender.send(*self.pointing_radec)
                 # sky-prior classification: label confirmed stars with
                 # their catalogue identity, flag the unexpected. The gate
                 # demands position AND (when a response is fitted) flux
@@ -4485,7 +4595,8 @@ class App:
             stack8, st_lo, st_hi = stretch_to_u8(ssmall, return_bounds=True)
             self._show(self.canvas_stack, stack8, "stack",
                        stars=stars, stride=stride, cross=self.pole_xy,
-                       ghosts=ghosts, cross2=self.axis_xy)
+                       ghosts=ghosts, cross2=self.axis_xy,
+                       pointing_radec=self.pointing_radec)
             self._draw_hist([(hraw, "#7a8aa0", 0.0, 256.0, "raw"),
                              (hstack, "#00d050", 0.0, 256.0, "stack")])
             if not self.noise_hist or n > self.noise_hist[-1][0]:
@@ -4572,6 +4683,12 @@ class App:
                             # solved on a crop: shift CRPIX to full frame
                             wcs = wcs.compose_rigid(
                                 0.0, self._solve_roi[0], self._solve_roi[1])
+                        # pointing anchor: armed unconditionally, unlike
+                        # sky_prior below -- it needs no catalogue
+                        # coverage, so it works wherever this solve was
+                        self.pointing_anchor = sky.PointingAnchor(
+                            wcs, time.time())
+                        self._pointing_prev_stars = None
                         cat = sky.load_catalog(self.args.data_dir, wcs.dec0)
                         w, h = self.current_size()
                         if cat is not None:
@@ -4860,6 +4977,15 @@ def main():
                     help="TCP port for the browser flat panel and test "
                          "image ('Serve to browser'; / is the flat panel, "
                          "/test the test image; default 8799)")
+    ap.add_argument("--stellarium-host", default="127.0.0.1",
+                    help="destination host for the Stellarium UDP "
+                         "position feed -- typically a local UDP->TCP "
+                         "relay (ncat/socat) in front of Stellarium's "
+                         "Telescope Control plugin (default 127.0.0.1)")
+    ap.add_argument("--stellarium-port", type=int, default=5005,
+                    help="destination UDP port for the Stellarium "
+                         "position feed (default 5005; not Stellarium's "
+                         "own TCP port -- see README for the relay step)")
     ap.add_argument("--debug", action="store_true",
                     help="write JSONL diagnostics suitable for LLM "
                          "consumption (one self-describing event per line; "

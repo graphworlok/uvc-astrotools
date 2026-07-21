@@ -522,6 +522,43 @@ class SkyPrior:
                 "ra": ra_k, "dec": dec_k}
 
 
+def _trimmed_rigid_fit(P, D, weights, min_pairs=4, max_rms=3.0):
+    """Shared core of refit_from_matches / refit_pointing: fit_rigid with
+    iterative outlier rejection. A wide-gate re-acquisition (or a greedy
+    frame-to-frame nearest-neighbour match) inevitably mismatches some
+    pairs, and one bad pair drags a least-squares rigid fit arbitrarily
+    far. Fit, drop pairs whose residual exceeds 3x the median residual,
+    refit -- up to twice. The consensus (the real move) survives; the
+    mismatches don't. Returns (dtheta_deg, dx, dy, rms, pivot, keep_mask)
+    or None if it never converges under max_rms (or trims below
+    min_pairs)."""
+    keep = np.ones(len(P), dtype=bool)
+    dth = dx = dy = rms = pivot = None
+    for _ in range(3):
+        if keep.sum() < min_pairs:
+            return None
+        dth, dx, dy, rms, pivot = fit_rigid(P[keep], D[keep],
+                                            weights=(weights[keep]
+                                                    if weights is not None
+                                                    else None))
+        if rms <= max_rms:
+            break
+        th = math.radians(dth)
+        R = np.array([[math.cos(th), -math.sin(th)],
+                      [math.sin(th), math.cos(th)]])
+        pv = np.asarray(pivot)
+        res = np.hypot(*(((P - pv) @ R.T + pv
+                          + np.array([dx, dy])) - D).T)
+        cut = max(3.0 * float(np.median(res[keep])), 2.0)
+        new_keep = keep & (res <= cut)
+        if new_keep.sum() == keep.sum():
+            break                      # nothing left to trim; verdict below
+        keep = new_keep
+    if rms > max_rms:
+        return None
+    return dth, dx, dy, rms, pivot, keep
+
+
 def refit_from_matches(prior, dets, pred, matched, t,
                        min_pairs=4, max_rms=3.0):
     """Phase-4 core: turn a burst's matched (prediction, detection) pairs
@@ -538,36 +575,10 @@ def refit_from_matches(prior, dets, pred, matched, t,
     D = np.array([[dets[di]["x"], dets[di]["y"]] for di, _, _, _ in matched])
     wts = np.sqrt(np.array([max(dets[di].get("flux", 1.0), 1e-3)
                             for di, _, _, _ in matched]))
-    # trimmed fit: a wide-gate re-acquisition inevitably mismatches some
-    # pairs (nearest-neighbour in a dense field), and one bad pair drags
-    # a least-squares rigid fit arbitrarily far. Fit, drop pairs whose
-    # residual exceeds 3x the median residual, refit -- up to twice. The
-    # consensus (the real move) survives; the mismatches don't.
-    keep = np.ones(len(P), dtype=bool)
-    dth = dx = dy = rms = pivot = None
-    n_dropped = 0
-    for _ in range(3):
-        if keep.sum() < min_pairs:
-            return None, (f"only {int(keep.sum())} consistent pair(s) "
-                          f"after trimming {n_dropped}")
-        dth, dx, dy, rms, pivot = fit_rigid(P[keep], D[keep],
-                                            weights=wts[keep])
-        if rms <= max_rms:
-            break
-        th = math.radians(dth)
-        R = np.array([[math.cos(th), -math.sin(th)],
-                      [math.sin(th), math.cos(th)]])
-        pv = np.asarray(pivot)
-        res = np.hypot(*(((P - pv) @ R.T + pv
-                          + np.array([dx, dy])) - D).T)
-        cut = max(3.0 * float(np.median(res[keep])), 2.0)
-        new_keep = keep & (res <= cut)
-        if new_keep.sum() == keep.sum():
-            break                      # nothing left to trim; verdict below
-        n_dropped += int(keep.sum() - new_keep.sum())
-        keep = new_keep
-    if rms > max_rms:
-        return None, f"fit rms {rms:.2f}px exceeds {max_rms}px"
+    fit = _trimmed_rigid_fit(P, D, wts, min_pairs, max_rms)
+    if fit is None:
+        return None, f"fit rms exceeds {max_rms}px after trimming"
+    dth, dx, dy, rms, pivot, keep = fit
     matched = [m for m, k in zip(matched, keep) if k]
     wcs_now = prior.wcs_at(t).compose_rigid(dth, dx, dy, pivot=pivot)
     new = SkyPrior(wcs_now, t, (prior.cat_ra, prior.cat_dec,
@@ -576,6 +587,86 @@ def refit_from_matches(prior, dets, pred, matched, t,
             "dx": round(dx, 3), "dy": round(dy, 3),
             "rms": round(rms, 3)}
     return new, info
+
+
+def match_stars(ref_stars, cur_stars, max_dist=80.0):
+    """Greedy nearest-neighbour matching of current star detections to a
+    reference list (dicts just need x/y). Returns [(rx, ry, cx, cy), ...]
+    for matched pairs -- no catalogue, no WCS: pure frame-to-frame pixel
+    correspondence, used both for the paused-mode drift overlay and for
+    refit_pointing's catalogue-free tracking."""
+    pairs = []
+    used = set()
+    for r in ref_stars:
+        best_j = None
+        best_d = max_dist
+        for j, c in enumerate(cur_stars):
+            if j in used:
+                continue
+            d = math.hypot(c["x"] - r["x"], c["y"] - r["y"])
+            if d < best_d:
+                best_d = d
+                best_j = j
+        if best_j is not None:
+            used.add(best_j)
+            c = cur_stars[best_j]
+            pairs.append((r["x"], r["y"], c["x"], c["y"]))
+    return pairs
+
+
+def motion_summary(pairs):
+    """Median displacement of matched star pairs: (dx, dy, magnitude,
+    direction in degrees with 0=right(+x), 90=up)."""
+    if not pairs:
+        return None
+    dxs = np.array([p[2] - p[0] for p in pairs])
+    dys = np.array([p[3] - p[1] for p in pairs])
+    mdx = float(np.median(dxs))
+    mdy = float(np.median(dys))
+    mag = math.hypot(mdx, mdy)
+    ang = math.degrees(math.atan2(-mdy, mdx)) % 360.0  # screen y is down
+    return mdx, mdy, mag, ang
+
+
+class PointingAnchor:
+    """A WCS anchor for a camera with no catalogue coverage (make_catalog.py
+    only covers the polar caps) -- kept current by folding frame-to-frame
+    star correspondence into a rigid refit each burst instead of catalogue
+    predictions, via refit_pointing() below. Same wcs_at()/sidereal-advance
+    contract as SkyPrior.wcs_at, minus the catalogue."""
+
+    def __init__(self, wcs, t0):
+        self.wcs0 = wcs
+        self.t0 = float(t0)
+
+    def wcs_at(self, t):
+        return self.wcs0.advance_sidereal(t - self.t0)
+
+
+def refit_pointing(anchor, ref_stars, cur_stars, t, max_dist=80.0,
+                   min_pairs=4, max_rms=3.0):
+    """Catalogue-free anchor refit: match this burst's confirmed stars
+    against the previous burst's by nearest pixel neighbour (match_stars)
+    instead of catalogue predictions, fit_rigid the pairs (with the same
+    trimmed outlier rejection refit_from_matches uses), and compose the
+    result onto the anchor advanced to t. Works anywhere in the sky --
+    the whole point, for a camera pointed off the polar-cap catalogue.
+    Returns (new_anchor, fit_info) or (None, reason), same contract as
+    refit_from_matches."""
+    pairs = match_stars(ref_stars, cur_stars, max_dist=max_dist)
+    if len(pairs) < min_pairs:
+        return None, f"only {len(pairs)} matched pair(s)"
+    P = np.array([[rx, ry] for rx, ry, cx, cy in pairs])
+    D = np.array([[cx, cy] for rx, ry, cx, cy in pairs])
+    fit = _trimmed_rigid_fit(P, D, None, min_pairs, max_rms)
+    if fit is None:
+        return None, f"fit rms exceeds {max_rms}px after trimming"
+    dth, dx, dy, rms, pivot, keep = fit
+    wcs_now = anchor.wcs_at(t).compose_rigid(dth, dx, dy, pivot=pivot)
+    new_anchor = PointingAnchor(wcs_now, t)
+    info = {"n": int(keep.sum()), "dtheta_deg": round(dth, 5),
+            "dx": round(dx, 3), "dy": round(dy, 3), "rms": round(rms, 3)}
+    return new_anchor, info
 
 
 def gate_stars(dets, pred, gate_px=8.0, max_dex=None):
