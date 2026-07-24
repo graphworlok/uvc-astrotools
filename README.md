@@ -1,11 +1,15 @@
-# CamTools — UVC / V4L2 sensor characterisation
+# uvc-astrotools — UVC/V4L2 camera characterisation + astronomy observing suite
 
-Low-level characterisation of UVC webcam-class camera modules over V4L2, aimed
-at working out what a given sensor + ISP-bridge + firmware combination *actually*
-does versus what its controls claim — exposure fidelity, dark noise, fixed-pattern
-and shading structure, hot pixels, and auto-exposure behaviour. Built for
-evaluating modules for astrophotography / autoguiding use, where the firmware's
-nominal exposure range is usually not the same as its usable one.
+Two halves built on one stack. First, low-level characterisation of UVC
+webcam-class camera modules over V4L2, aimed at working out what a given
+sensor + ISP-bridge + firmware combination *actually* does versus what its
+controls claim — exposure fidelity, dark noise, fixed-pattern and shading
+structure, hot pixels, and auto-exposure behaviour. Second, a live
+observing/plate-solving suite built on top of that characterisation: stacking,
+star extraction, astrometry.net solving, polar alignment, catalogue-free
+pointing tracking, and a Stellarium feed. Built for evaluating and then using
+modules for astrophotography / autoguiding, where the firmware's nominal
+exposure range is usually not the same as its usable one.
 
 Three tools:
 
