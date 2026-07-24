@@ -1076,6 +1076,75 @@ def load_bolts(data_dir, w, h):
         return None
 
 
+def bolt_correction(axis_xy, target_xy, arcsec_per_px, u_vec=None,
+                    v_vec=None):
+    """Decompose the axis-pixel -> target-pixel correction vector onto the
+    two mount adjustment bolts (u_vec/v_vec, empirically calibrated by
+    cluster_move_axes) -- the immediate version of plan_hops: no route,
+    no star count, just "turn THIS bolt THIS much, then THIS one," for
+    when the axis is already close enough that both bolts' fields of
+    view overlap it. Falls back to the frame's own x/y axes (labelled
+    accordingly) before the bolts are calibrated, same convention
+    plan_hops uses for its legs.
+
+    The +/- sign is only meaningful relative to whichever physical turn
+    direction cluster_move_axes happened to fold to "positive" for that
+    bolt -- pixel motion alone can't say which way is clockwise, so this
+    is exactly as directionally honest as the star-hop legs already are:
+    turn a little, and if the number grows, reverse.
+
+    Returns {"az": leg, "alt": leg, "calibrated": bool}, each leg a dict
+    of {"px", "arcmin", "label"}."""
+    d = np.array([target_xy[0] - axis_xy[0], target_xy[1] - axis_xy[1]],
+                dtype=np.float64)
+    calibrated = u_vec is not None and v_vec is not None
+    U = (np.asarray(u_vec, dtype=np.float64) if calibrated
+        else np.array([1.0, 0.0]))
+    V = (np.asarray(v_vec, dtype=np.float64) if calibrated
+        else np.array([0.0, 1.0]))
+    U = U / np.linalg.norm(U)
+    V = V / np.linalg.norm(V)
+    coeffs = np.linalg.solve(np.column_stack([U, V]), d)
+    scale = arcsec_per_px / 60.0
+
+    def leg(px, label):
+        return {"px": round(float(px), 1),
+                "arcmin": round(float(px) * scale, 2),
+                "label": label}
+
+    return {"az": leg(coeffs[0], "az" if calibrated else "frame-x"),
+            "alt": leg(coeffs[1], "alt" if calibrated else "frame-y"),
+            "calibrated": calibrated}
+
+
+# ----------------------------------------------------------------------------
+# Atmospheric refraction
+# ----------------------------------------------------------------------------
+
+def refraction_arcmin(true_alt_deg, pressure_hpa=1010.0, temp_c=10.0):
+    """Atmospheric refraction, in arcminutes, at a given TRUE (airless)
+    altitude: light bends toward the zenith as it enters the atmosphere,
+    so an object appears HIGHER than it truly is by this amount --
+    apparent_altitude = true_altitude + refraction_arcmin(true_altitude).
+    Saemundsson's formula (1986) -- the true-altitude form, as opposed to
+    Bennett's apparent-altitude form used for the reverse correction --
+    accurate to about 0.1' from the horizon to the zenith for the
+    standard atmosphere (1010 hPa, 10 deg C); pressure/temperature scale
+    the result the usual first-order way (refraction ~ pressure,
+    ~ 1/absolute-temperature). Zero at the zenith, ~29' at the horizon
+    (true horizon -- this is NOT the ~34' figure quoted for the horizon
+    in Bennett's apparent-altitude form; the two formulas take different
+    inputs and are only approximate inverses of each other, a known
+    property of both, not a bug here). Clamped to >= 0: right at the
+    zenith the formula's own +10.3/(h+5.11) offset pushes its tan()
+    argument a hair past 90 deg, which would otherwise flip the sign for
+    a fraction of an arcsecond -- physically refraction never reverses,
+    so 0 is the right floor, not a real negative reading."""
+    alt = max(0.0, min(90.0, true_alt_deg))
+    r = 1.02 / math.tan(math.radians(alt + 10.3 / (alt + 5.11)))
+    return max(0.0, r * (pressure_hpa / 1010.0) * (283.0 / (273.0 + temp_c)))
+
+
 # ----------------------------------------------------------------------------
 # Star-hop route planning (Phase 6): no leaps of faith
 # ----------------------------------------------------------------------------

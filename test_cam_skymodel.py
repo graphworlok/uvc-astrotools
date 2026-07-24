@@ -718,6 +718,76 @@ class TestNamesAndBolts(unittest.TestCase):
         self.assertAlmostEqual(float(p["dec"][0]), -84.33)
 
 
+class TestBoltCorrection(unittest.TestCase):
+    def test_orthogonal_axes_uncalibrated(self):
+        # no bolt vectors -> frame x/y, 1"/px -> 1'/px at 60"/px scale
+        corr = sm.bolt_correction((100.0, 100.0), (150.0, 130.0), 60.0)
+        self.assertFalse(corr["calibrated"])
+        self.assertEqual(corr["az"]["label"], "frame-x")
+        self.assertEqual(corr["alt"]["label"], "frame-y")
+        self.assertAlmostEqual(corr["az"]["arcmin"], 50.0)
+        self.assertAlmostEqual(corr["alt"]["arcmin"], 30.0)
+
+    def test_calibrated_orthogonal_axes(self):
+        corr = sm.bolt_correction((0.0, 0.0), (50.0, 30.0), 60.0,
+                                  u_vec=(1.0, 0.0), v_vec=(0.0, 1.0))
+        self.assertTrue(corr["calibrated"])
+        self.assertEqual(corr["az"]["label"], "az")
+        self.assertEqual(corr["alt"]["label"], "alt")
+        self.assertAlmostEqual(corr["az"]["arcmin"], 50.0)
+        self.assertAlmostEqual(corr["alt"]["arcmin"], 30.0)
+
+    def test_nonorthogonal_bolts_round_trip(self):
+        # bolts at 90 deg apart in name only -- a real mount's rarely
+        # exactly orthogonal. The decomposition must still reconstruct
+        # the original correction vector exactly (that's what a linear
+        # solve over a non-orthogonal basis guarantees).
+        u = (1.0, 0.0)
+        v = (0.6, 0.8)          # ~53 deg from u, not 90
+        axis = (200.0, 400.0)
+        target = (235.0, 370.0)
+        corr = sm.bolt_correction(axis, target, 3.0, u_vec=u, v_vec=v)
+        rebuilt_x = (corr["az"]["px"] * u[0] + corr["alt"]["px"] * v[0])
+        rebuilt_y = (corr["az"]["px"] * u[1] + corr["alt"]["px"] * v[1])
+        self.assertAlmostEqual(rebuilt_x, target[0] - axis[0], places=1)
+        self.assertAlmostEqual(rebuilt_y, target[1] - axis[1], places=1)
+
+    def test_zero_offset_is_zero_correction(self):
+        corr = sm.bolt_correction((10.0, 10.0), (10.0, 10.0), 5.0)
+        self.assertAlmostEqual(corr["az"]["arcmin"], 0.0)
+        self.assertAlmostEqual(corr["alt"]["arcmin"], 0.0)
+
+
+class TestRefraction(unittest.TestCase):
+    def test_zero_at_zenith(self):
+        self.assertAlmostEqual(sm.refraction_arcmin(90.0), 0.0, delta=0.01)
+
+    def test_never_negative(self):
+        for alt in (90.0, 89.99, 85.0):
+            self.assertGreaterEqual(sm.refraction_arcmin(alt), 0.0)
+
+    def test_about_29_arcmin_at_horizon(self):
+        self.assertAlmostEqual(sm.refraction_arcmin(0.0), 29.0, delta=1.0)
+
+    def test_monotonically_decreasing_with_altitude(self):
+        alts = (0.0, 10.0, 30.0, 45.0, 60.0, 80.0, 90.0)
+        vals = [sm.refraction_arcmin(a) for a in alts]
+        self.assertEqual(vals, sorted(vals, reverse=True))
+
+    def test_pressure_scales_linearly(self):
+        full = sm.refraction_arcmin(30.0, pressure_hpa=1010.0)
+        half = sm.refraction_arcmin(30.0, pressure_hpa=505.0)
+        self.assertAlmostEqual(half, full / 2.0, delta=0.01)
+
+    def test_clamps_out_of_range_altitude(self):
+        # a caller passing a bogus true altitude (e.g. below the
+        # horizon) gets the horizon value, not a domain error
+        self.assertAlmostEqual(sm.refraction_arcmin(-5.0),
+                               sm.refraction_arcmin(0.0))
+        self.assertAlmostEqual(sm.refraction_arcmin(95.0),
+                               sm.refraction_arcmin(90.0))
+
+
 class TestCatalogLoader(unittest.TestCase):
     def test_load_by_hemisphere_and_missing(self):
         with tempfile.TemporaryDirectory() as d:

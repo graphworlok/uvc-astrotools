@@ -808,6 +808,16 @@ def pole_offset_text(ra, dec):
     return f"{sep_deg:.3f} deg from {pole}"
 
 
+def bolt_correction_text(corr):
+    """sky.bolt_correction()'s dict -> 'turn AZ +3.2\'  ALT -1.1\'' for
+    the live status line -- the immediate instruction, not a distance to
+    interpret."""
+    def fmt(leg):
+        sign = "+" if leg["arcmin"] >= 0 else "-"
+        return f"{leg['label'].upper()} {sign}{abs(leg['arcmin']):.1f}'"
+    return f"turn {fmt(corr['az'])}  {fmt(corr['alt'])}"
+
+
 def radec_text(ra_deg, dec_deg):
     """RA/Dec degrees -> 'RA HHhMMmSSs  Dec +DD*MM'' for the live
     pointing readout -- the units astronomy conventionally reads in."""
@@ -1851,6 +1861,19 @@ class App:
         self.btn_axis_clear = tk.Button(r4b, text="Clear axis calibration",
                                         command=self.on_clear_axis)
         self.btn_axis_clear.pack(side="right", padx=4)
+
+        # immediate az/alt bolt correction: axis -> pole decomposed onto
+        # the two mount adjustment bolts (sky.bolt_correction) -- the
+        # actionable form of the RA-axis number above, no star-hop
+        # routing needed once the axis is already roughly on target.
+        # Frame-relative (labelled X/Y) until a bolt is turned enough
+        # times for cluster_move_axes to auto-calibrate which pixel
+        # direction is which bolt.
+        r4c = tk.Frame(lf_solve); r4c.pack(fill="x", pady=(0, 2))
+        self.lbl_bolts = tk.Label(
+            r4c, text="Adjust: no axis fit yet",
+            font=("TkDefaultFont", 10, "bold"), fg="#c08000", anchor="w")
+        self.lbl_bolts.pack(side="left", fill="x")
 
         # log
         self.txt = tk.Text(self.root, height=7, state="disabled",
@@ -3513,6 +3536,8 @@ class App:
         self.lbl_axis.configure(
             text="RA axis: cleared -- solve, rotate the mount >=15° in "
                  "RA, solve again", fg="#c08000")
+        self.lbl_bolts.configure(text="Adjust: no axis fit yet",
+                                 fg="#c08000")
         self._draw_bullseye()
         self.log("RA-axis calibration cleared; the next two solves "
                  "spanning a rotation will re-derive it")
@@ -4888,6 +4913,22 @@ class App:
                                 self.dbg.log("polar_error",
                                              arcmin=round(arcmin, 2),
                                              px=round(sep_px, 1))
+                                # immediate az/alt correction: the same
+                                # axis->pole vector, decomposed onto the
+                                # two mount bolts -- no routing, just
+                                # "turn this much" (sky.bolt_correction)
+                                bv = self.bolt_vectors
+                                corr = sky.bolt_correction(
+                                    self.axis_xy, self.pole_xy,
+                                    wcs.scale_arcsec_per_px(),
+                                    u_vec=bv[0] if bv else None,
+                                    v_vec=bv[1] if bv else None)
+                                self.lbl_bolts.configure(
+                                    text="Adjust: "
+                                         + bolt_correction_text(corr),
+                                    fg=("#00c060" if corr["calibrated"]
+                                        else "#c08000"))
+                                self.dbg.log("bolt_correction", **corr)
                             if self.axis_xy:
                                 axis_ra, axis_dec = wcs.pix_to_sky(
                                     self.axis_xy[0], self.axis_xy[1])
@@ -4902,13 +4943,29 @@ class App:
                                     "sep_arcmin":
                                         (90.0 - abs(axis_dec)) * 60.0})
                                 del self.axis_history[:-50]
+                                refr_txt = ""
+                                if self.args.latitude is not None:
+                                    # the pole sits at true altitude =
+                                    # |latitude| always (no LST/longitude
+                                    # needed): informational only, NOT
+                                    # subtracted from the number above --
+                                    # a plate solve fit near the axis
+                                    # already absorbs the locally-uniform
+                                    # part of refraction into its WCS, so
+                                    # this is the theoretical floor to be
+                                    # aware of, not a correction to apply
+                                    # on top (see sky.refraction_arcmin)
+                                    refr = sky.refraction_arcmin(
+                                        abs(self.args.latitude))
+                                    refr_txt = f"  ·  refraction ~{refr:.1f}'"
                                 self.lbl_axis.configure(
                                     text="RA axis: "
                                          + pole_offset_text(axis_ra,
                                                             axis_dec)
                                          + "  ·  collimation "
                                            f"{col['arcmin']:.1f}' @ "
-                                           f"{col['clock']} o'clock",
+                                           f"{col['clock']} o'clock"
+                                         + refr_txt,
                                     fg="#00c060")
                                 self._draw_bullseye()
                                 self.dbg.log(
@@ -5102,6 +5159,13 @@ def main():
                     help="destination UDP port for the Stellarium "
                          "position feed (default 5005; not Stellarium's "
                          "own TCP port -- see README for the relay step)")
+    ap.add_argument("--latitude", type=float, default=None,
+                    help="observing site latitude in degrees (+N/-S) -- "
+                         "the celestial pole sits at exactly this true "
+                         "altitude, always, so this alone (no longitude "
+                         "or clock time needed) is enough to show the "
+                         "atmospheric refraction near the pole alongside "
+                         "the RA-axis readout. Omit to leave it off.")
     ap.add_argument("--debug", action="store_true",
                     help="write JSONL diagnostics suitable for LLM "
                          "consumption (one self-describing event per line; "

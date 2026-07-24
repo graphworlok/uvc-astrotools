@@ -381,6 +381,33 @@ the workbench, unrelated to alignment quality. Re-arms automatically after
 gets remounted or the OTA shifts in its rings, since the fixed pixel is
 only true for one specific physical mounting.
 
+Once the axis pixel is known, the **Adjust:** status line (right below
+RA axis:) turns that distance into the actual instruction: `sky.bolt_correction`
+decomposes the axis→pole pixel vector onto the mount's two adjustment bolts
+(learned automatically from tracked moves — `sky.cluster_move_axes` clusters
+significant refit displacements into two directions once enough of each have
+been seen, `az` first / `alt` second) and reports each bolt's turn as signed
+arcminutes, e.g. `turn AZ +3.2'  ALT -1.1'`. No star-hop routing, no distance
+to interpret — turn each bolt by that amount and re-check. Before the bolts
+are auto-calibrated it falls back to the frame's own x/y axes (labelled
+`frame-x`/`frame-y`), and even once calibrated the `+`/`-` sign only tracks
+whichever physical turn direction the learned cluster happened to call
+positive — there's no way to know that's clockwise from pixel motion alone,
+so treat it exactly like the star-hop legs already ask: turn a little, and if
+the number grows, reverse.
+
+Optionally, passing `--latitude <deg>` adds an **atmospheric refraction**
+figure to the RA-axis line (`refraction ~R'`): the celestial pole sits at
+true altitude = |latitude| always, so no longitude or clock time is needed
+to compute the standard bending at that altitude (`sky.refraction_arcmin`,
+Saemundsson's formula). This is informational, not subtracted from the
+polar-axis number above — a plate solve fit near the axis pixel already
+absorbs the locally-uniform part of atmospheric refraction into its WCS fit
+(it's solving directly against catalogue truth, not a physical altitude
+reading), so this figure exists to show the theoretical floor / a sanity
+check, particularly useful at low latitudes where the pole sits close to the
+horizon and refraction climbs into multiple arcminutes.
+
 A second, independent use of the same solve is **pointing tracking** for a
 camera aimed anywhere — not just the polar cap `make_catalog.py` covers,
 e.g. a wide-angle finder riding along on the mount. One solve arms a
