@@ -1423,6 +1423,11 @@ class App:
 
         # visualisation state
         self.solve_history = []   # [{t, ra, dec, sep_arcmin}, ...]
+        self.axis_history = []    # [{t, ra, dec, sep_arcmin}, ...] -- the
+                                   # RA-axis pixel's sky position at each
+                                   # solve (once sky.estimate_axis has fixed
+                                   # it); THIS is the number polar alignment
+                                   # should converge, not solve_history
         self.pole_xy = None       # pole pixel from last solve's WCS
         self.noise_hist = []      # [(n, stack_sigma, single_sigma), ...]
         self._last_hist_series = []   # cached so a popout can redraw on resize
@@ -1830,6 +1835,23 @@ class App:
                                   anchor="w")
         self.lbl_solve.pack(side="left", fill="x")
 
+        # RA-axis (mechanical) polar-alignment readout: distinct from the
+        # optical field-centre reading above -- this is the fixed point of
+        # the rigid transform between two solves either side of a shaft
+        # rotation (sky.estimate_axis), so it tracks where the mount's
+        # actual rotation axis points rather than where the optics happen
+        # to be aimed. It arms itself the first time two solves land on
+        # opposite sides of a >=15 deg RA rotation; nothing to press.
+        r4b = tk.Frame(lf_solve); r4b.pack(fill="x", pady=(0, 2))
+        self.lbl_axis = tk.Label(
+            r4b, text="RA axis: not yet calibrated -- solve, rotate the "
+                      "mount >=15° in RA, solve again",
+            font=("TkDefaultFont", 10, "bold"), fg="#c08000", anchor="w")
+        self.lbl_axis.pack(side="left", fill="x")
+        self.btn_axis_clear = tk.Button(r4b, text="Clear axis calibration",
+                                        command=self.on_clear_axis)
+        self.btn_axis_clear.pack(side="right", padx=4)
+
         # log
         self.txt = tk.Text(self.root, height=7, state="disabled",
                            font=("TkFixedFont", 9))
@@ -2025,12 +2047,18 @@ class App:
                      "hist": self._render_hist}
         desc = {
             "pole":
-                "Polar-alignment scope. Each plate solve plots a point at "
-                "angle = field RA and radius = the field centre's angular "
-                "distance from the celestial pole (rings: 1', 5', 10', 30', "
-                "1°; √ radial scale). Newest solve is bright, the trail "
-                "shows drift — adjust the mount to walk the point into the "
-                "centre.",
+                "Polar-alignment scope. Green = the plate-solved FIELD "
+                "centre (angle = RA, radius = distance from the celestial "
+                "pole; rings at 1', 5', 10', 30', 1°, √ radial scale). "
+                "Amber = the RA AXIS itself, once two solves either side "
+                "of a >=15° shaft rotation have located its fixed pixel "
+                "(sky.estimate_axis) — the mechanical truth, and the one "
+                "to walk into the centre when it's present, since the "
+                "field centre reads a real offset whenever the camera "
+                "isn't perfectly coaxial with the shaft, even at a "
+                "flawless alignment. Newest point of each trail is "
+                "bright; clear the axis fit with the button beside the "
+                "RA-axis readout if the camera gets remounted.",
             "noise":
                 "Noise of the integrated stack (robust MAD σ) vs frame "
                 "count N. Grey = the ideal 1/√N improvement from averaging; "
@@ -2119,22 +2147,38 @@ class App:
 
     def _render_pole(self, cv):
         """Polar-scope-style chart: rings at 1'/5'/10'/30'/1° (sqrt radial
-        mapping so the inner rings stay visible), each solve plotted at
-        angle=RA, radius=pole separation; trail fades, newest is bright.
-        Watching the dot walk toward centre IS the polar alignment.
+        mapping so the inner rings stay visible). Two trails can appear,
+        each plotted at angle=RA, radius=pole separation, fading with age,
+        newest bright:
 
-        Hemisphere-aware: the pole (NCP/SCP) is taken from the latest solve's
-        declination sign, and the angular handedness is mirrored for the SCP
-        so the chart turns the same way the southern sky does (clockwise
-        facing south) instead of the northern convention."""
+          green  -- solve_history: the plate-solved FIELD centre. This is
+                    where the optics are pointed, not necessarily where
+                    the mount's RA axis is -- a camera that isn't
+                    perfectly coaxial with the shaft reads a real offset
+                    here even at a flawless polar alignment.
+          amber  -- axis_history: the RA-AXIS pixel (sky.estimate_axis's
+                    fixed point of two solves either side of a shaft
+                    rotation -- see on_clear_axis) carried to a sky
+                    position via the latest WCS. This is the mechanical
+                    truth and, once armed, is the trail to walk into the
+                    centre.
+
+        Hemisphere-aware: the pole (NCP/SCP) is taken from the latest
+        available point's declination sign (axis preferred over field),
+        and the angular handedness is mirrored for the SCP so the chart
+        turns the same way the southern sky does (clockwise facing south)
+        instead of the northern convention."""
         cv.delete("all")
         size = min(cv.winfo_width(), cv.winfo_height())
         if size < 50:                       # not yet mapped (or tiny)
             size = AUX_W
         cx = cy = size // 2
         R = cx - 14
-        pts = self.solve_history[-20:]
-        south = bool(pts) and pts[-1]["dec"] < 0
+        field_pts = self.solve_history[-20:]
+        axis_pts = self.axis_history[-20:]
+        anchor = (axis_pts[-1] if axis_pts
+                 else field_pts[-1] if field_pts else None)
+        south = bool(anchor) and anchor["dec"] < 0
         ysign = 1.0 if south else -1.0  # SCP: clockwise; NCP: counter-clockwise
         for sep, lab in ((1, "1'"), (5, "5'"), (10, "10'"),
                          (30, "30'"), (60, "1°")):
@@ -2144,32 +2188,47 @@ class App:
                            font=("TkDefaultFont", 7), anchor="e")
         cv.create_line(cx - 4, cy, cx + 4, cy, fill="#80a0c0")
         cv.create_line(cx, cy - 4, cx, cy + 4, fill="#80a0c0")
-        if pts:
+        if anchor:
             cv.create_text(cx + 7, cy + 8, text=("SCP" if south else "NCP"),
                            fill="#80a0c0", anchor="w",
                            font=("TkDefaultFont", 8, "bold"))
-        prev = None
-        for i, p in enumerate(pts):
-            r = R * math.sqrt(min(p["sep_arcmin"], 60.0) / 60.0)
-            a = math.radians(p["ra"])
-            x = cx + r * math.cos(a)
-            y = cy + ysign * r * math.sin(a)
-            if prev:
-                cv.create_line(prev[0], prev[1], x, y, fill="#2e5a3a")
-            last = i == len(pts) - 1
-            d = 4 if last else 2
-            cv.create_oval(x - d, y - d, x + d, y + d,
-                           fill="#00ff60" if last else "#3a7a4a", outline="")
-            prev = (x, y)
-        if pts:
-            sep = pts[-1]["sep_arcmin"]
-            txt = f"{sep:.1f}'" if sep < 100 else f"{sep / 60.0:.2f}°"
-            if sep > 60:
-                txt = "off-chart  " + txt
-            cv.create_text(cx, size - 9,
-                           text=f"{('SCP' if south else 'NCP')}  {txt}",
-                           fill="#00ff60",
-                           font=("TkDefaultFont", 10, "bold"))
+
+        def plot_trail(pts, trail_fill, bright_fill):
+            prev = None
+            for i, p in enumerate(pts):
+                r = R * math.sqrt(min(p["sep_arcmin"], 60.0) / 60.0)
+                a = math.radians(p["ra"])
+                x = cx + r * math.cos(a)
+                y = cy + ysign * r * math.sin(a)
+                if prev:
+                    cv.create_line(prev[0], prev[1], x, y, fill=trail_fill)
+                last = i == len(pts) - 1
+                d = 4 if last else 2
+                cv.create_oval(x - d, y - d, x + d, y + d,
+                               fill=bright_fill if last else trail_fill,
+                               outline="")
+                prev = (x, y)
+
+        plot_trail(field_pts, "#2e5a3a", "#00ff60")
+        plot_trail(axis_pts, "#7a5a10", "#ffb000")
+
+        if axis_pts or field_pts:
+            lines = []
+            if axis_pts:
+                sep = axis_pts[-1]["sep_arcmin"]
+                txt = f"{sep:.1f}'" if sep < 100 else f"{sep / 60.0:.2f}°"
+                lines.append((f"AXIS  {txt}", "#ffb000", 10))
+            if field_pts:
+                sep = field_pts[-1]["sep_arcmin"]
+                txt = f"{sep:.1f}'" if sep < 100 else f"{sep / 60.0:.2f}°"
+                lines.append((f"FIELD  {txt}", "#00ff60",
+                             8 if axis_pts else 10))
+            y0 = size - 9 - (11 if len(lines) > 1 else 0)
+            for txt, fill, fsize in lines:
+                cv.create_text(
+                    cx, y0, text=f"{('SCP' if south else 'NCP')}  " + txt,
+                    fill=fill, font=("TkDefaultFont", fsize, "bold"))
+                y0 += 13
         else:
             cv.create_text(cx, size - 9, text="no solves yet",
                            fill="#4a5a6c")
@@ -3435,6 +3494,28 @@ class App:
                                        dbg=self.dbg))),
             daemon=True)
         t.start()
+
+    def on_clear_axis(self):
+        """Forget the RA-axis pixel (in memory and on disk) so the next
+        two solves spanning a rotation re-derive it from scratch -- for
+        after the camera has been unmounted/remounted, or the OTA shifted
+        in its rings, since the axis pixel is a property of that specific
+        physical mounting and stops being true the moment it changes."""
+        self.axis_xy = None
+        self._armed_prev = None
+        self.axis_history = []
+        w, h = self.current_size()
+        if w:
+            try:
+                os.remove(sky.axis_path(self.data_dir(), w, h))
+            except OSError:
+                pass
+        self.lbl_axis.configure(
+            text="RA axis: cleared -- solve, rotate the mount >=15° in "
+                 "RA, solve again", fg="#c08000")
+        self._draw_bullseye()
+        self.log("RA-axis calibration cleared; the next two solves "
+                 "spanning a rotation will re-derive it")
 
     # ---------------- deep-dive diagnostics ----------------
 
@@ -4785,7 +4866,15 @@ class App:
                                                  rot_deg=round(rot, 2))
                             self._armed_prev = (now_t, wcs, (h, w))
                             # the number that matters: axis -> pole
-                            # separation IS the polar alignment error
+                            # separation IS the polar alignment error.
+                            # Reported two ways: in THIS frame's pixels
+                            # (precise, but only meaningful while this
+                            # solve is current) and as a sky position via
+                            # pix_to_sky (frame-independent -- this is
+                            # what accumulates in axis_history and drives
+                            # the bullseye/lbl_axis readouts below, and
+                            # is directly comparable solve to solve even
+                            # as the mount is adjusted)
                             if self.axis_xy and self.pole_xy:
                                 sep_px = math.hypot(
                                     self.axis_xy[0] - self.pole_xy[0],
@@ -4799,6 +4888,33 @@ class App:
                                 self.dbg.log("polar_error",
                                              arcmin=round(arcmin, 2),
                                              px=round(sep_px, 1))
+                            if self.axis_xy:
+                                axis_ra, axis_dec = wcs.pix_to_sky(
+                                    self.axis_xy[0], self.axis_xy[1])
+                                axis_ra = float(axis_ra)
+                                axis_dec = float(axis_dec)
+                                col = sky.collimation(
+                                    self.axis_xy, (h, w),
+                                    wcs.scale_arcsec_per_px())
+                                self.axis_history.append({
+                                    "t": now_t, "ra": axis_ra,
+                                    "dec": axis_dec,
+                                    "sep_arcmin":
+                                        (90.0 - abs(axis_dec)) * 60.0})
+                                del self.axis_history[:-50]
+                                self.lbl_axis.configure(
+                                    text="RA axis: "
+                                         + pole_offset_text(axis_ra,
+                                                            axis_dec)
+                                         + "  ·  collimation "
+                                           f"{col['arcmin']:.1f}' @ "
+                                           f"{col['clock']} o'clock",
+                                    fg="#00c060")
+                                self._draw_bullseye()
+                                self.dbg.log(
+                                    "axis_sky", ra=round(axis_ra, 4),
+                                    dec=round(axis_dec, 4),
+                                    collimation=col)
                             # star-hop guidance when the pole is off
                             # frame: a route of single-bolt legs, each
                             # keeping enough detectable stars in frame

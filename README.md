@@ -350,8 +350,32 @@ Plate solving runs a local astrometry.net (`solve-field`) on the stack
 enough stars are present, and reports RA/Dec field centre, rotation, and the
 **angular offset from the celestial pole** — with the camera mounted in or
 coaxial to an equatorial's RA axis, that offset is the live polar-alignment
-number while adjusting the mount. (Fitting the mechanical rotation centre
-from solves at several RA-axis rotations is the planned refinement on top.)
+number while adjusting the mount. This FIELD-centre offset is what the
+bullseye's green trail plots, and it is real but not quite the right
+number: it moves with wherever the optics happen to be pointed, and reads
+a fixed error whenever the camera isn't perfectly coaxial with the shaft
+— even at flawless alignment.
+
+The mechanical number is the **RA-axis fit**: once two armed solves land
+either side of a `>=15°` RA-only rotation, `sky.estimate_axis` finds the
+pixel that stayed fixed between them (the rigid 2D transform's fixed
+point — the camera rotates with the shaft, so whatever pixel doesn't move
+IS the shaft's projection onto the sensor, regardless of how well or badly
+the optics are centred on it). That pixel is persisted per device+
+resolution (`axis_WxH.json` in the same per-device data directory as the
+dark/flat/response calibration) and, via `wcs.pix_to_sky` on every subsequent
+solve, converted into a live sky position: how far the axis itself is from
+the pole, which is the actual polar-alignment error. It shows up three
+places: the **RA axis:** status line above the log (persistent, not just
+scrolled past), the amber trail on the pole bullseye (drawn over the green
+field trail — walk the amber dot to centre, not the green one, when both
+are present), and a **collimation** figure (`sky.collimation`) reporting
+how far the axis pierces the sensor from its centre and toward which
+clock position — a property of the mount/OTA/camera assembly, useful at
+the workbench, unrelated to alignment quality. Re-arms automatically after
+"Clear axis calibration" (next to the RA-axis status line) if the camera
+gets remounted or the OTA shifts in its rings, since the fixed pixel is
+only true for one specific physical mounting.
 
 A second, independent use of the same solve is **pointing tracking** for a
 camera aimed anywhere — not just the polar cap `make_catalog.py` covers,
