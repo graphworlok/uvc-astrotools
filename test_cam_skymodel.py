@@ -869,6 +869,60 @@ class TestTimeAndPrecession(unittest.TestCase):
             places=9)
 
 
+class TestPoleOffset(unittest.TestCase):
+    """The ~9' systematic: 90 - |dec_J2000| measures to the pole as it was in
+    2000, not where it is now."""
+
+    T = 1785974400.0        # a 2026 epoch
+
+    def _pole_of_date_in_j2000(self, south):
+        v = np.array([0.0, 0.0, -1.0 if south else 1.0])
+        u = sm.precession_matrix(self.T).T @ v
+        return (math.degrees(math.atan2(u[1], u[0])) % 360.0,
+                math.degrees(math.asin(max(-1.0, min(1.0, u[2])))))
+
+    def test_perfectly_aligned_axis_reads_zero(self):
+        for south in (True, False):
+            ra, dec = self._pole_of_date_in_j2000(south)
+            off = sm.pole_offset(ra, dec, self.T)
+            self.assertLess(off["sep_arcmin"], 1e-6)
+            # and the naive figure would have reported ~9' of error
+            self.assertGreater(off["sep_arcmin_j2000"], 8.0)
+
+    def test_reports_the_correct_hemisphere(self):
+        self.assertEqual(sm.pole_offset(0.0, -89.0, self.T)["hemisphere"], "SCP")
+        self.assertEqual(sm.pole_offset(0.0, 89.0, self.T)["hemisphere"], "NCP")
+
+    def test_agrees_with_the_absolute_readout(self):
+        # the bullseye radius and polar_alignment's sky error are the same
+        # quantity by two routes; they must not disagree
+        for lat, lon in ((-34.9, 138.6), (51.5, -0.1)):
+            ra, dec = self._pole_of_date_in_j2000(lat < 0)
+            # nudge off the pole so it is a real comparison, not 0 == 0
+            dec += 0.4 if lat > 0 else -0.4
+            a = sm.pole_offset(ra, dec, self.T)["sep_arcmin"]
+            b = sm.polar_alignment(ra, dec, lat, lon, self.T)["sky_error_arcmin"]
+            self.assertAlmostEqual(a, b, places=6)
+
+    def test_vectorised_matches_scalar(self):
+        ra = np.array([0.0, 90.0, 180.0, 270.0, 33.3])
+        dec = np.array([-89.0, -85.0, -80.0, -88.0, 12.0])
+        ra_d, dec_d = sm.precess_arrays(ra, dec, self.T)
+        for i in range(len(ra)):
+            s = sm.precess_from_j2000(float(ra[i]), float(dec[i]), self.T)
+            self.assertAlmostEqual(s[0], float(ra_d[i]), places=9)
+            self.assertAlmostEqual(s[1], float(dec_d[i]), places=9)
+
+    def test_matrix_is_orthonormal(self):
+        P = sm.precession_matrix(self.T)
+        np.testing.assert_allclose(P @ P.T, np.eye(3), atol=1e-12)
+        self.assertAlmostEqual(float(np.linalg.det(P)), 1.0, places=12)
+
+    def test_matrix_is_identity_at_j2000(self):
+        np.testing.assert_allclose(sm.precession_matrix(946728000.0),
+                                   np.eye(3), atol=1e-9)
+
+
 class TestAltAz(unittest.TestCase):
     def test_pole_sits_at_latitude_altitude_north(self):
         for lst in (0.0, 73.2, 189.0, 359.9):

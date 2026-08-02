@@ -798,17 +798,29 @@ def solve_field(stack, solve_path, scale_low, scale_high, timeout=180,
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def pole_offset_text(ra, dec):
-    """Angular separation of the solved field centre from the celestial pole
-    of its hemisphere. With the camera mounted in / coaxial to the RA axis,
+def pole_offset_text(ra, dec, t=None):
+    """Angular separation of a solved position from the celestial pole of
+    its hemisphere. With the camera mounted in / coaxial to the RA axis,
     this is the live 'how far is my axis from the pole' polar-alignment
     number (the mechanical-axis refinement -- solving at several RA-axis
-    rotations and fitting the rotation centre -- can sit on top of this)."""
-    pole = "NCP" if dec >= 0 else "SCP"
-    sep_deg = 90.0 - abs(dec)
+    rotations and fitting the rotation centre -- can sit on top of this).
+
+    Measured to the pole OF DATE. Plate solves return J2000, and the pole
+    has since moved ~9' away from where it was in 2000, so comparing a J2000
+    declination against 90 deg quietly reports that drift as alignment
+    error. Pass t (POSIX seconds) to get the honest figure; without it the
+    J2000 pole is used and the text says so, rather than looking correct."""
+    if t is None:
+        pole = "NCP" if dec >= 0 else "SCP"
+        sep_deg = 90.0 - abs(dec)
+        suffix = f" {pole} (J2000)"
+    else:
+        off = sky.pole_offset(ra, dec, t)
+        sep_deg = off["sep_arcmin"] / 60.0
+        suffix = f" {off['hemisphere']}"
     if sep_deg < 1.0:
-        return f"{sep_deg * 60.0:.1f} arcmin from {pole}"
-    return f"{sep_deg:.3f} deg from {pole}"
+        return f"{sep_deg * 60.0:.1f} arcmin from{suffix}"
+    return f"{sep_deg:.3f} deg from{suffix}"
 
 
 def bolt_correction_text(corr):
@@ -2342,7 +2354,9 @@ class App:
             prev = None
             for i, p in enumerate(pts):
                 r = R * math.sqrt(min(p["sep_arcmin"], 60.0) / 60.0)
-                a = math.radians(p["ra"])
+                # angle from the OF-DATE right ascension, to match the
+                # of-date radius; older records without it fall back
+                a = math.radians(p.get("ra_date", p["ra"]))
                 x = cx + r * math.cos(a)
                 y = cy + ysign * r * math.sin(a)
                 if prev:
@@ -2660,14 +2674,29 @@ class App:
     # Wide-field reference view
     # ------------------------------------------------------------------
 
-    def _wide_catalog(self, south):
-        """Polar-cap catalogue for a hemisphere, cached. Returns None when the
-        catalogue file is absent -- the view still draws, just without stars."""
-        key = "s" if south else "n"
+    def _wide_catalog(self, south, t=None):
+        """Polar-cap catalogue for a hemisphere, PRECESSED to the frame of
+        date and cached there.
+
+        The catalogue is J2000 and the reticle is now of-date, so drawing one
+        against the other unprecessed would put a ~9' offset between the
+        stars and the marks -- which on a finder chart reads as a pointing
+        error that isn't there. Cached per hemisphere per day: precession
+        moves ~20"/yr, so re-rotating more often than that is pointless.
+        Returns None when the catalogue file is absent -- the view still
+        draws, just without stars."""
+        t = time.time() if t is None else t
+        key = ("s" if south else "n", int(t // 86400))
         if key not in self._wide_cat:
+            self._wide_cat.clear()          # only ever one epoch in flight
             try:
-                self._wide_cat[key] = sky.load_catalog(
-                    self.args.data_dir, -1.0 if south else 1.0)
+                cat = sky.load_catalog(self.args.data_dir,
+                                       -1.0 if south else 1.0)
+                if cat is not None:
+                    ra, dec, mag = cat
+                    ra_d, dec_d = sky.precess_arrays(ra, dec, t)
+                    cat = (ra_d, dec_d, mag)
+                self._wide_cat[key] = cat
             except Exception:
                 self._wide_cat[key] = None
         return self._wide_cat[key]
@@ -2747,7 +2776,8 @@ class App:
                            font=("TkDefaultFont", 7))
 
         # catalogue stars: the reference the eye actually uses
-        cat = self._wide_catalog(south)
+        # of-date catalogue, matching the of-date reticle below
+        cat = self._wide_catalog(south, anchor.get("t"))
         n_stars = 0
         if cat is not None:
             ra_c, dec_c, mag_c = cat
@@ -2796,7 +2826,9 @@ class App:
         # the camera's own footprint, to scale, around the field centre --
         # this is the "where am I looking" the view exists to answer
         w, h = self.current_size()
-        fp = project(field["ra"], field["dec"]) if field else None
+        fp = (project(field.get("ra_date", field["ra"]),
+                      field.get("dec_date", field["dec"]))
+              if field else None)
         if fp and w and self.arcsec_per_px:
             half_w = (w * self.arcsec_per_px / 3600.0) / 2.0
             half_h = (h * self.arcsec_per_px / 3600.0) / 2.0
@@ -2820,7 +2852,8 @@ class App:
             cv.create_oval(fp[0] - 4, fp[1] - 4, fp[0] + 4, fp[1] + 4,
                            fill="#00ff60", outline="")
         if axis:
-            ap = project(axis["ra"], axis["dec"])
+            ap = project(axis.get("ra_date", axis["ra"]),
+                         axis.get("dec_date", axis["dec"]))
             if ap:
                 cv.create_line(ap[0] - 7, ap[1], ap[0] + 7, ap[1],
                                fill="#ffb000", width=2)
@@ -5546,11 +5579,18 @@ class App:
                        f"Dec {info['dec']:+.4f}°")
                 if "rot" in info:
                     pos += f"  rot {info['rot']:+.1f}°"
-                pos += "  |  " + pole_offset_text(info["ra"], info["dec"])
+                _t = time.time()
+                pos += "  |  " + pole_offset_text(info["ra"], info["dec"], _t)
                 self.lbl_solve.configure(text=pos, fg="#006000")
+                # J2000 ra/dec kept for the catalogue-frame wide view; the
+                # of-date pair drives the bullseye, whose 1' rings would
+                # otherwise sit ~9' off the truth
+                _off = sky.pole_offset(info["ra"], info["dec"], _t)
                 self.solve_history.append(
-                    {"t": time.time(), "ra": info["ra"], "dec": info["dec"],
-                     "sep_arcmin": (90.0 - abs(info["dec"])) * 60.0})
+                    {"t": _t, "ra": info["ra"], "dec": info["dec"],
+                     "ra_date": _off["ra_of_date"],
+                     "dec_date": _off["dec_of_date"],
+                     "sep_arcmin": _off["sep_arcmin"]})
                 del self.solve_history[:-50]
                 # plate scale and roll feed the wide view's to-scale FOV box
                 self.arcsec_per_px = info.get("arcsec_per_px")
@@ -5732,11 +5772,14 @@ class App:
                                 col = sky.collimation(
                                     self.axis_xy, (h, w),
                                     wcs.scale_arcsec_per_px())
+                                _aoff = sky.pole_offset(axis_ra, axis_dec,
+                                                        now_t)
                                 self.axis_history.append({
                                     "t": now_t, "ra": axis_ra,
                                     "dec": axis_dec,
-                                    "sep_arcmin":
-                                        (90.0 - abs(axis_dec)) * 60.0})
+                                    "ra_date": _aoff["ra_of_date"],
+                                    "dec_date": _aoff["dec_of_date"],
+                                    "sep_arcmin": _aoff["sep_arcmin"]})
                                 del self.axis_history[:-50]
                                 refr_txt = ""
                                 if self.args.latitude is not None:
@@ -5756,7 +5799,7 @@ class App:
                                 self.lbl_axis.configure(
                                     text="RA axis: "
                                          + pole_offset_text(axis_ra,
-                                                            axis_dec)
+                                                            axis_dec, now_t)
                                          + "  ·  collimation "
                                            f"{col['arcmin']:.1f}' @ "
                                            f"{col['clock']} o'clock"
@@ -5958,7 +6001,8 @@ class App:
                "flat_exposure_units": self.flat_exp,
                "parsed": info}
         if ok and "ra" in info and "dec" in info:
-            rec["pole_offset"] = pole_offset_text(info["ra"], info["dec"])
+            rec["pole_offset"] = pole_offset_text(
+                info["ra"], info["dec"], time.time())
         rec.update(record)
         path = os.path.join(self.data_dir(), "solves.jsonl")
         try:

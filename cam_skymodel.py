@@ -1211,29 +1211,66 @@ def lst_deg(unix_t, lon_east_deg):
     return (gmst_deg(julian_date(unix_t)) + lon_east_deg) % 360.0
 
 
-def precess_from_j2000(ra_deg, dec_deg, unix_t):
-    """Precess equatorial coordinates from J2000 to the mean equinox of
-    date. IAU 1976 angles (Lieske), rigorous rotation rather than the
-    first-order approximation, because near the pole the first-order form
-    degrades exactly where this is used.
+def precession_matrix(unix_t):
+    """3x3 rotation taking J2000 equatorial unit vectors to the mean equinox
+    of date. IAU 1976 angles (Lieske): P = Rz(z) . Ry(theta) . Rz(zeta).
 
-    Returns (ra_deg, dec_deg) of date."""
+    Exposed as a matrix, not just a scalar coordinate transform, because the
+    star catalogue has to be carried into the same frame wholesale -- mixing
+    a precessed axis position with J2000 catalogue positions on one chart
+    would put a ~9' offset between the reticle and the stars it is drawn
+    against. Its transpose is the exact inverse, no iteration needed."""
     t = (julian_date(unix_t) - 2451545.0) / 36525.0
-    # arcseconds -> radians
-    s = math.pi / (180.0 * 3600.0)
+    s = math.pi / (180.0 * 3600.0)          # arcseconds -> radians
     zeta = (2306.2181 * t + 0.30188 * t * t + 0.017998 * t ** 3) * s
     z = (2306.2181 * t + 1.09468 * t * t + 0.018203 * t ** 3) * s
     theta = (2004.3109 * t - 0.42665 * t * t - 0.041833 * t ** 3) * s
-    a0 = math.radians(ra_deg)
-    d0 = math.radians(dec_deg)
-    A = math.cos(d0) * math.sin(a0 + zeta)
-    B = (math.cos(theta) * math.cos(d0) * math.cos(a0 + zeta)
-         - math.sin(theta) * math.sin(d0))
-    C = (math.sin(theta) * math.cos(d0) * math.cos(a0 + zeta)
-         + math.cos(theta) * math.sin(d0))
-    ra = (math.degrees(math.atan2(A, B) + z)) % 360.0
-    dec = math.degrees(math.asin(max(-1.0, min(1.0, C))))
-    return ra, dec
+    cz, sz = math.cos(z), math.sin(z)
+    ct, st = math.cos(theta), math.sin(theta)
+    cx, sx = math.cos(zeta), math.sin(zeta)
+    Rz_z = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
+    Ry_t = np.array([[ct, 0.0, -st], [0.0, 1.0, 0.0], [st, 0.0, ct]])
+    Rz_x = np.array([[cx, -sx, 0.0], [sx, cx, 0.0], [0.0, 0.0, 1.0]])
+    return Rz_z @ Ry_t @ Rz_x
+
+
+def precess_arrays(ra_deg, dec_deg, unix_t, matrix=None):
+    """Vectorised J2000 -> date for whole coordinate arrays (the catalogue).
+    Pass `matrix` to reuse one rotation across repeated calls."""
+    P = precession_matrix(unix_t) if matrix is None else matrix
+    a = np.radians(np.asarray(ra_deg, dtype=np.float64))
+    d = np.radians(np.asarray(dec_deg, dtype=np.float64))
+    v = np.stack([np.cos(d) * np.cos(a), np.cos(d) * np.sin(a), np.sin(d)])
+    u = P @ v
+    return (np.degrees(np.arctan2(u[1], u[0])) % 360.0,
+            np.degrees(np.arcsin(np.clip(u[2], -1.0, 1.0))))
+
+
+def precess_from_j2000(ra_deg, dec_deg, unix_t):
+    """Precess one equatorial position from J2000 to the mean equinox of
+    date. Rigorous rotation rather than the first-order approximation,
+    because the first-order form degrades near the pole -- exactly where
+    this is used.
+
+    Returns (ra_deg, dec_deg) of date."""
+    ra, dec = precess_arrays(ra_deg, dec_deg, unix_t)
+    return float(ra), float(dec)
+
+
+def pole_offset(ra_j2000, dec_j2000, unix_t):
+    """Separation from the celestial pole OF DATE, with the coordinates in
+    both frames.
+
+    The naive form -- 90 - |dec_J2000| -- measures to the J2000 pole, which
+    the real pole left behind at ~20.04"/yr: by the mid-2020s that is a ~9'
+    systematic, larger than the alignment anyone is chasing and silently
+    reported as if it were the answer. Everything that quotes a distance
+    from the pole goes through here."""
+    ra_d, dec_d = precess_from_j2000(ra_j2000, dec_j2000, unix_t)
+    return {"ra_of_date": ra_d, "dec_of_date": dec_d,
+            "sep_arcmin": (90.0 - abs(dec_d)) * 60.0,
+            "sep_arcmin_j2000": (90.0 - abs(dec_j2000)) * 60.0,
+            "hemisphere": "SCP" if dec_d < 0 else "NCP"}
 
 
 def radec_to_altaz(ra_deg, dec_deg, lat_deg, lst_deg_):

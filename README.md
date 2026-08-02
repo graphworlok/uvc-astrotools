@@ -502,6 +502,14 @@ field is going during polar alignment. Resume optionally resets the stack
 An auxiliary panel column carries three live visualisations (the pole chart
 and the noise curve are LIGHT-mode only; the histogram is shown in both):
 
+All pole distances are measured to the pole **of date**, not the J2000 pole.
+Plate solves return J2000 and the celestial pole moves ~20.04″/yr, so by the
+mid-2020s the two are ~9′ apart — larger than the alignment anyone is chasing,
+and previously reported as if it were real error. Everything that quotes a
+distance from the pole goes through `sky.pole_offset`, and the wide-field
+catalogue is precessed with the same rotation so the stars and the reticle
+share one frame.
+
 - **Pole bullseye** — a polar-scope-style chart with rings at 1′/5′/10′/30′/1°
   (√-radial mapping so the inner rings stay legible), plotting each solve at
   angle = RA, radius = pole separation, with a fading trail. Watching the dot
