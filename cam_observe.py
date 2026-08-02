@@ -1755,9 +1755,14 @@ class App:
         # rotation, no calibration and no sign ambiguity -- so it goes
         # first, being the one to act on when far out.
         r4d = tk.Frame(lf_solve); r4d.pack(fill="x", pady=(0, 2))
+        # startup text must not blame the arguments: they may well be set,
+        # and the real precondition is a solve
         self.lbl_altaz = tk.Label(
-            r4d, text="Mount: needs --latitude and --longitude for the "
-                      "absolute point-higher/left-right readout",
+            r4d, text="Mount: solve once for the absolute "
+                      "point-higher / left-right readout"
+                      + ("" if (self.args.latitude is not None
+                                and self.args.longitude is not None)
+                         else "  (needs --latitude and --longitude)"),
             font=("TkDefaultFont", 11, "bold"), fg="#808080", anchor="w")
         self.lbl_altaz.pack(side="left", fill="x")
 
@@ -1966,15 +1971,22 @@ class App:
             if mode in modes:
                 widget.pack(**kw)
 
-    def _update_altaz(self, axis_ra, axis_dec, t):
-        """Absolute mount correction from one solved axis direction.
+    def _update_altaz(self, axis_ra, axis_dec, t, source="RA axis"):
+        """Absolute mount correction from one solved direction.
 
         This is the readout to act on when far out: it needs no shaft
         rotation, no bolt calibration and has no sign ambiguity, because it
         is computed in horizon coordinates rather than decomposed onto
         empirically-learned pixel directions. Requires latitude AND
         longitude -- the hour angle is what makes 'higher' and 'left' mean
-        anything, and that needs local sidereal time."""
+        anything, and that needs local sidereal time.
+
+        `source` says WHICH direction was used. The RA axis is the
+        mechanical truth and is preferred, but it needs two solves spanning
+        a rotation; until then the FIELD CENTRE stands in, which is exact
+        for a camera coaxial in the RA bore and off by the collimation error
+        otherwise. Waiting for the axis fit before saying anything would
+        withhold the one number that works from the first solve."""
         lat, lon = self.args.latitude, self.args.longitude
         if lat is None or lon is None:
             missing = " and ".join(
@@ -1990,20 +2002,20 @@ class App:
             self.dbg.exc("error", where="polar_alignment")
             self.lbl_altaz.configure(text=f"Mount: {e}", fg="#802000")
             return
+        pa["source"] = source
         self.polar_abs = pa
         err = pa["sky_error_arcmin"]
         col = ("#00c060" if err < 5 else "#c08000" if err < 60 else "#802000")
         self.lbl_altaz.configure(
             text=f"MOUNT: {pa['instruction_alt']}  ·  {pa['instruction_az']}"
-                 f"   [axis alt {pa['axis_alt_deg']:.2f}° az "
+                 f"   [{source}: alt {pa['axis_alt_deg']:.2f}° az "
                  f"{pa['axis_az_deg']:.2f}° → pole alt "
                  f"{pa['pole_alt_deg']:.2f}° az {pa['pole_az_deg']:.0f}°, "
                  f"off {err:.1f}′]",
             fg=col)
-        self.log(f"MOUNT: {pa['instruction_alt']}; {pa['instruction_az']} "
-                 f"(sky error {err:.1f}', precession term "
-                 f"{pa['precession_shift_arcmin']:.1f}')")
-        self.dbg.log("polar_alignment_abs",
+        self.log(f"MOUNT ({source}): {pa['instruction_alt']}; "
+                 f"{pa['instruction_az']} (sky error {err:.1f}')")
+        self.dbg.log("polar_alignment_abs", source=source,
                      d_alt_deg=round(pa["d_alt_deg"], 5),
                      d_az_deg=round(pa["d_az_deg"], 5),
                      sky_error_arcmin=round(err, 3),
@@ -2694,10 +2706,17 @@ class App:
         cv.create_text(W // 2, 18, fill=col,
                        font=("TkDefaultFont", 12, "bold"),
                        text=f"axis → pole: {sky._fmt_ang(err / 60.0)}")
+        src = pa.get("source", "RA axis")
         cv.create_text(W // 2, 38, fill="#9fb0c4",
                        font=("TkDefaultFont", 8),
-                       text="absolute correction — one solve, no rotation, "
-                            "no sign ambiguity")
+                       text=f"absolute correction from the {src} — "
+                            "no rotation, no sign ambiguity")
+        if src == "field centre":
+            cv.create_text(W // 2, 52, fill="#e0c060",
+                           font=("TkDefaultFont", 8),
+                           text="RA axis not fitted yet: exact for a camera "
+                                "coaxial in the bore, otherwise off by the "
+                                "collimation error")
 
         cy = H // 2
         # ALTITUDE
@@ -5671,6 +5690,15 @@ class App:
                      "ra_date": _off["ra_of_date"],
                      "dec_date": _off["dec_of_date"],
                      "sep_arcmin": _off["sep_arcmin"]})
+                # Absolute mount correction from THIS solve. The RA-axis
+                # branch below redoes it with the mechanical axis once that
+                # is calibrated, but gating it on the axis fit -- which
+                # needs two solves spanning a >=15 deg rotation -- would
+                # withhold the one readout that works immediately, which is
+                # exactly when you are far out and need it most.
+                if self.axis_xy is None:
+                    self._update_altaz(info["ra"], info["dec"], _t,
+                                       source="field centre")
                 del self.solve_history[:-50]
                 # plate scale and roll feed the wide view's to-scale FOV box
                 self.arcsec_per_px = info.get("arcsec_per_px")
@@ -5885,9 +5913,11 @@ class App:
                                            f"{col['clock']} o'clock"
                                          + refr_txt,
                                     fg="#00c060")
-                                # absolute mount correction: the actionable
-                                # form, from this one solve
-                                self._update_altaz(axis_ra, axis_dec, now_t)
+                                # redo the absolute correction against the
+                                # mechanical axis, which supersedes the
+                                # field-centre proxy used above
+                                self._update_altaz(axis_ra, axis_dec, now_t,
+                                                   source="RA axis")
                                 self._draw_bullseye()
                                 self._draw_wide()
                                 self.dbg.log(
