@@ -818,6 +818,192 @@ class TestCollimation(unittest.TestCase):
         self.assertAlmostEqual(r["arcmin"], 6.6, delta=0.01)
 
 
+class TestTimeAndPrecession(unittest.TestCase):
+    """Anchored on values that are definitions, not opinions."""
+
+    J2000 = 946728000.0        # 2000-01-01 12:00:00 UTC as a POSIX time
+
+    def test_julian_date_at_j2000(self):
+        self.assertAlmostEqual(sm.julian_date(self.J2000), 2451545.0, places=6)
+
+    def test_gmst_at_j2000_is_the_defining_value(self):
+        self.assertAlmostEqual(sm.gmst_deg(2451545.0), 280.46061837, places=6)
+
+    def test_gmst_advances_a_sidereal_day(self):
+        # one solar day advances GMST by ~360.9856 deg, i.e. ~0.9856 net
+        g0 = sm.gmst_deg(2451545.0)
+        g1 = sm.gmst_deg(2451546.0)
+        self.assertAlmostEqual((g1 - g0) % 360.0, 0.98564736629, places=5)
+
+    def test_lst_tracks_longitude_one_for_one(self):
+        a = sm.lst_deg(self.J2000, 0.0)
+        b = sm.lst_deg(self.J2000, 90.0)
+        self.assertAlmostEqual((b - a) % 360.0, 90.0, places=9)
+
+    def test_precession_is_identity_at_j2000(self):
+        ra, dec = sm.precess_from_j2000(123.4, 56.7, self.J2000)
+        self.assertAlmostEqual(ra, 123.4, places=6)
+        self.assertAlmostEqual(dec, 56.7, places=6)
+
+    def test_pole_precesses_by_the_expected_rate(self):
+        # ~20.04"/yr, so the J2000 pole is ~8.9' off the pole of date in 2026
+        t2026 = self.J2000 + 26.58 * 365.25 * 86400.0
+        _ra, dec = sm.precess_from_j2000(0.0, 90.0, t2026)
+        off_arcmin = (90.0 - dec) * 60.0
+        self.assertAlmostEqual(off_arcmin, 2004.3109 * 0.2658 / 60.0, delta=0.05)
+        self.assertGreater(off_arcmin, 8.0)   # big enough to matter, the point
+
+    def test_precession_preserves_angular_separation(self):
+        # a rotation cannot change the angle between two directions
+        def sep(a, b):
+            (r1, d1), (r2, d2) = a, b
+            r1, d1, r2, d2 = map(math.radians, (r1, d1, r2, d2))
+            return math.degrees(math.acos(max(-1.0, min(1.0,
+                math.sin(d1) * math.sin(d2)
+                + math.cos(d1) * math.cos(d2) * math.cos(r1 - r2)))))
+        t = self.J2000 + 26.0 * 365.25 * 86400.0
+        A, B = (10.0, 70.0), (200.0, 85.0)
+        self.assertAlmostEqual(
+            sep(A, B),
+            sep(sm.precess_from_j2000(*A, t), sm.precess_from_j2000(*B, t)),
+            places=9)
+
+
+class TestAltAz(unittest.TestCase):
+    def test_pole_sits_at_latitude_altitude_north(self):
+        for lst in (0.0, 73.2, 189.0, 359.9):
+            alt, az = sm.radec_to_altaz(0.0, 90.0, 51.5, lst)
+            self.assertAlmostEqual(alt, 51.5, places=9)
+            self.assertAlmostEqual(az % 360.0, 0.0, places=6)
+
+    def test_pole_sits_due_south_in_the_south(self):
+        for lst in (0.0, 120.0, 300.0):
+            alt, az = sm.radec_to_altaz(0.0, -90.0, -34.9, lst)
+            self.assertAlmostEqual(alt, 34.9, places=9)
+            self.assertAlmostEqual(az, 180.0, places=6)
+
+    def test_object_on_the_meridian_is_due_south_or_north(self):
+        lst = 100.0
+        # dec below the zenith for a northern observer -> due south, H=0
+        alt, az = sm.radec_to_altaz(lst, 20.0, 51.5, lst)
+        self.assertAlmostEqual(az, 180.0, places=6)
+        self.assertAlmostEqual(alt, 90.0 - 51.5 + 20.0, places=6)
+
+    def test_azimuth_east_and_west_of_the_meridian(self):
+        # H = LST - RA, so H < 0 is still RISING (east of the meridian) and
+        # H > 0 has already transited (west). Getting this backwards is the
+        # classic hour-angle slip, so both sides are pinned here.
+        lst, dec, lat = 100.0, 20.0, 51.5
+        _a, az_east = sm.radec_to_altaz((lst + 15.0) % 360.0, dec, lat, lst)
+        _a, az_west = sm.radec_to_altaz((lst - 15.0) % 360.0, dec, lat, lst)
+        self.assertTrue(90.0 < az_east < 180.0, az_east)   # east of south
+        self.assertTrue(180.0 < az_west < 270.0, az_west)  # west of south
+
+
+class TestPolarAlignment(unittest.TestCase):
+    """Round-trip: place the axis a known amount off the pole in horizon
+    coordinates, hand the solver the equivalent J2000 direction, and require
+    the original offsets back. Exercises precession, LST, the horizon
+    transform and the sign conventions together."""
+
+    T = 1785936600.0        # a fixed 2026 epoch
+
+    @staticmethod
+    def _P(t):
+        T = (sm.julian_date(t) - 2451545.0) / 36525.0
+        s = math.pi / (180.0 * 3600.0)
+        ze = (2306.2181 * T + 0.30188 * T * T + 0.017998 * T ** 3) * s
+        z = (2306.2181 * T + 1.09468 * T * T + 0.018203 * T ** 3) * s
+        th = (2004.3109 * T - 0.42665 * T * T - 0.041833 * T ** 3) * s
+        Rz = lambda a: np.array([[math.cos(a), -math.sin(a), 0.0],
+                                 [math.sin(a), math.cos(a), 0.0],
+                                 [0.0, 0.0, 1.0]])
+        My = lambda a: np.array([[math.cos(a), 0.0, -math.sin(a)],
+                                 [0.0, 1.0, 0.0],
+                                 [math.sin(a), 0.0, math.cos(a)]])
+        return Rz(z) @ My(th) @ Rz(ze)
+
+    @classmethod
+    def _deprecess(cls, ra_d, dec_d, t):
+        r, d = math.radians(ra_d), math.radians(dec_d)
+        v = np.array([math.cos(d) * math.cos(r), math.cos(d) * math.sin(r),
+                      math.sin(d)])
+        u = cls._P(t).T @ v
+        return (math.degrees(math.atan2(u[1], u[0])) % 360.0,
+                math.degrees(math.asin(max(-1.0, min(1.0, u[2])))))
+
+    @staticmethod
+    def _altaz_to_radec(alt, az, lat, lst):
+        a, A, p = map(math.radians, (alt, az, lat))
+        dec = math.asin(max(-1.0, min(1.0, math.sin(a) * math.sin(p)
+                                      + math.cos(a) * math.cos(p) * math.cos(A))))
+        H = math.atan2(-math.sin(A) * math.cos(a),
+                       math.sin(a) * math.cos(p)
+                       - math.cos(a) * math.sin(p) * math.cos(A))
+        return (lst - math.degrees(H)) % 360.0, math.degrees(dec)
+
+    def _roundtrip(self, lat, lon, d_alt, d_az):
+        lst = sm.lst_deg(self.T, lon)
+        alt_pole, az_pole = abs(lat), (180.0 if lat < 0 else 0.0)
+        ra_d, dec_d = self._altaz_to_radec(alt_pole - d_alt,
+                                           (az_pole - d_az) % 360.0, lat, lst)
+        ra_j, dec_j = self._deprecess(ra_d, dec_d, self.T)
+        return sm.polar_alignment(ra_j, dec_j, lat, lon, self.T)
+
+    def test_recovers_known_offsets_both_hemispheres(self):
+        for lat, lon, da, dz in ((-34.9, 138.6, -1.50, +2.00),
+                                 (-34.9, 138.6, +0.75, -0.40),
+                                 (+51.5, -0.1, -2.00, -1.25),
+                                 (+51.5, -0.1, +0.10, +0.05),
+                                 (+22.0, 120.0, -0.005, +0.004)):
+            r = self._roundtrip(lat, lon, da, dz)
+            self.assertAlmostEqual(r["d_alt_deg"], da, places=6)
+            self.assertAlmostEqual(r["d_az_deg"], dz, places=6)
+
+    def test_direction_words_match_the_signs(self):
+        # _roundtrip places the axis at (alt_pole - d_alt), so a POSITIVE
+        # d_alt puts the axis BELOW the pole and must read "point higher".
+        r = self._roundtrip(-34.9, 138.6, +1.5, +2.0)   # axis low, and left
+        self.assertTrue(r["alt_up"])
+        self.assertIn("HIGHER", r["instruction_alt"])
+        self.assertTrue(r["az_right"])
+        self.assertIn("RIGHT", r["instruction_az"])
+        r = self._roundtrip(-34.9, 138.6, -1.5, -2.0)   # axis high, and right
+        self.assertFalse(r["alt_up"])
+        self.assertIn("LOWER", r["instruction_alt"])
+        self.assertFalse(r["az_right"])
+        self.assertIn("LEFT", r["instruction_az"])
+
+    def test_sky_error_is_independent_of_the_decomposition(self):
+        # The true angular error should match the quadrature combination of
+        # the two adjustments with azimuth foreshortened by cos(altitude) --
+        # but that relation is FIRST ORDER, so at ~1 deg it is only good to
+        # a few thousandths. The tolerance says so rather than pretending.
+        lat = -34.9
+        r = self._roundtrip(lat, 138.6, -0.8, +1.1)
+        approx = math.hypot(r["d_alt_deg"],
+                            r["d_az_deg"] * math.cos(math.radians(abs(lat))))
+        self.assertAlmostEqual(r["sky_error_deg"], approx, delta=0.01)
+
+    def test_perfect_alignment_reads_zero(self):
+        # 1e-5 deg = 0.04 arcsec: the round trip goes through two precession
+        # rotations, so this is float residue, not a modelling error
+        r = self._roundtrip(-34.9, 138.6, 0.0, 0.0)
+        self.assertAlmostEqual(r["d_alt_deg"], 0.0, places=5)
+        self.assertAlmostEqual(r["d_az_deg"], 0.0, places=5)
+        self.assertLess(r["sky_error_arcmin"], 0.01)
+
+    def test_precession_is_actually_applied(self):
+        # feeding the J2000 pole must NOT report zero error: it is ~9' from
+        # the pole of date, and reporting 0 there is the bug this guards
+        r = sm.polar_alignment(0.0, 90.0, 51.5, -0.1, self.T)
+        self.assertGreater(r["sky_error_arcmin"], 8.0)
+        self.assertLess(r["sky_error_arcmin"], 10.0)
+
+    def test_result_is_json_serialisable(self):
+        json.dumps(self._roundtrip(-34.9, 138.6, -1.0, 1.0))
+
+
 class TestTleMatcher(unittest.TestCase):
     """Self-consistency: fabricate a transient record AT a satellite's
     own computed topocentric position, then require the matcher to find

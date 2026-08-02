@@ -1176,6 +1176,7 @@ class App:
         self.pole_xy = None       # pole pixel from last solve's WCS
         # inputs to the mount-adjustment and wide-field visualisations
         self.bolt_corr = None     # last sky.bolt_correction() result
+        self.polar_abs = None     # last sky.polar_alignment() result
         self.arcsec_per_px = None  # plate scale from the last solve
         self.solve_rot = None     # frame rotation (deg) from the last solve
         self._wide_cat = {}       # hemisphere -> (ra, dec, mag), cached
@@ -1198,6 +1199,7 @@ class App:
         self._solve_roi = None    # crop origin snapshot for the in-flight solve
 
         self._build_ui()
+        self._fit_to_screen()
         self._set_mode_banner()
         self._draw_bullseye()
         self._draw_noise()
@@ -1288,7 +1290,7 @@ class App:
             c.bind("<Button-1>",
                    lambda e, k=kind: self._popout_graph(k))
 
-        self.root.minsize(2 * CANVAS_W + AUX_W + 60, CANVAS_H + 430)
+        self.root.minsize(2 * CANVAS_W + AUX_W + 60, 420)
 
         ctl = tk.Frame(self.root)
         ctl.pack(fill="x", padx=4)
@@ -1327,6 +1329,20 @@ class App:
         self.btn_deepdive = tk.Button(bar, text="Deep-dive dump",
                                       command=self.on_deepdive)
         self.btn_deepdive.pack(side="right", padx=4)
+        # The two alignment views live in their own windows (they are read at
+        # the mount, in the dark, and want the space). Their buttons belong on
+        # THIS bar, not down beside the RA-axis readout: the control column is
+        # taller than a 1080p screen, so anything at the bottom of it is
+        # unreachable on exactly the laptop most likely to be in the field.
+        # F3/F4 do the same, for when the window is smaller still.
+        tk.Button(bar, text="Wide field  (F4)",
+                  command=lambda: self._popout_graph("wide")).pack(
+                      side="right", padx=2)
+        tk.Button(bar, text="Mount adjustment  (F3)",
+                  command=lambda: self._popout_graph("mount")).pack(
+                      side="right", padx=2)
+        self.root.bind("<F3>", lambda e: self._popout_graph("mount"))
+        self.root.bind("<F4>", lambda e: self._popout_graph("wide"))
 
         # camera: everything about the device itself
         lf_cam = tk.LabelFrame(ctl, text="Camera")
@@ -1490,8 +1506,19 @@ class App:
         self.btn_stellarium.pack(side="left", padx=(8, 2))
 
         # integration: what the LIGHT worker does with each frame
-        lf_int = tk.LabelFrame(ctl, text="Integration")
-        self._mode_pack(lf_int, ("light",), fill="x", pady=2)
+        # Stacking OPTIONS live in their own window; only the live status and
+        # the two run-time actions stay on the main panel. The control column
+        # is taller than a 1080p screen, and settings you touch once should
+        # not be permanently occupying the space that readouts you watch
+        # continuously need.
+        self.win_stack = tk.Toplevel(self.root)
+        self.win_stack.title("Stacking / integration options")
+        self.win_stack.geometry("+160+160")
+        self.win_stack.withdraw()
+        self.win_stack.protocol("WM_DELETE_WINDOW", self.win_stack.withdraw)
+
+        lf_int = tk.LabelFrame(self.win_stack, text="Integration")
+        lf_int.pack(fill="both", expand=True, padx=6, pady=6)
         r2 = tk.Frame(lf_int); r2.pack(fill="x", pady=1)
         tk.Label(r2, text="Rolling window:").pack(side="left")
         self.var_stack_max = tk.IntVar(value=self.stack_max_value)
@@ -1522,33 +1549,42 @@ class App:
                        variable=self.var_fix).pack(side="left")
         tk.Checkbutton(r2, text="align (phase corr.)",
                        variable=self.var_align).pack(side="left")
-        self.btn_pause = tk.Button(r2, text="Pause integration",
-                                   command=self.on_pause, state="disabled")
-        self.btn_pause.pack(side="left", padx=8)
+
+        r2b = tk.Frame(lf_int); r2b.pack(fill="x", pady=1)
         self.var_reset_resume = tk.BooleanVar(value=True)
         self.var_reset_resume.trace_add(
             "write", lambda *a: setattr(self, "reset_on_resume",
                                         bool(self.var_reset_resume.get())))
-        tk.Checkbutton(r2, text="reset stack on resume",
+        tk.Checkbutton(r2b, text="reset stack on resume",
                        variable=self.var_reset_resume).pack(side="left")
-        self.btn_reset = tk.Button(r2, text="Reset stack",
-                                   command=self.on_reset_stack)
-        self.btn_reset.pack(side="left", padx=8)
-
-        # integration status
-        r2b = tk.Frame(lf_int); r2b.pack(fill="x", pady=1)
         # roughly how many stars the user judges visible: detection adapts
         # its threshold toward this count, with the track filter keeping
         # the lowered threshold honest
-        tk.Label(r2b, text="Visible stars ≈").pack(side="left", padx=(4, 0))
+        tk.Label(r2b, text="Visible stars ≈").pack(side="left", padx=(16, 0))
         self.var_star_target = tk.IntVar(value=self.star_target_value)
         self.var_star_target.trace_add("write", self._on_star_target_change)
         tk.Spinbox(r2b, from_=1, to=300, width=4,
                    textvariable=self.var_star_target).pack(side="left",
                                                            padx=(0, 8))
-        self.lbl_stack = tk.Label(r2b, text="integrating: 0 frames")
-        self.lbl_stack.pack(side="left", padx=4)
-        self.lbl_stars = tk.Label(r2b, text="stars: -")
+        tk.Button(lf_int, text="Close", command=self.win_stack.withdraw
+                  ).pack(side="bottom", anchor="e", pady=(6, 0))
+
+        # main panel keeps only what you WATCH and what you PRESS mid-run
+        lf_run = tk.LabelFrame(ctl, text="Integration")
+        self._mode_pack(lf_run, ("light",), fill="x", pady=2)
+        r2c = tk.Frame(lf_run); r2c.pack(fill="x", pady=1)
+        tk.Button(r2c, text="Stacking options…  (F5)",
+                  command=self._show_stack_options).pack(side="left", padx=4)
+        self.root.bind("<F5>", lambda e: self._show_stack_options())
+        self.btn_pause = tk.Button(r2c, text="Pause integration",
+                                   command=self.on_pause, state="disabled")
+        self.btn_pause.pack(side="left", padx=4)
+        self.btn_reset = tk.Button(r2c, text="Reset stack",
+                                   command=self.on_reset_stack)
+        self.btn_reset.pack(side="left", padx=4)
+        self.lbl_stack = tk.Label(r2c, text="integrating: 0 frames")
+        self.lbl_stack.pack(side="left", padx=8)
+        self.lbl_stars = tk.Label(r2c, text="stars: -")
         self.lbl_stars.pack(side="left", padx=8)
 
         # plate solving
@@ -1559,8 +1595,14 @@ class App:
         self.var_solver = tk.StringVar(value=self.args.solver)
         tk.Entry(r3, textvariable=self.var_solver, width=16).pack(side="left")
         tk.Label(r3, text="scale arcsec/px low/high:").pack(side="left")
+        # Persisted per camera AND per resolution: the plate scale doubles
+        # when the bridge bins 4K to 1080p, so one saved pair for the device
+        # would be wrong in the other mode. Retyping it every session was
+        # the single most tedious part of a solve.
         self.var_sc_lo = tk.DoubleVar(value=0.0)
         self.var_sc_hi = tk.DoubleVar(value=0.0)
+        self.var_sc_lo.trace_add("write", self._save_solve_scale)
+        self.var_sc_hi.trace_add("write", self._save_solve_scale)
         tk.Entry(r3, textvariable=self.var_sc_lo, width=6).pack(side="left")
         tk.Entry(r3, textvariable=self.var_sc_hi, width=6).pack(side="left")
         self.btn_solve = tk.Button(r3, text="Plate solve stack",
@@ -1628,23 +1670,26 @@ class App:
         # Frame-relative (labelled X/Y) until a bolt is turned enough
         # times for cluster_move_axes to auto-calibrate which pixel
         # direction is which bolt.
+        # ABSOLUTE correction: point higher/lower, left/right, in real
+        # degrees. Needs latitude + longitude + the clock, and unlike the
+        # bolt decomposition below it works from a SINGLE solve with no
+        # rotation, no calibration and no sign ambiguity -- so it goes
+        # first, being the one to act on when far out.
+        r4d = tk.Frame(lf_solve); r4d.pack(fill="x", pady=(0, 2))
+        self.lbl_altaz = tk.Label(
+            r4d, text="Mount: needs --latitude and --longitude for the "
+                      "absolute point-higher/left-right readout",
+            font=("TkDefaultFont", 11, "bold"), fg="#808080", anchor="w")
+        self.lbl_altaz.pack(side="left", fill="x")
+
         r4c = tk.Frame(lf_solve); r4c.pack(fill="x", pady=(0, 2))
         self.lbl_bolts = tk.Label(
             r4c, text="Adjust: no axis fit yet",
             font=("TkDefaultFont", 10, "bold"), fg="#c08000", anchor="w")
         self.lbl_bolts.pack(side="left", fill="x")
-        # The two alignment visualisations open in their own windows rather
-        # than the aux column: they are read at the mount, in the dark, and
-        # want the space. Both track live through the _draw_* fan-out.
-        tk.Button(r4c, text="Wide field",
-                  command=lambda: self._popout_graph("wide")).pack(
-                      side="right", padx=2)
-        tk.Button(r4c, text="Mount adjustment",
-                  command=lambda: self._popout_graph("mount")).pack(
-                      side="right", padx=2)
 
         # log
-        self.txt = tk.Text(self.root, height=7, state="disabled",
+        self.txt = tk.Text(self.root, height=4, state="disabled",
                            font=("TkFixedFont", 9))
         self.txt.pack(fill="x", padx=4, pady=4)
 
@@ -1691,6 +1736,118 @@ class App:
         except (tk.TclError, ValueError):
             pass
 
+    def _fit_to_screen(self, min_canvas=200):
+        """Shrink the two image canvases until the whole window fits on the
+        screen, and report if it still cannot.
+
+        Measured rather than assumed: the control column's height depends on
+        the theme's fonts, the DPI scaling and which mode is showing, so any
+        hard-coded canvas size is right on exactly one machine. Instead, ask
+        Tk what the laid-out window wants, subtract what the screen has, and
+        take the difference out of the canvases -- which are the only elastic
+        thing here, and the thing the user just authorised shrinking.
+
+        LIGHT mode is measured because it is the taller of the two; sizing to
+        DARK would leave the mode switch overflowing again."""
+        was = self.var_mode.get()
+        self.var_mode.set("light")
+        self._apply_mode_layout()
+        self.root.update_idletasks()
+        need0 = self.root.winfo_reqheight()
+        # leave room for title bar and taskbar; conservative on purpose
+        avail = self.root.winfo_screenheight() - 96
+        if need0 <= avail:
+            self.var_mode.set(was)
+            self._apply_mode_layout()
+            return
+
+        # Both columns of the display row have to give. The aux column
+        # (pole 220 + noise 110 + hist 110) is TALLER than the image
+        # canvases, so shrinking the images alone moves nothing -- the row
+        # is as tall as its tallest child either way.
+        sizes = {self.canvas_live: CANVAS_H, self.canvas_stack: CANVAS_H,
+                 self.canvas_pole: AUX_W, self.canvas_noise: 110,
+                 self.canvas_hist: 110}
+        floors = {self.canvas_live: min_canvas, self.canvas_stack: min_canvas,
+                  self.canvas_pole: 130, self.canvas_noise: 64,
+                  self.canvas_hist: 64}
+        # Solve by iteration rather than algebra: the relationship between a
+        # canvas height and the window's requested height runs through pack
+        # geometry, padding and label metrics, so measuring beats modelling.
+        f = 1.0
+        for _ in range(8):
+            need = self.root.winfo_reqheight()
+            if need <= avail:
+                break
+            f *= max(0.55, (avail - (need - self._disp_height())) /
+                     max(1, self._disp_height()))
+            for cv, base in sizes.items():
+                cv.configure(height=max(floors[cv], int(base * f)))
+            self.root.update_idletasks()
+        final = self.root.winfo_reqheight()
+        self.log(f"display fitted to screen: image canvases {CANVAS_H}→"
+                 f"{self.canvas_live.cget('height')}px, aux "
+                 f"{AUX_W}→{self.canvas_pole.cget('height')}px "
+                 f"(needed {need0}px, screen offers {avail}px)")
+        if final > avail:
+            self.log(f"!! still {final - avail}px too tall at the minimum "
+                     "canvas sizes -- lower rows may be off screen. F3/F4/F5 "
+                     "open the mount, wide-field and stacking windows, which "
+                     "are reachable regardless.")
+        self.dbg.log("ui", action="fit_to_screen", required=need0,
+                     available=avail, final=final,
+                     canvas_h=self.canvas_live.cget("height"),
+                     aux_h=self.canvas_pole.cget("height"))
+        self.var_mode.set(was)
+        self._apply_mode_layout()
+
+    def _disp_height(self):
+        """Current height of the image+aux display row."""
+        self.root.update_idletasks()
+        return max(self.canvas_live.master.winfo_reqheight(),
+                   self.canvas_pole.master.master.winfo_reqheight())
+
+    def _show_stack_options(self):
+        """Raise the stacking options window (created withdrawn at startup,
+        so its widgets and Tk variables exist from the beginning and the
+        workers never have to care whether it is on screen)."""
+        self.win_stack.deiconify()
+        self._raise_popout(self.win_stack)
+        self.dbg.log("ui", action="stack_options_open")
+
+    def _save_solve_scale(self, *a):
+        """Persist the solver's scale hint for THIS camera at THIS resolution.
+        Guarded: the trace fires while the entry is half-typed ('3.' is not a
+        float yet), and during startup before a resolution is known."""
+        if getattr(self, "_restoring_prefs", False):
+            return
+        w, h = self.current_size()
+        if not w:
+            return
+        try:
+            lo = float(self.var_sc_lo.get())
+            hi = float(self.var_sc_hi.get())
+        except (tk.TclError, ValueError):
+            return
+        scales = self._load_prefs().get("solve_scale", {})
+        scales[f"{w}x{h}"] = [lo, hi]
+        self._save_prefs(solve_scale=scales)
+
+    def _restore_solve_scale(self, w, h):
+        """Load the saved scale hint for this resolution, if any."""
+        saved = self._load_prefs().get("solve_scale", {}).get(f"{w}x{h}")
+        if not saved or len(saved) != 2:
+            return
+        self._restoring_prefs = True          # don't re-save what we just read
+        try:
+            self.var_sc_lo.set(saved[0])
+            self.var_sc_hi.set(saved[1])
+        finally:
+            self._restoring_prefs = False
+        if saved[0] or saved[1]:
+            self.log(f"solver scale hint restored: "
+                     f"{saved[0]:g}..{saved[1]:g} arcsec/px for {w}x{h}")
+
     def _on_stack_max_change(self, *a):
         try:
             self.stack_max_value = max(1, int(self.var_stack_max.get()))
@@ -1729,6 +1886,52 @@ class App:
         for widget, modes, kw in self._mode_widgets:
             if mode in modes:
                 widget.pack(**kw)
+
+    def _update_altaz(self, axis_ra, axis_dec, t):
+        """Absolute mount correction from one solved axis direction.
+
+        This is the readout to act on when far out: it needs no shaft
+        rotation, no bolt calibration and has no sign ambiguity, because it
+        is computed in horizon coordinates rather than decomposed onto
+        empirically-learned pixel directions. Requires latitude AND
+        longitude -- the hour angle is what makes 'higher' and 'left' mean
+        anything, and that needs local sidereal time."""
+        lat, lon = self.args.latitude, self.args.longitude
+        if lat is None or lon is None:
+            missing = " and ".join(
+                n for n, v in (("--latitude", lat), ("--longitude", lon))
+                if v is None)
+            self.lbl_altaz.configure(
+                text=f"Mount: needs {missing} for the absolute "
+                     "point-higher/left-right readout", fg="#808080")
+            return
+        try:
+            pa = sky.polar_alignment(axis_ra, axis_dec, lat, lon, t)
+        except Exception as e:
+            self.dbg.exc("error", where="polar_alignment")
+            self.lbl_altaz.configure(text=f"Mount: {e}", fg="#802000")
+            return
+        self.polar_abs = pa
+        err = pa["sky_error_arcmin"]
+        col = ("#00c060" if err < 5 else "#c08000" if err < 60 else "#802000")
+        self.lbl_altaz.configure(
+            text=f"MOUNT: {pa['instruction_alt']}  ·  {pa['instruction_az']}"
+                 f"   [axis alt {pa['axis_alt_deg']:.2f}° az "
+                 f"{pa['axis_az_deg']:.2f}° → pole alt "
+                 f"{pa['pole_alt_deg']:.2f}° az {pa['pole_az_deg']:.0f}°, "
+                 f"off {err:.1f}′]",
+            fg=col)
+        self.log(f"MOUNT: {pa['instruction_alt']}; {pa['instruction_az']} "
+                 f"(sky error {err:.1f}', precession term "
+                 f"{pa['precession_shift_arcmin']:.1f}')")
+        self.dbg.log("polar_alignment_abs",
+                     d_alt_deg=round(pa["d_alt_deg"], 5),
+                     d_az_deg=round(pa["d_az_deg"], 5),
+                     sky_error_arcmin=round(err, 3),
+                     axis_alt=round(pa["axis_alt_deg"], 4),
+                     axis_az=round(pa["axis_az_deg"], 4),
+                     lst_deg=round(pa["lst_deg"], 4))
+        self._draw_mount()
 
     def _set_mode_banner(self):
         dark = self.var_mode.get() == "dark"
@@ -2219,10 +2422,18 @@ class App:
         W = W if W > 60 else AUX_W          # not yet mapped (or tiny)
         H = H if H > 60 else 320
         corr = self.bolt_corr
-        if not corr:
+        pa = self.polar_abs
+        if not corr and not pa:
             cv.create_text(W // 2, H // 2, fill="#4a5a6c", justify="center",
                            text="no axis fit yet\n\nsolve, rotate the mount "
-                                "≥15° in RA,\nsolve again")
+                                "≥15° in RA,\nsolve again\n\n(with --latitude "
+                                "and --longitude the\nabsolute readout needs "
+                                "only one solve)")
+            return
+        if not corr:
+            # absolute correction only: no bolt decomposition yet, but the
+            # two numbers that matter are already known
+            self._render_mount_absolute(cv, W, H, pa)
             return
 
         az = corr["az"]
@@ -2252,9 +2463,19 @@ class App:
         # footer first: it is fixed-height, and the two panes share what is
         # left, so nothing can be pushed off the bottom edge
         foot = 40 if self.args.latitude is not None else 26
+        if pa:
+            foot += 18       # room for the absolute line above the footer
         top = 44          # both calibrated and uncalibrated draw a note line
         avail = max(80, H - top - foot - 12)   # 12 = altitude pane's offset
         pane = avail // 2
+        if pa:
+            # Absolute degrees outrank the relative decomposition, so they are
+            # stated plainly even when the bolt fit exists -- the geometry
+            # below is exaggerated and sign-ambiguous; this line is neither.
+            cv.create_text(W // 2, H - foot + 6, fill="#00ff80",
+                           font=("TkDefaultFont", 10, "bold"),
+                           text=f"ABSOLUTE: {pa['instruction_alt']}   ·   "
+                                f"{pa['instruction_az']}")
 
         # ---- AZIMUTH: seen from above ----
         acy = top + pane // 2
@@ -2379,6 +2600,61 @@ class App:
                            justify="center", font=("TkDefaultFont", 8),
                            text=f"refraction at the pole ≈ {refr:.1f}′ — a "
                                 "floor to be aware of, not subtracted")
+
+    def _render_mount_absolute(self, cv, W, H, pa):
+        """The two absolute adjustments, big, with nothing else competing.
+
+        Drawn when there is no bolt fit yet -- which is the common case when
+        far out, and precisely when this readout is the only guidance
+        available. No exaggerated geometry here: these are real degrees, so
+        the numbers ARE the picture."""
+        err = pa["sky_error_arcmin"]
+        col = ("#00ff80" if err < 5 else "#e0c060" if err < 60 else "#ff6040")
+        cv.create_text(W // 2, 18, fill=col,
+                       font=("TkDefaultFont", 12, "bold"),
+                       text=f"axis → pole: {sky._fmt_ang(err / 60.0)}")
+        cv.create_text(W // 2, 38, fill="#9fb0c4",
+                       font=("TkDefaultFont", 8),
+                       text="absolute correction — one solve, no rotation, "
+                            "no sign ambiguity")
+
+        cy = H // 2
+        # ALTITUDE
+        up = pa["alt_up"]
+        cv.create_text(W // 2, cy - 70, fill="#80a0c0",
+                       font=("TkDefaultFont", 9, "bold"), text="ALTITUDE")
+        cv.create_text(W // 2, cy - 40, fill="#ffb000",
+                       font=("TkDefaultFont", 20, "bold"),
+                       text=("▲  POINT HIGHER" if up else "▼  POINT LOWER"))
+        cv.create_text(W // 2, cy - 12, fill="#ffb000",
+                       font=("TkDefaultFont", 18, "bold"),
+                       text=sky._fmt_ang(abs(pa["d_alt_deg"])))
+        # AZIMUTH
+        right = pa["az_right"]
+        cv.create_text(W // 2, cy + 34, fill="#80a0c0",
+                       font=("TkDefaultFont", 9, "bold"), text="AZIMUTH")
+        cv.create_text(W // 2, cy + 64, fill="#ffb000",
+                       font=("TkDefaultFont", 20, "bold"),
+                       text=("ROTATE RIGHT  ▶" if right else "◀  ROTATE LEFT"))
+        cv.create_text(W // 2, cy + 92, fill="#ffb000",
+                       font=("TkDefaultFont", 18, "bold"),
+                       text=sky._fmt_ang(abs(pa["d_az_deg"])))
+        cv.create_text(W // 2, cy + 116, fill="#6a7a8c",
+                       font=("TkDefaultFont", 8),
+                       text="right/left as you stand behind the mount "
+                            "facing the pole")
+
+        cv.create_text(W // 2, H - 40, fill="#6a7a8c", width=W - 16,
+                       justify="center", font=("TkDefaultFont", 8),
+                       text=f"axis alt {pa['axis_alt_deg']:.3f}°  az "
+                            f"{pa['axis_az_deg']:.3f}°   →   pole alt "
+                            f"{pa['pole_alt_deg']:.3f}°  az "
+                            f"{pa['pole_az_deg']:.0f}°")
+        cv.create_text(W // 2, H - 20, fill="#6a7a8c", width=W - 16,
+                       justify="center", font=("TkDefaultFont", 8),
+                       text="azimuth figure is adjuster rotation; sky motion "
+                            f"is ×cos(alt). Precession J2000→date applied "
+                            f"({pa['precession_shift_arcmin']:.1f}′).")
 
     # ------------------------------------------------------------------
     # Wide-field reference view
@@ -3122,6 +3398,7 @@ class App:
         saved_roi = self._load_prefs().get("roi", {}).get(f"{w}x{h}")
         if saved_roi and len(saved_roi) == 4:
             self._set_roi(*saved_roi, source="restored")
+        self._restore_solve_scale(w, h)
         d = self.data_dir()
         mp = os.path.join(d, f"master_{w}x{h}.npy")
         dp = os.path.join(d, f"defects_{w}x{h}.txt")
@@ -5485,6 +5762,9 @@ class App:
                                            f"{col['clock']} o'clock"
                                          + refr_txt,
                                     fg="#00c060")
+                                # absolute mount correction: the actionable
+                                # form, from this one solve
+                                self._update_altaz(axis_ra, axis_dec, now_t)
                                 self._draw_bullseye()
                                 self._draw_wide()
                                 self.dbg.log(
@@ -5744,6 +6024,17 @@ def main():
                          "means the same exposure time on either source. "
                          "Override for a driver you would rather address "
                          "in other units.")
+    ap.add_argument("--longitude", type=float, default=None,
+                    help="observing site longitude in degrees, EAST-positive "
+                         "(so Adelaide is +138.6, London -0.1). With "
+                         "--latitude this unlocks the ABSOLUTE polar "
+                         "alignment readout: point higher/lower and "
+                         "left/right in real degrees, from a SINGLE solve -- "
+                         "no >=15 deg rotation, no bolt calibration, no sign "
+                         "ambiguity. Longitude is needed because the "
+                         "correction is decomposed in horizon coordinates, "
+                         "which requires the hour angle and so local "
+                         "sidereal time.")
     ap.add_argument("--latitude", type=float, default=None,
                     help="observing site latitude in degrees (+N/-S) -- "
                          "the celestial pole sits at exactly this true "

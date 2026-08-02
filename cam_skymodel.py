@@ -1146,6 +1146,199 @@ def refraction_arcmin(true_alt_deg, pressure_hpa=1010.0, temp_c=10.0):
 
 
 # ----------------------------------------------------------------------------
+# Absolute polar alignment: "point higher / lower, left / right"
+#
+# Everything else in this file works in relative terms -- the axis pixel, the
+# axis->pole vector, its decomposition onto empirically-learned bolt directions
+# with signs that are only meaningful up to whichever way the calibration
+# happened to fold. That is fine once you are close, and useless when you are
+# not: it needs two solves either side of a >=15 deg rotation before it says
+# anything at all, and then it tells you to turn something and see whether the
+# number grows.
+#
+# The absolute form needs no rotation, no bolt calibration and no sign
+# ambiguity, and works from ONE solve: convert where the RA axis points into
+# horizon coordinates, compare against where the pole actually is, and report
+# the difference as two adjustments in real degrees. That conversion needs the
+# hour angle, hence local sidereal time, hence longitude and a clock -- which
+# is exactly why longitude is required here and nowhere else in the project.
+#
+# Two corrections that matter at the arcminute level and are easy to skip:
+#
+#  * PRECESSION. Plate solves come back in J2000, and the celestial pole moves
+#    ~20.04"/yr, so by the mid-2020s the pole of date sits ~8-9' from the J2000
+#    pole. Comparing a J2000 declination against "90 deg" therefore carries an
+#    ~8.7' systematic -- larger than the alignment most people are chasing. So
+#    the axis is precessed J2000 -> date and everything is done in the frame of
+#    date, where the pole really is at +/-90.
+#
+#  * REFRACTION is deliberately NOT applied. The plate solve fits observed
+#    pixels to catalogue positions, so its WCS already absorbs the locally
+#    uniform part of refraction and reports in the true (airless) frame -- the
+#    same frame the pole of date lives in. Applying refraction on top would
+#    double-count it. It stays an informational figure (refraction_arcmin).
+#
+# Nutation (~9") and aberration (~20") are omitted: both are far inside the
+# arcminute this is trying to serve, and the axis is a mechanical direction
+# rather than a light path.
+# ----------------------------------------------------------------------------
+
+def julian_date(unix_t):
+    """Julian Date from a POSIX timestamp (UTC). The Unix epoch is
+    JD 2440587.5, and a day is 86400 SI seconds -- close enough to a UT day
+    for sidereal purposes at this precision (leap seconds are ~1s, i.e. ~15"
+    of Earth rotation, well inside the arcminute this feeds)."""
+    return unix_t / 86400.0 + 2440587.5
+
+
+def gmst_deg(jd):
+    """Greenwich Mean Sidereal Time in degrees, 0-360.
+
+    IAU 1982 series in the form used with the JD directly. At JD 2451545.0
+    (2000-01-01 12:00 UT) this returns 280.46061837 deg, which is the
+    defining value and the natural way to check it."""
+    d = jd - 2451545.0
+    t = d / 36525.0
+    g = (280.46061837 + 360.98564736629 * d
+         + 0.000387933 * t * t - t * t * t / 38710000.0)
+    return g % 360.0
+
+
+def lst_deg(unix_t, lon_east_deg):
+    """Local (mean) sidereal time in degrees. Longitude is EAST-positive,
+    the sign convention the rest of this project uses (match_tle's --lon is
+    the same)."""
+    return (gmst_deg(julian_date(unix_t)) + lon_east_deg) % 360.0
+
+
+def precess_from_j2000(ra_deg, dec_deg, unix_t):
+    """Precess equatorial coordinates from J2000 to the mean equinox of
+    date. IAU 1976 angles (Lieske), rigorous rotation rather than the
+    first-order approximation, because near the pole the first-order form
+    degrades exactly where this is used.
+
+    Returns (ra_deg, dec_deg) of date."""
+    t = (julian_date(unix_t) - 2451545.0) / 36525.0
+    # arcseconds -> radians
+    s = math.pi / (180.0 * 3600.0)
+    zeta = (2306.2181 * t + 0.30188 * t * t + 0.017998 * t ** 3) * s
+    z = (2306.2181 * t + 1.09468 * t * t + 0.018203 * t ** 3) * s
+    theta = (2004.3109 * t - 0.42665 * t * t - 0.041833 * t ** 3) * s
+    a0 = math.radians(ra_deg)
+    d0 = math.radians(dec_deg)
+    A = math.cos(d0) * math.sin(a0 + zeta)
+    B = (math.cos(theta) * math.cos(d0) * math.cos(a0 + zeta)
+         - math.sin(theta) * math.sin(d0))
+    C = (math.sin(theta) * math.cos(d0) * math.cos(a0 + zeta)
+         + math.cos(theta) * math.sin(d0))
+    ra = (math.degrees(math.atan2(A, B) + z)) % 360.0
+    dec = math.degrees(math.asin(max(-1.0, min(1.0, C))))
+    return ra, dec
+
+
+def radec_to_altaz(ra_deg, dec_deg, lat_deg, lst_deg_):
+    """Equatorial (of date) -> horizon. Azimuth is measured from NORTH,
+    increasing toward EAST (the surveying convention: N=0, E=90, S=180,
+    W=270). Returns (alt_deg, az_deg).
+
+    Sanity anchors, both of which this must satisfy exactly: the north
+    celestial pole sits at alt=+lat, az=0 for a northern observer, and the
+    south celestial pole at alt=|lat|, az=180 for a southern one."""
+    H = math.radians((lst_deg_ - ra_deg) % 360.0)     # hour angle
+    d = math.radians(dec_deg)
+    p = math.radians(lat_deg)
+    sin_alt = math.sin(d) * math.sin(p) + math.cos(d) * math.cos(p) * math.cos(H)
+    alt = math.asin(max(-1.0, min(1.0, sin_alt)))
+    az = math.atan2(-math.cos(d) * math.sin(H),
+                    math.sin(d) * math.cos(p) - math.cos(d) * math.sin(p) * math.cos(H))
+    return math.degrees(alt), math.degrees(az) % 360.0
+
+
+def _wrap180(deg):
+    """Fold an angle difference into (-180, +180]."""
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+def polar_alignment(axis_ra_j2000, axis_dec_j2000, lat_deg, lon_east_deg,
+                    unix_t):
+    """Absolute mount correction from a single solved RA-axis direction.
+
+    axis_ra/dec are the J2000 coordinates the axis pixel maps to through the
+    plate solve's WCS. lat/lon are the observing site (lon EAST-positive).
+
+    Returns a dict with the two numbers that matter -- how much higher or
+    lower to point, and how far left or right -- plus the intermediate
+    quantities, because a polar-alignment number you cannot check is a number
+    you should not trust.
+
+    Sign conventions, stated because this is where such tools go wrong:
+      d_alt > 0  -> the axis is BELOW the pole, raise it.
+      d_az  > 0  -> rotate the mount toward INCREASING azimuth, which is to
+                    your RIGHT when standing behind the mount looking along
+                    the polar axis. This holds in BOTH hemispheres: azimuth
+                    increases clockwise seen from above, so facing north
+                    (az 0) or facing south (az 180), increasing azimuth is
+                    a turn to the right either way.
+
+    d_az is the rotation to APPLY to the azimuth adjuster, not the resulting
+    sky motion -- those differ by cos(altitude), and the adjuster is what you
+    are actually holding. sky_arcmin reports the true angular error.
+    """
+    lst = lst_deg(unix_t, lon_east_deg)
+    ra_d, dec_d = precess_from_j2000(axis_ra_j2000, axis_dec_j2000, unix_t)
+    alt_axis, az_axis = radec_to_altaz(ra_d, dec_d, lat_deg, lst)
+
+    south = lat_deg < 0
+    # the pole of date is exactly +/-90 in the frame of date, so its horizon
+    # position is exact and needs no conversion: altitude |lat|, due N or S
+    alt_pole = abs(lat_deg)
+    az_pole = 180.0 if south else 0.0
+
+    d_alt = alt_pole - alt_axis
+    d_az = _wrap180(az_pole - az_axis)
+    # true angular separation on the sky (the honest error figure), from the
+    # precessed declination -- independent of the alt/az decomposition
+    sky_deg = 90.0 - abs(dec_d)
+
+    return {
+        "ok": True,
+        "d_alt_deg": d_alt,
+        "d_az_deg": d_az,
+        "alt_up": bool(d_alt > 0),
+        "az_right": bool(d_az > 0),
+        "instruction_alt": ("point HIGHER by " if d_alt > 0 else
+                            "point LOWER by ") + _fmt_ang(abs(d_alt)),
+        "instruction_az": ("rotate RIGHT by " if d_az > 0 else
+                           "rotate LEFT by ") + _fmt_ang(abs(d_az))
+                          + " (facing the pole)",
+        "sky_error_deg": sky_deg,
+        "sky_error_arcmin": sky_deg * 60.0,
+        "axis_alt_deg": alt_axis,
+        "axis_az_deg": az_axis,
+        "pole_alt_deg": alt_pole,
+        "pole_az_deg": az_pole,
+        "axis_radec_of_date": [ra_d, dec_d],
+        "axis_radec_j2000": [axis_ra_j2000, axis_dec_j2000],
+        "precession_shift_arcmin":
+            60.0 * abs((90.0 - abs(dec_d)) - (90.0 - abs(axis_dec_j2000))),
+        "lst_deg": lst,
+        "hemisphere": "south" if south else "north",
+        "note": ("d_az is the azimuth-adjuster rotation to apply; sky motion "
+                 "is d_az*cos(alt). Refraction is deliberately not applied -- "
+                 "the WCS already reports in the true frame."),
+    }
+
+
+def _fmt_ang(deg):
+    """Angle as the unit a human would use at that size."""
+    if deg < 1.0 / 60.0:
+        return f"{deg * 3600.0:.0f}\""
+    if deg < 1.0:
+        return f"{deg * 60.0:.1f}'"
+    return f"{deg:.2f}°"
+
+
+# ----------------------------------------------------------------------------
 # Star-hop route planning (Phase 6): no leaps of faith
 # ----------------------------------------------------------------------------
 
