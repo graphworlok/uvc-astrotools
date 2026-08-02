@@ -118,8 +118,6 @@ import platform
 import queue
 import re
 import shutil
-import socket
-import struct
 import subprocess
 import sys
 import tempfile
@@ -127,6 +125,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 
@@ -847,40 +846,108 @@ def radec_text(ra_deg, dec_deg):
     return f"RA {hh:02d}h{mm:02d}m{ss:02d}s  Dec {sign}{dd:02d}°{dm:02d}'"
 
 
-def encode_stellarium_packet(ra_deg, dec_deg, t=None):
-    """MessageCurrentPosition, Stellarium Telescope Protocol v1.0 (server
-    -> client position report; verified against the canonical spec,
-    Johannes Gajdosik 2006): 24 bytes, little-endian --
-    LENGTH(u16)=24, TYPE(u16)=0, TIME(i64 microseconds since epoch,
-    unused by Stellarium but sent for correctness), RA(u32, full circle
-    = 2**32), DEC(i32, +/-90deg = +/-0x40000000), STATUS(i32)=0."""
-    t_us = int((t if t is not None else time.time()) * 1_000_000)
-    ra = round(ra_deg / 360.0 * 2 ** 32) % 2 ** 32
-    dec = round(dec_deg / 90.0 * 0x40000000)
-    return struct.pack("<HHqIii", 24, 0, t_us, ra, dec, 0)
+def radec_to_j2000_vector(ra_deg, dec_deg):
+    """RA/Dec (J2000, degrees) -> the rectangular unit vector Stellarium's
+    Remote Control API expects for a J2000 direction."""
+    r, d = math.radians(ra_deg), math.radians(dec_deg)
+    return [math.cos(d) * math.cos(r), math.cos(d) * math.sin(r), math.sin(d)]
 
 
-class StellariumUDPSender:
-    """Fire-and-forget UDP position feed for Stellarium's Telescope
-    Control plugin. Stellarium itself only speaks TCP (its telescope
-    protocol is TCP-only) -- point a UDP->TCP relay (ncat/socat, see
-    README) at the port Stellarium connects to, and send these datagrams
-    at the relay's UDP side. No listening, no thread: one UDP socket, one
-    sendto() per update, called directly from the capture worker."""
+class StellariumRemoteControl:
+    """Position feed for Stellarium's stock **Remote Control** plugin.
 
-    def __init__(self, host, port):
-        self.addr = (host, port)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    This replaces an earlier Telescope-Control-protocol feed that spoke
+    binary MessageCurrentPosition over UDP and needed an external UDP->TCP
+    relay (ncat/socat) in front of it, because that protocol is TCP-only and
+    expects Stellarium to dial IN. Remote Control is a plain HTTP API that
+    Stellarium serves itself, so there is no relay, no listener, and nothing
+    to configure beyond enabling the plugin -- and it can be verified with
+    curl, which the old path could not.
+
+    POSTs the camera's position to /api/main/focus so Stellarium centres on
+    (and selects at) wherever the camera is looking.
+
+    Threaded on purpose. An HTTP round trip can block for as long as the
+    timeout, and this is fed from the capture worker: send() only rebinds a
+    slot and sets an event, so a slow or absent Stellarium can never stall a
+    capture. The sender also rate-limits, because bursts arrive far faster
+    than a sky chart needs redrawing."""
+
+    def __init__(self, host, port, mode="center", min_interval=1.0,
+                 timeout=2.0, on_log=None):
+        self.base = f"http://{host}:{port}/api"
+        self.mode = mode
+        self.min_interval = min_interval
+        self.timeout = timeout
+        self._log = on_log or (lambda m: None)
+        self._latest = None          # (ra, dec); rebind is atomic under GIL
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self.sent = 0
+        self.errors = 0
+        self._err_streak = 0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def probe(self):
+        """One synchronous GET /api/main/status, so enabling the feed can
+        say whether Stellarium is actually there instead of failing silently
+        for the rest of the session. Returns (ok, message)."""
+        try:
+            with urllib.request.urlopen(f"{self.base}/main/status",
+                                        timeout=self.timeout) as r:
+                st = json.loads(r.read().decode("utf-8", "replace"))
+            loc = (st.get("location") or {}).get("name")
+            fov = (st.get("view") or {}).get("fov")
+            return True, ("connected" + (f" (location {loc})" if loc else "")
+                          + (f", FOV {fov:.1f}°" if isinstance(fov, (int, float))
+                             else ""))
+        except Exception as e:
+            return False, str(e)
 
     def send(self, ra_deg, dec_deg):
+        """Non-blocking. Called from the capture worker."""
+        self._latest = (ra_deg, dec_deg)
+        self._wake.set()
+
+    def _run(self):
+        last = 0.0
+        while not self._stop.is_set():
+            self._wake.wait(timeout=1.0)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
+            v = self._latest
+            if v is None:
+                continue
+            wait = self.min_interval - (time.monotonic() - last)
+            if wait > 0 and self._stop.wait(wait):
+                break
+            last = time.monotonic()
+            self._post(*v)
+
+    def _post(self, ra_deg, dec_deg):
+        data = urllib.parse.urlencode({
+            "position": json.dumps(radec_to_j2000_vector(ra_deg, dec_deg)),
+            "mode": self.mode,
+        }).encode("ascii")
         try:
-            self.sock.sendto(encode_stellarium_packet(ra_deg, dec_deg),
-                             self.addr)
-        except OSError:
-            pass   # unreachable/no route -- never break the capture loop
+            with urllib.request.urlopen(f"{self.base}/main/focus", data=data,
+                                        timeout=self.timeout) as r:
+                r.read()
+            self.sent += 1
+            self._err_streak = 0
+        except Exception as e:
+            self.errors += 1
+            self._err_streak += 1
+            # once per outage, not once per burst
+            if self._err_streak == 1:
+                self._log(f"Stellarium feed error: {e}")
 
     def close(self):
-        self.sock.close()
+        self._stop.set()
+        self._wake.set()
+        self.thread.join(timeout=2.0)
 
 
 # ----------------------------------------------------------------------------
@@ -1154,7 +1221,7 @@ class App:
         self.pointing_anchor = None
         self._pointing_prev_stars = None  # last burst's confirmed stars
         self.pointing_radec = None        # (ra_deg, dec_deg), latest
-        self.stellarium_sender = None     # StellariumUDPSender, if enabled
+        self.stellarium_sender = None     # StellariumRemoteControl, if on
 
         # INDI: one client shared by the camera source and the mount, since
         # indiserver multiplexes every device over the one connection.
@@ -1496,14 +1563,14 @@ class App:
                                   command=self.on_test_image)
         self.btn_test.pack(side="left", padx=(8, 2))
 
-        # Stellarium: stream the catalogue-free pointing anchor's RA/Dec
-        # as UDP MessageCurrentPosition packets -- a UDP->TCP relay
-        # (ncat/socat, see README) feeds Stellarium's own Telescope
-        # Control plugin, so its sky chart shows a live reticle tracking
-        # wherever this camera is pointed. Needs one "Solve" first.
+        # Stellarium: POST the catalogue-free pointing anchor's RA/Dec to
+        # the stock Remote Control plugin's HTTP API, so its sky chart
+        # follows wherever this camera is pointed. Stellarium serves that
+        # API itself -- no relay, no plugin beyond the one that ships with
+        # it. Needs one "Solve" first to have a pointing anchor.
         r1d = tk.Frame(lf_cal)
         self._mode_pack(r1d, ("light",), fill="x", pady=1)
-        tk.Label(r1d, text="Stellarium UDP:", width=17,
+        tk.Label(r1d, text="Stellarium:", width=17,
                  anchor="w").pack(side="left")
         tk.Label(r1d, text="host:").pack(side="left")
         self.var_stel_host = tk.StringVar(value=self.args.stellarium_host)
@@ -3633,35 +3700,48 @@ class App:
                      port=port, urls=urls)
 
     def on_stellarium_toggle(self):
-        """Toggle the Stellarium UDP position feed on/off."""
+        """Toggle the Stellarium Remote Control position feed on/off."""
         if self.stellarium_sender is not None:
-            self.stellarium_sender.close()
+            s = self.stellarium_sender
+            s.close()
             self.stellarium_sender = None
             self.btn_stellarium.configure(relief="raised",
                                           text="Send to Stellarium")
-            self.log("Stellarium UDP feed stopped")
-            self.dbg.log("ui", action="stellarium_sender", state="stopped")
+            self.log(f"Stellarium feed stopped ({s.sent} positions sent, "
+                     f"{s.errors} errors)")
+            self.dbg.log("ui", action="stellarium_sender", state="stopped",
+                         sent=s.sent, errors=s.errors)
             return
         host = self.var_stel_host.get().strip() or self.args.stellarium_host
         try:
             port = int(self.var_stel_port.get())
         except (tk.TclError, ValueError):
             port = self.args.stellarium_port
-        try:
-            self.stellarium_sender = StellariumUDPSender(host, port)
-        except OSError as e:
-            self.log(f"could not start the Stellarium UDP feed to "
-                     f"{host}:{port}: {e}")
-            self.set_status("Stellarium feed failed to start", fg="#ff8060")
+        sender = StellariumRemoteControl(host, port, on_log=self.log)
+        # Verify BEFORE claiming success: the old UDP feed could not tell a
+        # working link from a black hole, so a misconfigured port looked
+        # exactly like a working one until you noticed the chart never moved.
+        ok, msg = sender.probe()
+        if not ok:
+            sender.close()
+            self.log(f"Stellarium Remote Control not reachable at "
+                     f"{host}:{port}/api -- {msg}. Enable the Remote Control "
+                     "plugin (Configuration → Plugins → Remote Control → "
+                     "'Load at startup' + Configure → Server enabled) and "
+                     "check the port matches.")
+            self.set_status("Stellarium not reachable — see log", fg="#ff8060")
+            self.dbg.log("ui", action="stellarium_sender", state="failed",
+                         host=host, port=port, error=msg)
             return
+        self.stellarium_sender = sender
         self.btn_stellarium.configure(relief="sunken",
-                                      text=f"Sending -> {host}:{port}")
-        self.log(f"Stellarium UDP feed sending to {host}:{port} -- relay "
-                 "it to Stellarium's Telescope Control (TCP) with "
-                 "ncat/socat (see README); needs one Solve to have a "
-                 "pointing anchor to send")
+                                      text=f"Sending → {host}:{port}")
+        self.log(f"Stellarium Remote Control {host}:{port} — {msg}. The chart "
+                 "will follow the camera; needs one Solve first to have a "
+                 "pointing anchor.")
+        self.set_status(f"Stellarium linked on {host}:{port}", fg="#80ff80")
         self.dbg.log("ui", action="stellarium_sender", state="started",
-                     host=host, port=port)
+                     host=host, port=port, probe=msg)
 
     # ---------------- test image ----------------
 
@@ -5046,7 +5126,7 @@ class App:
                 # below (which needs polar-cap catalogue coverage) --
                 # tracks frame-to-frame star motion so ANY camera's
                 # pointing stays known between solves. Feeds the live
-                # RA/Dec annotation and the Stellarium UDP feed.
+                # RA/Dec annotation and the Stellarium feed.
                 if self.pointing_anchor is not None:
                     now_p = time.time()
                     if self._pointing_prev_stars:
@@ -6031,14 +6111,14 @@ def main():
                          "image ('Serve to browser'; / is the flat panel, "
                          "/test the test image; default 8799)")
     ap.add_argument("--stellarium-host", default="127.0.0.1",
-                    help="destination host for the Stellarium UDP "
-                         "position feed -- typically a local UDP->TCP "
-                         "relay (ncat/socat) in front of Stellarium's "
-                         "Telescope Control plugin (default 127.0.0.1)")
-    ap.add_argument("--stellarium-port", type=int, default=5005,
-                    help="destination UDP port for the Stellarium "
-                         "position feed (default 5005; not Stellarium's "
-                         "own TCP port -- see README for the relay step)")
+                    help="host running Stellarium with the Remote Control "
+                         "plugin enabled (default 127.0.0.1)")
+    ap.add_argument("--stellarium-port", type=int, default=8090,
+                    help="TCP port of Stellarium's Remote Control plugin "
+                         "(the plugin's own default is 8090; set it to "
+                         "match whatever the plugin's Configure dialog "
+                         "shows). No relay is involved -- Stellarium serves "
+                         "this HTTP API itself.")
     ap.add_argument("--indi-host", default="127.0.0.1",
                     help="indiserver host for the INDI camera/mount options "
                          "below (default 127.0.0.1; a remote indiserver "

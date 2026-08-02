@@ -652,25 +652,39 @@ back onto the anchor — the same trimmed-outlier rigid fit the catalogue path
 uses, just fed frame-to-frame star motion instead of catalogue predictions,
 so it needs no re-solve and no catalogue coverage to stay live. The current
 frame-centre RA/Dec is drawn on the stack view (a small crosshair + text)
-and, when the **Stellarium UDP** row is armed, streamed out as
-`MessageCurrentPosition` packets (Stellarium Telescope Protocol v1.0 —
-24-byte little-endian LENGTH/TYPE/TIME/RA/DEC/STATUS, verified against the
-canonical spec) so Stellarium's own sky chart can show a live reticle
-tracking wherever the camera is pointed. Stellarium's Telescope Control
-plugin only speaks TCP, so a small UDP→TCP relay sits between this tool and
-Stellarium — no Stellarium plugin or rebuild needed, stock Stellarium:
+and, when the **Stellarium** row is armed, POSTed to Stellarium's stock
+**Remote Control** plugin so its sky chart follows wherever the camera is
+pointed.
+
+Setup is just the plugin — Stellarium serves the HTTP API itself, so there is
+no relay, no listener and nothing to install:
+
+1. *Configuration* (`F2`) → *Plugins* → **Remote Control** → tick **Load at
+   startup**, then **Configure** → tick **Server enabled**. Restart Stellarium.
+2. Note the port in that dialog (the plugin's own default is **8090**).
+3. In this tool, set the **Stellarium** row's host/port to match and press
+   **Send to Stellarium**.
+
+The link is verified on connect with a `GET /api/main/status`, so a wrong port
+says so immediately instead of silently going nowhere. Positions go to
+`POST /api/main/focus` as a J2000 unit vector with `mode=center`. You can
+check the plugin independently with curl:
 
 ```sh
-# Windows (ncat, from nmap)
-ncat -l -p 10001 --sh-exec "ncat --udp -l -p 5005"
-# Linux/macOS (socat)
-socat TCP-LISTEN:10001,fork UDP-RECVFROM:5005,fork
+curl -s http://127.0.0.1:8090/api/main/status | head -c 200
 ```
 
-then in Stellarium: *Telescope Control* → configure a new telescope →
-"External software or a remote computer" → host `127.0.0.1`, port `10001`
-(the port Stellarium itself connects to; `--stellarium-port`/the UDP port
-row is where *this tool* sends, default 5005 — the relay bridges the two).
+The feed runs on its own thread with a single-slot mailbox and a 1 s rate
+limit: the capture worker only rebinds a value and sets an event, so a slow or
+absent Stellarium can never stall a capture, and a burst of frames does not
+turn into a burst of HTTP requests. Errors are logged once per outage rather
+than once per frame. It needs one **Solve** first, to have a pointing anchor.
+
+*(This replaces an earlier feed that spoke the binary Telescope Control
+protocol over UDP and needed an external `ncat`/`socat` UDP→TCP relay, because
+that protocol is TCP-only and expects Stellarium to dial in. The Remote
+Control API removes the relay entirely and is inspectable with curl, which the
+old path was not.)*
 
 ```sh
 python3 cam_observe.py --device /dev/video0 --data-dir ~/.local/share/PHD2
