@@ -599,6 +599,14 @@ the workbench, unrelated to alignment quality. Re-arms automatically after
 gets remounted or the OTA shifts in its rings, since the fixed pixel is
 only true for one specific physical mounting.
 
+Clearing the axis **also clears the bolt-axis calibration** (`bolts_WxH.json`
+and the move samples it was fitted from). Those are pixel-space directions,
+so the same remount or camera roll that invalidates the axis invalidates them
+too — and they fail worse: a stale axis is obviously stale, while stale bolt
+vectors keep reporting a confident, green, "calibrated" az/alt decomposition
+onto directions that no longer match the bolts. Adjustments fall back to
+frame-X/Y until a few one-bolt-at-a-time moves re-derive them.
+
 Once the axis pixel is known, the **Adjust:** status line (right below
 RA axis:) turns that distance into the actual instruction: `sky.bolt_correction`
 decomposes the axis→pole pixel vector onto the mount's two adjustment bolts

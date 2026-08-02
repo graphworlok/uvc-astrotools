@@ -2240,11 +2240,19 @@ class App:
                            font=("TkDefaultFont", 8),
                            text="bolt axes NOT calibrated — showing frame X/Y; "
                                 "turn one bolt a few times to calibrate")
+        else:
+            # the calibration is a pair of PIXEL directions, so it is only
+            # valid while the camera keeps the orientation it was learned in
+            cv.create_text(W // 2, 30, fill="#6a7a8c",
+                           font=("TkDefaultFont", 8),
+                           text="bolt axes calibrated for this camera "
+                                "orientation — re-seated or rolled? clear the "
+                                "axis calibration")
 
         # footer first: it is fixed-height, and the two panes share what is
         # left, so nothing can be pushed off the bottom edge
         foot = 40 if self.args.latitude is not None else 26
-        top = 44 if not cal else 32
+        top = 44          # both calibrated and uncalibrated draw a note line
         avail = max(80, H - top - foot - 12)   # 12 = altitude pane's offset
         pane = avail // 2
 
@@ -3879,16 +3887,32 @@ class App:
         two solves spanning a rotation re-derive it from scratch -- for
         after the camera has been unmounted/remounted, or the OTA shifted
         in its rings, since the axis pixel is a property of that specific
-        physical mounting and stops being true the moment it changes."""
+        physical mounting and stops being true the moment it changes.
+
+        The bolt vectors go with it. They are PIXEL-space directions learned
+        by cluster_move_axes from observed moves, so the same remount or
+        camera roll that invalidates the axis invalidates them too -- and
+        they fail worse: a stale axis is obviously stale, while stale bolt
+        vectors keep reporting a confident, green, "calibrated" az/alt
+        decomposition onto directions that no longer match the bolts. The
+        move samples they were fitted from are dropped as well; they were
+        collected in the old orientation and would just re-derive the same
+        wrong axes."""
         self.axis_xy = None
         self._armed_prev = None
         self.axis_history = []
+        self.bolt_vectors = None
+        self.move_samples.clear()
         w, h = self.current_size()
+        removed = []
         if w:
-            try:
-                os.remove(sky.axis_path(self.data_dir(), w, h))
-            except OSError:
-                pass
+            for path in (sky.axis_path(self.data_dir(), w, h),
+                         sky.bolts_path(self.data_dir(), w, h)):
+                try:
+                    os.remove(path)
+                    removed.append(os.path.basename(path))
+                except OSError:
+                    pass
         self.lbl_axis.configure(
             text="RA axis: cleared -- solve, rotate the mount >=15° in "
                  "RA, solve again", fg="#c08000")
@@ -3900,6 +3924,11 @@ class App:
         self._draw_wide()
         self.log("RA-axis calibration cleared; the next two solves "
                  "spanning a rotation will re-derive it")
+        self.log("bolt-axis calibration cleared too (pixel directions are "
+                 "only valid for the orientation they were learned in); "
+                 "adjustments read as frame-X/Y until a few one-bolt-at-a-"
+                 "time moves re-calibrate them")
+        self.dbg.log("ui", action="clear_axis", files_removed=removed)
 
     # ---------------- deep-dive diagnostics ----------------
 
