@@ -41,6 +41,9 @@ measurement. These tools measure it.
 - Python 3 with NumPy
 - A UVC camera on `/dev/videoN`
 - The lens capped / full darkness for dark runs
+- Optional: an `indiserver` for the INDI camera/mount options — no client
+  library needed (see *INDI camera and mount*), it speaks the protocol
+  directly over TCP
 
 The capture path shells out to `v4l2-ctl --stream-mmap ... --stream-to=FILE`
 rather than driving ioctls directly — this proved to be the only reliable path
@@ -110,6 +113,32 @@ Welford accumulator (so a 256-frame 4K stack costs ~tens of MB, not gigabytes):
 - **Fixed-pattern noise (FPN)** — spatial spread of the master dark; subtractable.
 - **Irreducible temporal dark noise** — per-pixel temporal std after master-dark
   subtraction; the single-frame floor.
+- **Defect classes** — "1057 hot pixels" is not actionable, because those
+  pixels fail in different ways needing different remedies. They are sorted
+  into four mutually exclusive classes:
+  - **stuck** — zero temporal variance across the whole stack. Not responding
+    at all; a live pixel does not do this. *Interpolate.*
+  - **intermittent hot** — wrong in *some* frames. The one a
+    single-threshold defect map cannot see: the average looks unremarkable, so
+    subtraction leaves a residual that flickers frame to frame. Detected by
+    excess temporal σ, and by a per-pixel *maximum* that reaches hot while the
+    mean never does. Random telegraph signal behaves exactly this way.
+    *Interpolate — no master dark can subtract it.*
+  - **hot** — stable and elevated. *Dark subtraction removes it* until it
+    saturates.
+  - **dark current** — fine at short exposure, elevated at long: a steep
+    pixel rather than a defect, found by comparing the deep stack against a
+    short bias reference. *Scaled dark subtraction handles it*, and it does
+    not belong in an interpolation list at all.
+
+  Precedence is stuck → intermittent → hot → dark current, so instability
+  outranks elevation deliberately: a pixel that is hot in 60% of frames reads
+  as "hot" on the average, but subtraction will not fix it. The PHD2 defect
+  map gets the interpolation classes only (`--defect-classes`, default
+  `stuck,intermittent_hot,hot`), with the full per-class breakdown written
+  alongside as `<file>.classes.json` / `defect_classes_WxH.json`. If a
+  quantiser-collapsed stack makes *every* pixel look frozen, classification is
+  refused rather than reporting millions of stuck pixels.
 - **Hot pixels** — single-pixel outliers above 6 robust sigma of the residual
   after a local median smooth. (Thresholding the raw master at mean+6σ fails at
   native resolution: the LSC shading gradient inflates the global σ and hides
@@ -133,15 +162,55 @@ exposure from that — which is robust even when the exposure-vs-mean fit is not
 **Resolution matters here.** The fps-as-exposure instrument only works at a
 resolution whose bandwidth ceiling is *above* the integration knee. At a large
 frame over USB2 the stream is bandwidth-limited and the framerate is pinned
-regardless of exposure, masking integration entirely. Use the smallest available
-resolution for exposure-fidelity work; use the native resolution for true
-hot-pixel and shading maps.
+regardless of exposure, masking integration entirely.
+
+### MJPEG as a clock (`--fps-probe`)
+That masking is why the framerate sweep runs in **MJPEG** rather than the
+measurement format. The test reads frame *timestamps* — it never looks at a
+pixel value — so the codec's destruction of noise is irrelevant to it, while
+the order-of-magnitude smaller payload lifts the bandwidth ceiling until the
+frame period is set by integration rather than by the bus. That is the only
+condition under which the test says anything at all; in an uncompressed format
+at any useful resolution the answer is permanently "indeterminate
+(bandwidth-limited)", which is a statement about USB, not about the firmware.
+
+The separation is structural, not a convention: `FpsProbe` has no decode path
+and never writes frames to disk, so nothing captured during a timing pass can
+reach a mean, a noise figure, a master dark or a defect map. It streams without
+`--stream-to` and reads the kernel's per-buffer timestamps off `v4l2-ctl
+--verbose`.
+
+`--dark` runs this probe first by default and uses it for the knee and the
+real-vs-synthetic verdict, then does all pixel work in the uncompressed format.
+`--no-timing-probe` reverts to deriving both from the uncompressed ladder.
+`--fps-probe` runs the sweep standalone, over a **geometric** exposure ladder
+from the control's minimum to its maximum — geometric because the knee sits low
+(384 units out of a 9411 range in one case) and a linear sweep steps straight
+over it.
+
+```sh
+sudo ./cam_characterise.py --device /dev/video0 --fps-probe \
+     --width 1920 --height 1080
+```
+
+Note the two knees are different quantities. The uncompressed ladder's knee is
+the *bandwidth ceiling*; the probe's is the *integration knee*. Using the former
+over-excludes good points from the dark-current fit, because below a
+bandwidth-pinned frame period the integration still tracks the commanded
+exposure — the frame merely waits.
+
+Use the smallest available resolution for exposure-fidelity work; use the native
+resolution for true hot-pixel and shading maps.
 
 ### fps ↔ exposure calibration (`--save-calib` / `--calib`)
 A dark run can emit a monotonic fps→exposure inverse, fit over the integration-
 limited region. In auto-exposure mode this converts the measured framerate into
 an effective exposure, independent of the (possibly lying) `exposure_time_absolute`
-readback. The calibration is resolution-specific — rebuild it per resolution.
+readback. The calibration is built from the **uncompressed** ladder, not the
+MJPEG timing probe, because it is applied to framerates measured in the
+measurement format — and the fps↔exposure mapping moves with both format and
+frame size. It is stamped with the fourcc and resolution it was built in, and
+`--calib` warns on a mismatch rather than confidently returning wrong exposures.
 
 The framerate itself is measured from the kernel's per-buffer timestamps
 (v4l2-ctl `--verbose` dqbuf lines), not wall-clock over the whole capture —
@@ -167,19 +236,102 @@ path cannot disambiguate a genuinely low-noise sensor from a denoised one at
 ### Processing-path controls
 `--gamma`, `--brightness`, `--contrast`, `--sharpness`, `--saturation` set the
 ISP processing controls (for clean measurement: gamma linear, sharpness min,
-brightness/contrast neutral). A **clip guard** flags any capture driven to the
-floor (0) or ceiling (255) by aggressive settings and marks the measurement
-invalid rather than reporting clipped zeros as data. If the deep stack itself
-is clipped, the master / defects / dark-model exports are **refused** — writing
-them would hand PHD2 meaningless calibration to auto-load at every connect.
+brightness/contrast neutral). The path is read **back** from the device after
+setting and recorded in the report as `processing_path`, so a control that
+silently refused the write is not logged as if it had taken.
+
+Two guards decide whether a run is a measurement at all:
+
+- **Clip guard** — flags any capture driven to the floor (0) or ceiling (255)
+  by aggressive settings.
+- **Quantiser guard** — catches the failure the clip guard cannot see. A run
+  can sit at mean 18, nowhere near a rail, and still be meaningless: if the
+  output has been collapsed onto too few codes, the sensor's noise no longer
+  reaches the least significant bit. The tell is temporal noise of 0.000 across
+  a deep stack with the mean identical to three decimals at every ladder point.
+  A real 8-bit path *cannot* do that — read noise alone dithers the LSB — so
+  that number is the quantiser's floor, not the sensor's. Detected directly by
+  counting distinct output codes: ≤ 2 unique values in the master dark, or
+  temporal noise below 0.05 ADU, marks the run **QUANTISER-LIMITED**.
+
+If the deep stack trips *either* guard, the master / defects / dark-model
+exports are **refused** — writing them would hand PHD2 meaningless calibration
+to auto-load at every connect. This matters more than it sounds: with the
+output collapsed, hot-pixel detection returned 12 defects where the true count
+was 1057, and a 12-pixel defect map that looks like it worked is worse than no
+defect map at all.
+
+### Upper bounds instead of floored zeros
+`IRREDUCIBLE temporal dark noise: 0.000 ADU` reads as a result — a remarkably
+quiet sensor. It is not one. When a measurement has hit the quantiser floor the
+tool reports the bound instead: *"< 0.5 ADU, unmeasurable at this bit depth and
+processing setting"*.
+
+The same applies to dark current. `0.00000 ADU/unit (r²=0.206)` is not a
+measurement of zero dark current, it is a measurement that found nothing. When
+the mean is flat across the whole ladder, the tool reports the **detection
+limit** — the smallest slope this ladder could have resolved given the observed
+noise and exposure span. That is the number PHD2's dark-scaling decision
+actually needs. With no temporal dither the limit is one whole code: nothing
+smaller flips a pixel, however many frames are stacked.
+
+### The knee is derived, not supplied
+Below the knee the frame period is pinned by bus bandwidth and the commanded
+exposure is clamped inside it, so those points are bias pedestal and drag the
+dark-current regression down. The ladder already *measures* where that ends —
+the knee is where fps first departs from its pinned maximum — so `--knee` is
+now an **override**, not a required input, and defaults to auto-detection.
+Carrying a knee across firmware revisions is how `--knee 256` (right for a
+2047-unit range) ended up wrong for 9411, where fps stayed flat through 256 and
+only broke at 384.
+
+### Report comparison (`--compare A.json B.json`)
+Per-ladder-point deltas in mean, temporal noise, fps and distinct code count,
+plus the deep-stack summary (hot pixels, FPN, noise, dark current, knee) and
+the **processing path** behind the difference. Touches no hardware, so it runs
+on a machine with no camera attached. Since reflashing firmware is routine
+here, before/after diffing is the most-used operation there is — and a
+hot-pixel count that moves across a processing change gets called out
+explicitly, because the defect map is a function of the processing path, not
+just the sensor.
+
+```sh
+./cam_characterise.py --compare before.json after.json
+```
+
+### Lit transfer curve (`--transfer`)
+Sweeps the software flat panel's grey level and records mean output at each
+step, giving the ISP transfer function directly. This is what settles whether a
+gamma control reshapes the tone curve or merely scales it, and it is the only
+way to put a measured curve next to a firmware LUT and compare entry for entry.
+
+The panel is the same one `cam_observe.py` uses (shared in `cam_panel.py`) and
+is served over HTTP — open the printed URL on whatever display is acting as the
+source. Each level waits for the browser to acknowledge that it is painted
+before capturing, so a slow display cannot leave the previous level in frame.
+Both a straight line and a power law are fit over the unclipped region and the
+residuals decide between them.
+
+```sh
+sudo ./cam_characterise.py --device /dev/video0 --transfer \
+     --width 1280 --height 720 --exposure 200 --panel-port 8088
+```
+
+The exponent is (display transfer) × (ISP transfer), since the stimulus is an
+8-bit grey on an uncalibrated screen. That confound **cancels** when two sweeps
+taken on the same display are compared — so the absolute exponent is
+indicative, and the difference between two settings, via `--compare`, is the
+measurement.
 
 ## Output
 
 Per run, with `--report-dir DIR`, a timestamped JSON report
-(`camchar_<mode>_<WxH>_<UTC>.json`) containing the full ladder, per-point
-mean/noise/fps/clip flags, dark-current fit, radial profile, fps calibration, and
-(for `--auto`) the AE series and verdict. `--save-master FILE.npy` writes the 2D
-master dark for offline analysis (e.g. differencing shading maps across settings).
+(`camchar_<tag>_<mode>_<WxH>_<UTC>.json`) containing the full ladder, per-point
+mean/noise/fps/clip/quantiser flags and distinct code counts, dark-current fit
+with its detection limit, derived knee, radial profile, fps calibration, the
+processing path, and (for `--auto`) the AE series and verdict.
+`--save-master FILE.npy` writes the 2D master dark for offline analysis (e.g.
+differencing shading maps across settings).
 
 ## Safety notes
 
@@ -199,16 +351,41 @@ from exposure dependence.
 A standalone tkinter GUI (numpy + stdlib only) around the same capture and
 analysis stack. The raw stream is always shown; the second display window is
 mode-aware. Two explicitly user-declared modes — the tool cannot know whether
-the lens is capped, so the human says so via a banner toggle:
+the lens is capped, so the human says so via a banner toggle.
+
+**The mode selects the whole workspace, not just the second view.** DARK and
+LIGHT are different jobs, and controls for one are noise during the other:
+integration depth, plate solving and the pole chart mean nothing with the lens
+capped, and the master-dark controls mean nothing once it is off. So each
+panel declares which modes it belongs to and is packed or hidden as the mode
+changes — hidden outright rather than greyed, because a disabled row still
+takes up space and still has to be read past. DARK mode is reduced to the
+camera, the master-dark row and the histogram; everything else appears when
+you switch to LIGHT.
 
 - **DARK mode** — the raw stream beside the **dark-corrected residual** at a
   fixed stretch (deliberately not auto-stretched: a perfect correction should
   *look* black, with residual mean/σ/max stats saying how close it is).
   Acquire a deep master dark (streaming per-pixel mean) and derive a
   hot-pixel defect map, written in exactly the per-device layout the other
-  tools use (`{vid+pid[_serial]}/master_WxH.npy` ×257 uint16,
-  `defects_WxH.txt`, plus a `dark_meta_WxH.json` sidecar recording the
-  exposure). Existing files for the device + resolution load automatically.
+  tools use (`{vid+pid}_{serial}_{capability_hash}/master_WxH.npy` ×257
+  uint16, `defects_WxH.txt`, plus a `dark_meta_WxH.json` sidecar recording the
+  exposure **and the processing path** — gamma, brightness, contrast,
+  sharpness, saturation, hue, gain — the dark was built at). Existing files for
+  the device + resolution load automatically, and a master dark whose recorded
+  processing path no longer matches the camera's current settings is flagged in
+  the log and on the label rather than silently applied: gamma alone moved the
+  defect count 12 → 1057 on one bridge, so a map built at one setting is simply
+  wrong at another.
+
+  The directory key carries the same capability hash the report filenames use
+  (`1bcf28c4_01.00.00_c963e3f5065c`), because the bridge serial alone collides:
+  `1bcf:28c4` reports `01.00.00` — a firmware string, not a per-unit id — on
+  both an IMX678 and an IMX385 module.
+
+  Defects are **classified, not just counted** (see below); the acquisition
+  captures a short bias reference at minimum exposure first so the
+  dark-current class has an exposure lever arm to work against.
 - **LIGHT mode** — the raw stream beside the **integrated stack**:
   dark-subtract → flat-correct → defect-repair → optional translation
   alignment (phase correlation) → a **rolling integration window of N
@@ -217,6 +394,16 @@ the lens is capped, so the human says so via a banner toggle:
   components → sub-pixel centroids, flux, FWHM) and overlaid on the display,
   with a noise readout — the figure of merit when mining the noise floor
   with no stars at all.
+
+  **N = 1 is the live single-frame view**, not a degenerate case: full
+  calibration still runs (dark, flat, defect repair) but nothing is summed,
+  which is what you want for focusing, framing and judging an individual sub.
+  Two things follow the window down automatically — the capture burst drops to
+  one frame, so the view is genuinely live rather than six frames behind, and
+  **alignment is bypassed**, since with a window of one there is nothing to
+  align *with* and shifting the frame to a stale reference would only resample
+  and edge-fill it. The readout says "single frame (no stacking)" and the
+  noise-vs-√N chart stays empty, because at N=1 there is no curve to plot.
 
 **Static-camera star confirmation** — detection assumes a fixed mount: real
 stars persist burst after burst and drift slowly and predictably, noise
@@ -312,7 +499,8 @@ with a median displacement/direction readout: live feedback on where the
 field is going during polar alignment. Resume optionally resets the stack
 (the old integration is invalid once the sensor has moved).
 
-An auxiliary panel column carries three live visualisations:
+An auxiliary panel column carries three live visualisations (the pole chart
+and the noise curve are LIGHT-mode only; the histogram is shown in both):
 
 - **Pole bullseye** — a polar-scope-style chart with rings at 1′/5′/10′/30′/1°
   (√-radial mapping so the inner rings stay legible), plotting each solve at
@@ -329,6 +517,36 @@ An auxiliary panel column carries three live visualisations:
 - **Histogram (log-y)** — raw vs stack in light mode, raw vs residual in dark
   mode, showing pedestal position, clipping at either rail, and headroom at a
   glance.
+
+Two further alignment views open in their own windows, from buttons beside the
+RA-axis readout. They live outside the aux column deliberately: they are read
+at the mount, in the dark, and want the space.
+
+- **Mount adjustment** — the two adjusters and what each one needs, drawn the
+  way the mount presents them: azimuth as a rotation seen from above, altitude
+  as an elevation seen from the side. In each pane a grey dashed line is the
+  polar axis *where it points now* and a green arrow is *where it has to go*,
+  so the correction is the visible gap between them; the highlighted bolt and
+  the amber arrow say which one to turn and which way. Angles are exaggerated
+  to stay readable — read the numbers, not the geometry. The sign carries the
+  same honesty as `sky.bolt_correction` itself: it is relative to whichever
+  direction the bolt-axis calibration folded to "positive", because pixel
+  motion alone cannot distinguish clockwise from anticlockwise, so the chart
+  states the rule directly — *turn a little, re-solve, and reverse if the
+  number grows*. Until `cluster_move_axes` has enough turns to calibrate, the
+  panes are the frame's own X/Y and are labelled that way.
+- **Wide field** — where the polar scope is actually pointing, at a scale you
+  can recognise the sky at. The bullseye is a precision instrument that caps
+  at 1° with a √ radial scale; this is its complement, a **linear** projection
+  several degrees across that answers "where am I pointing" when you are *not*
+  close yet. Polar-cap catalogue stars are drawn sized by magnitude for
+  matching against the eyepiece, with the camera's own field of view as a
+  dashed box scaled from the plate solve. The span auto-scales to keep the
+  current offset on the chart. Star reference needs `catalog_ncp.npy` /
+  `catalog_scp.npy` in the data dir (`make_catalog.py`); without them the view
+  still draws, just without stars. The FOV box's *orientation* is indicative —
+  it uses the solver's reported roll about local north, whose handedness is
+  not independently verified.
 
 When a solve yields a WCS, the **celestial pole's pixel position** is computed
 from the CD matrix (exact, including rotation and parity) and drawn as a
@@ -441,6 +659,36 @@ row is where *this tool* sends, default 5005 — the relay bridges the two).
 ```sh
 python3 cam_observe.py --device /dev/video0 --data-dir ~/.local/share/PHD2
 ```
+
+**INDI camera and mount** (`cam_indi.py`). An INDI CCD is a *peer* of the
+V4L2 path, not a remote workaround — indiserver runs on the same Linux host
+this tool already needs for v4l2, and the whole stacking/solving/pointing
+pipeline runs on top of either source unchanged. The client speaks the INDI
+XML/BLOB protocol straight over TCP, so there is no `pyindi-client`, SWIG or
+libindi build to satisfy; it works against a remote indiserver over TCP
+unchanged. `--indi-camera` substitutes an INDI CCD for `--device` (the
+driver owns the frame geometry, reported via `CCD_INFO`), and
+`--indi-mount` adds the mount's own RA/Dec to the stack view in violet
+beneath the star-derived readout, with the separation between them:
+
+```sh
+indiserver -v indi_simulator_ccd indi_simulator_telescope &
+python3 cam_observe.py --indi-camera "CCD Simulator" \
+                       --indi-mount "Telescope Simulator"
+```
+
+That delta is the point of showing both. The cyan readout is derived from
+the sky itself (frame-to-frame star motion); the violet one is what the
+mount *believes*. Their separation is therefore the mount model's error
+against sky truth — the quantity a SYNC at that position would zero out —
+and it is logged per burst as `mount_vs_sky` for later analysis. The
+Exposure box means the same thing on both paths: it is in 100 µs units
+(the unit v4l2's `exposure_time_absolute` is defined in), so the INDI
+scaling defaults to 1e-4 s per unit rather than silently exposing 10×
+longer; `--indi-exposure-scale` overrides it for a driver you would rather
+address in other units. Both options are independent and both are off
+unless given — an unconfigured INDI setup costs nothing, and an
+indiserver that refuses the connection leaves the V4L2 path working.
 
 `--debug` writes JSONL diagnostics designed for LLM consumption: one
 self-describing event per line (probe results, control writes, a per-burst

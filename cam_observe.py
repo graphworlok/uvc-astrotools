@@ -136,7 +136,10 @@ from tkinter import ttk
 
 import cam_characterise as cc
 from cam_manager import usb_device_tag, query_formats, query_controls, identify
+from cam_panel import PanelServer, local_ips, _grey
+import cam_indi as indi
 import cam_skymodel as sky
+from match_tle import ang_sep
 
 TOOL_VERSION = "0.17"
 
@@ -832,293 +835,6 @@ def radec_text(ra_deg, dec_deg):
     return f"RA {hh:02d}h{mm:02d}m{ss:02d}s  Dec {sign}{dd:02d}°{dm:02d}'"
 
 
-# ----------------------------------------------------------------------------
-# Remote flat panel: serve the panel to any browser on the network
-# ----------------------------------------------------------------------------
-
-# Self-contained page. Triggered refresh: long-polls /level (the server
-# holds the request until the level changes, so updates land immediately,
-# not on a poll grid) and ACKS each applied level via /shown so the
-# auto-level servo can wait for confirmation instead of sleeping blind.
-# Levels are plain 8-bit greys; display gamma already spreads them across
-# a wide luminance range. Tap for fullscreen + screen wake lock; cursor
-# hidden; disable the device's auto-brightness.
-PANEL_HTML = """<!doctype html><html><head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cam_observe flat panel</title>
-<style>html,body{margin:0;height:100%;background:#000;cursor:none}
-#p{position:fixed;inset:0;background:#000}
-#hint{position:fixed;bottom:10px;width:100%;text-align:center;color:#444;
-font:14px sans-serif}</style></head>
-<body><div id="p"></div>
-<div id="hint">cam_observe flat panel &mdash; tap for fullscreen; disable
-this device's auto-brightness</div>
-<script>
-let lvl=null;
-function render(L){
-  const h=L.toString(16).padStart(2,'0');
-  document.getElementById('p').style.background='#'+h+h+h;
-  fetch('/shown?level='+L,{cache:'no-store'}).catch(()=>{});
-}
-async function loop(){
-  try{
-    const q=(lvl===null)?'':'&last='+lvl;
-    const r=await fetch('/level?wait=25'+q,{cache:'no-store'});
-    const j=await r.json();
-    if(j.level!==lvl){lvl=j.level;render(lvl);}
-  }catch(e){await new Promise(t=>setTimeout(t,1000));}
-  loop();
-}
-loop();
-let wl=null;
-async function wake(){
-  try{
-    if(navigator.wakeLock&&!wl){
-      wl=await navigator.wakeLock.request('screen');
-      wl.addEventListener('release',()=>{wl=null;});
-    }
-  }catch(e){}
-}
-document.addEventListener('visibilitychange',
-  ()=>{if(!document.hidden)wake();});
-document.body.addEventListener('click',()=>{
-  wake();
-  const e=document.documentElement;
-  if(e.requestFullscreen)e.requestFullscreen().catch(()=>{});
-  document.getElementById('hint').style.display='none';
-});
-</script></body></html>"""
-
-# Test image page, served at /test on the same server: basic test patterns
-# (line grid, checkerboard, Siemens star) drawn on a full-window canvas.
-# Same triggered-refresh method as the flat panel, keyed on a revision
-# counter instead of a grey level: long-poll /pattern (held until the rev
-# moves), ACK each painted rev via /pattern_shown. Read-only, fullscreen +
-# wake lock on tap.
-TEST_HTML = """<!doctype html><html><head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cam_observe test image</title>
-<style>html,body{margin:0;height:100%;background:#000;cursor:none;
-overflow:hidden}
-canvas{position:fixed;inset:0}
-#hint{position:fixed;bottom:10px;width:100%;text-align:center;color:#444;
-font:14px sans-serif}</style></head>
-<body><canvas id="c"></canvas>
-<div id="hint">cam_observe test image &mdash; tap for fullscreen; disable
-this device's auto-brightness</div>
-<script>
-let st=null;
-function draw(p){
-  const c=document.getElementById('c');
-  c.width=innerWidth;c.height=innerHeight;
-  const w=c.width,h=c.height,x=c.getContext('2d');
-  const lv=p.level,bg=p.invert?lv:0,fg=p.invert?0:lv;
-  x.fillStyle='rgb('+bg+','+bg+','+bg+')';x.fillRect(0,0,w,h);
-  const f='rgb('+fg+','+fg+','+fg+')';
-  x.fillStyle=f;x.strokeStyle=f;
-  const s=p.scale,cx=w/2,cy=h/2;
-  if(p.kind==='grid'){
-    x.lineWidth=1;x.beginPath();
-    for(let gx=cx%s;gx<=w;gx+=s){x.moveTo(gx+.5,0);x.lineTo(gx+.5,h);}
-    for(let gy=cy%s;gy<=h;gy+=s){x.moveTo(0,gy+.5);x.lineTo(w,gy+.5);}
-    x.stroke();
-    x.lineWidth=3;x.beginPath();
-    x.moveTo(cx-s,cy);x.lineTo(cx+s,cy);
-    x.moveTo(cx,cy-s);x.lineTo(cx,cy+s);x.stroke();
-  }else if(p.kind==='checker'){
-    for(let gy=0,ry=0;gy<h;gy+=s,ry++)
-      for(let gx=(ry%2)*s;gx<w;gx+=2*s)
-        x.fillRect(gx,gy,s,s);
-  }else if(p.kind==='siemens'){
-    const n=36,r=Math.min(w,h)/2-8;
-    for(let i=0;i<n;i++){
-      const a0=i*2*Math.PI/n;
-      x.beginPath();x.moveTo(cx,cy);
-      x.arc(cx,cy,r,a0,a0+Math.PI/n);x.closePath();x.fill();
-    }
-  }
-  fetch('/pattern_shown?rev='+p.rev,{cache:'no-store'}).catch(()=>{});
-}
-async function loop(){
-  try{
-    const q=(st===null)?'':'&last='+st.rev;
-    const r=await fetch('/pattern?wait=25'+q,{cache:'no-store'});
-    const j=await r.json();
-    if(st===null||j.rev!==st.rev){st=j;draw(st);}
-  }catch(e){await new Promise(t=>setTimeout(t,1000));}
-  loop();
-}
-loop();
-window.addEventListener('resize',()=>{if(st)draw(st);});
-let wl=null;
-async function wake(){
-  try{
-    if(navigator.wakeLock&&!wl){
-      wl=await navigator.wakeLock.request('screen');
-      wl.addEventListener('release',()=>{wl=null;});
-    }
-  }catch(e){}
-}
-document.addEventListener('visibilitychange',
-  ()=>{if(!document.hidden)wake();});
-document.body.addEventListener('click',()=>{
-  wake();
-  const e=document.documentElement;
-  if(e.requestFullscreen)e.requestFullscreen().catch(()=>{});
-  document.getElementById('hint').style.display='none';
-});
-</script></body></html>"""
-
-
-def _grey(v):
-    """8-bit grey level -> Tk colour string."""
-    v = int(v)
-    return f"#{v:02x}{v:02x}{v:02x}"
-
-
-def local_ips():
-    """Best-effort list of this machine's LAN IPv4 addresses, for showing
-    usable panel URLs."""
-    ips = set()
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))     # no packet sent; just picks a route
-        ips.add(s.getsockname()[0])
-        s.close()
-    except OSError:
-        pass
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None):
-            ip = info[4][0]
-            if "." in ip and not ip.startswith("127."):
-                ips.add(ip)
-    except OSError:
-        pass
-    return sorted(ips)
-
-
-class PanelServer:
-    """Serves the software flat panel over HTTP so a browser on ANY device
-    -- a big desktop monitor, a tablet clamped in front of the objective --
-    can be the illumination source. GET / is the panel page, GET /level the
-    current grey level as JSON. GET /test is the test image page, driven by
-    /pattern (current pattern params + revision as JSON, long-pollable) and
-    acknowledged via /pattern_shown. Read-only by design: nothing on the
-    network can change tool state, it can only ask what to display. The
-    last-poll timestamp tells the auto-level servo a remote display is
-    following, so it allows extra settle time per step."""
-
-    def __init__(self, get_level, get_pattern, port):
-        self.get_level = get_level
-        self.get_pattern = get_pattern   # -> dict incl. a "rev" counter
-        self.port = port
-        self.last_poll = 0.0
-        self.last_shown = float("nan")   # last level a browser ACKed
-        self.last_pattern_shown = -1     # last pattern rev a browser ACKed
-        outer = self
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                u = urllib.parse.urlparse(self.path)
-                qs = urllib.parse.parse_qs(u.query)
-                if u.path == "/level":
-                    outer.last_poll = time.monotonic()
-                    # triggered refresh: with wait+last, hold the request
-                    # until the level moves (or timeout) -- the browser
-                    # sees changes immediately, not on a poll grid
-                    try:
-                        wait = min(float(qs.get("wait", ["0"])[0]), 30.0)
-                        last = float(qs.get("last", ["nan"])[0])
-                    except ValueError:
-                        wait, last = 0.0, float("nan")
-                    if wait > 0 and last == last:      # last is not NaN
-                        deadline = time.monotonic() + wait
-                        while (float(outer.get_level()) == last
-                               and time.monotonic() < deadline):
-                            # a held request IS an active client: keep the
-                            # timestamp fresh so active_client() stays true
-                            # while the browser quietly holds the poll
-                            outer.last_poll = time.monotonic()
-                            time.sleep(0.05)
-                        outer.last_poll = time.monotonic()
-                    body = json.dumps(
-                        {"level": int(round(float(
-                            outer.get_level())))}).encode()
-                    ctype = "application/json"
-                elif u.path == "/shown":
-                    # the browser confirms a level is actually painted;
-                    # the auto-level servo waits on this instead of a
-                    # blind sleep
-                    try:
-                        outer.last_shown = float(
-                            qs.get("level", ["nan"])[0])
-                    except ValueError:
-                        pass
-                    outer.last_poll = time.monotonic()
-                    body = b'{"ok":1}'
-                    ctype = "application/json"
-                elif u.path == "/pattern":
-                    outer.last_poll = time.monotonic()
-                    # same triggered refresh as /level, keyed on the
-                    # pattern's revision counter
-                    try:
-                        wait = min(float(qs.get("wait", ["0"])[0]), 30.0)
-                        last = int(qs.get("last", ["-1"])[0])
-                    except ValueError:
-                        wait, last = 0.0, -1
-                    if wait > 0 and last >= 0:
-                        deadline = time.monotonic() + wait
-                        while (int(outer.get_pattern()["rev"]) == last
-                               and time.monotonic() < deadline):
-                            outer.last_poll = time.monotonic()
-                            time.sleep(0.05)
-                        outer.last_poll = time.monotonic()
-                    body = json.dumps(outer.get_pattern()).encode()
-                    ctype = "application/json"
-                elif u.path == "/pattern_shown":
-                    # the browser confirms a pattern revision is painted
-                    try:
-                        outer.last_pattern_shown = int(
-                            qs.get("rev", ["-1"])[0])
-                    except ValueError:
-                        pass
-                    outer.last_poll = time.monotonic()
-                    body = b'{"ok":1}'
-                    ctype = "application/json"
-                elif u.path == "/test":
-                    body = TEST_HTML.encode("utf-8")
-                    ctype = "text/html; charset=utf-8"
-                elif u.path == "/" or u.path.startswith("/index"):
-                    body = PANEL_HTML.encode("utf-8")
-                    ctype = "text/html; charset=utf-8"
-                else:
-                    self.send_error(404)
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *a):   # keep stdout quiet
-                pass
-
-        self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port),
-                                                     Handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever,
-                                       daemon=True)
-        self.thread.start()
-
-    def active_client(self, within=5.0):
-        """True when some browser polled the level recently."""
-        return time.monotonic() - self.last_poll < within
-
-    def stop(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
-
-
 def encode_stellarium_packet(ra_deg, dec_deg, t=None):
     """MessageCurrentPosition, Stellarium Telescope Protocol v1.0 (server
     -> client position report; verified against the canonical spec,
@@ -1343,6 +1059,14 @@ LIGHT_BANNER = ("LIGHT MODE — capturing photons: integrating and extracting",
 UVC_PANEL_CTRLS = ("gain", "gamma", "brightness", "contrast",
                    "sharpness", "saturation")
 
+# Defect classes written into the repair/defect map. These are the pixels a
+# master dark CANNOT fix: stuck ones carry no signal, intermittent ones are
+# inconsistent frame to frame, and hot ones saturate. The dark_current class is
+# deliberately absent -- those pixels scale with exposure, so the (scaled) dark
+# subtraction is exactly what corrects them, and interpolating over them would
+# throw away good signal.
+DEFECT_REPAIR_CLASSES = ("stuck", "intermittent_hot", "hot")
+
 
 class App:
     def __init__(self, root, args, dbg=None):
@@ -1420,6 +1144,17 @@ class App:
         self.pointing_radec = None        # (ra_deg, dec_deg), latest
         self.stellarium_sender = None     # StellariumUDPSender, if enabled
 
+        # INDI: one client shared by the camera source and the mount, since
+        # indiserver multiplexes every device over the one connection.
+        # Created lazily -- an unconfigured INDI setup must cost nothing,
+        # and a refused connection must not stop the v4l2 path working.
+        self._indi = None
+        self._indi_lock = threading.Lock()
+        self.indi_mount = None            # IndiMount, once connected
+        self.mount_radec = None           # (ra_deg, dec_deg) as the MOUNT
+        self._indi_warned = None          # reports it; None until first read
+        self._indi_retry_at = 0.0         # monotonic; backoff after a failure
+
         self._photo_live = None     # keep references or Tk drops the images
         self._photo_stack = None
 
@@ -1439,6 +1174,12 @@ class App:
                                    # it); THIS is the number polar alignment
                                    # should converge, not solve_history
         self.pole_xy = None       # pole pixel from last solve's WCS
+        # inputs to the mount-adjustment and wide-field visualisations
+        self.bolt_corr = None     # last sky.bolt_correction() result
+        self.arcsec_per_px = None  # plate scale from the last solve
+        self.solve_rot = None     # frame rotation (deg) from the last solve
+        self._wide_cat = {}       # hemisphere -> (ra, dec, mag), cached
+        self._star_names = None   # lazily loaded bright-star name table
         self.noise_hist = []      # [(n, stack_sigma, single_sigma), ...]
         self._last_hist_series = []   # cached so a popout can redraw on resize
         self._popouts = {}        # kind -> Canvas in an expanded popout window
@@ -1469,6 +1210,12 @@ class App:
     # ---------------- UI construction ----------------
 
     def _build_ui(self):
+        # Mode state and its widget registry come first: everything built
+        # below may register itself as belonging to one mode or both, and
+        # _mode_pack consults the current mode as it goes.
+        self.var_mode = tk.StringVar(value="dark")
+        self._mode_widgets = []   # [(widget, {modes}, pack_kwargs)] in order
+
         self.banner = tk.Label(self.root, font=("TkDefaultFont", 12, "bold"),
                                pady=6)
         self.banner.pack(fill="x")
@@ -1512,18 +1259,23 @@ class App:
         # histogram -- fixed size, main canvases take the slack
         aux = tk.Frame(disp)
         aux.pack(side="left", fill="y", padx=2)
+        # pole + noise are LIGHT concerns (both need a stack / a solve); the
+        # histogram is how you read a dark too, so it stays in both
         lfp = tk.LabelFrame(aux, text="Pole offset (θ = RA)")
-        lfp.pack(fill="x")
+        self._mode_pack(lfp, ("light",), fill="x")
         self.canvas_pole = tk.Canvas(lfp, width=AUX_W, height=AUX_W,
                                      bg="#101018", highlightthickness=0)
         self.canvas_pole.pack()
         lfn = tk.LabelFrame(aux, text="Stack noise vs √N")
-        lfn.pack(fill="x", pady=2)
+        self._mode_pack(lfn, ("light",), fill="x", pady=2)
         self.canvas_noise = tk.Canvas(lfn, width=AUX_W, height=110,
                                       bg="#101018", highlightthickness=0)
         self.canvas_noise.pack()
+        # registered in BOTH modes, not left unmanaged: _apply_mode_layout
+        # re-packs registered widgets in declaration order, and an unmanaged
+        # sibling would end up above them after the first mode switch
         lfh = tk.LabelFrame(aux, text="Histogram (log y)")
-        lfh.pack(fill="x")
+        self._mode_pack(lfh, ("dark", "light"), fill="x")
         self.canvas_hist = tk.Canvas(lfh, width=AUX_W, height=110,
                                      bg="#101018", highlightthickness=0)
         self.canvas_hist.pack()
@@ -1548,7 +1300,6 @@ class App:
         bar.pack(fill="x", pady=(4, 2))
         tk.Label(bar, text="Mode:",
                  font=("TkDefaultFont", 10, "bold")).pack(side="left")
-        self.var_mode = tk.StringVar(value="dark")
         for text, val, sel in (
                 ("DARK — lens capped", "dark", "#c9c9c9"),
                 ("LIGHT — capturing photons", "light", "#aecdf0")):
@@ -1621,8 +1372,9 @@ class App:
         lf_cal = tk.LabelFrame(ctl, text="Calibration masters "
                                          "(per device + resolution)")
         lf_cal.pack(fill="x", pady=2)
-        r1 = tk.Frame(lf_cal); r1.pack(fill="x", pady=1)
-        tk.Label(r1, text="Dark (DARK mode):", width=17,
+        r1 = tk.Frame(lf_cal)
+        self._mode_pack(r1, ("dark",), fill="x", pady=1)
+        tk.Label(r1, text="Dark:", width=17,
                  anchor="w").pack(side="left")
         tk.Label(r1, text="frames:").pack(side="left")
         self.var_dark_n = tk.IntVar(value=64)
@@ -1641,8 +1393,9 @@ class App:
                                       state="disabled")
         self.btn_viewdark.pack(side="left", padx=4)
 
-        r1b = tk.Frame(lf_cal); r1b.pack(fill="x", pady=1)
-        tk.Label(r1b, text="Flat (LIGHT mode):", width=17,
+        r1b = tk.Frame(lf_cal)
+        self._mode_pack(r1b, ("light",), fill="x", pady=1)
+        tk.Label(r1b, text="Flat:", width=17,
                  anchor="w").pack(side="left")
         tk.Label(r1b, text="frames:").pack(side="left")
         self.var_flat_n = tk.IntVar(value=64)
@@ -1688,7 +1441,8 @@ class App:
         # test image: basic test patterns on the same panel plumbing --
         # local window or any browser at /test on the served port -- for
         # focus, geometry/distortion and scaling checks
-        r1c = tk.Frame(lf_cal); r1c.pack(fill="x", pady=1)
+        r1c = tk.Frame(lf_cal)
+        self._mode_pack(r1c, ("light",), fill="x", pady=1)
         tk.Label(r1c, text="Test image:", width=17,
                  anchor="w").pack(side="left")
         self.var_test_kind = tk.StringVar(value="grid")
@@ -1719,7 +1473,8 @@ class App:
         # (ncat/socat, see README) feeds Stellarium's own Telescope
         # Control plugin, so its sky chart shows a live reticle tracking
         # wherever this camera is pointed. Needs one "Solve" first.
-        r1d = tk.Frame(lf_cal); r1d.pack(fill="x", pady=1)
+        r1d = tk.Frame(lf_cal)
+        self._mode_pack(r1d, ("light",), fill="x", pady=1)
         tk.Label(r1d, text="Stellarium UDP:", width=17,
                  anchor="w").pack(side="left")
         tk.Label(r1d, text="host:").pack(side="left")
@@ -1735,15 +1490,19 @@ class App:
         self.btn_stellarium.pack(side="left", padx=(8, 2))
 
         # integration: what the LIGHT worker does with each frame
-        lf_int = tk.LabelFrame(ctl, text="Integration (LIGHT mode)")
-        lf_int.pack(fill="x", pady=2)
+        lf_int = tk.LabelFrame(ctl, text="Integration")
+        self._mode_pack(lf_int, ("light",), fill="x", pady=2)
         r2 = tk.Frame(lf_int); r2.pack(fill="x", pady=1)
         tk.Label(r2, text="Rolling window:").pack(side="left")
         self.var_stack_max = tk.IntVar(value=self.stack_max_value)
         self.var_stack_max.trace_add("write", self._on_stack_max_change)
-        tk.Spinbox(r2, from_=2, to=1024, width=5,
+        # 1 is a legitimate setting, not a degenerate one: it is the live
+        # single-frame view (calibration still applied, nothing summed) --
+        # what you want for focusing, framing and judging a single sub
+        tk.Spinbox(r2, from_=1, to=1024, width=5,
                    textvariable=self.var_stack_max).pack(side="left")
-        tk.Label(r2, text="frames").pack(side="left")
+        tk.Label(r2, text="frames (1 = single frame, no stacking)").pack(
+            side="left")
         self.var_sub = tk.BooleanVar(value=True)
         self.var_fix = tk.BooleanVar(value=True)
         self.var_align = tk.BooleanVar(value=True)
@@ -1793,8 +1552,8 @@ class App:
         self.lbl_stars.pack(side="left", padx=8)
 
         # plate solving
-        lf_solve = tk.LabelFrame(ctl, text="Plate solving")
-        lf_solve.pack(fill="x", pady=2)
+        lf_solve = tk.LabelFrame(ctl, text="Plate solving / polar alignment")
+        self._mode_pack(lf_solve, ("light",), fill="x", pady=2)
         r3 = tk.Frame(lf_solve); r3.pack(fill="x", pady=1)
         tk.Label(r3, text="solve-field:").pack(side="left")
         self.var_solver = tk.StringVar(value=self.args.solver)
@@ -1874,6 +1633,15 @@ class App:
             r4c, text="Adjust: no axis fit yet",
             font=("TkDefaultFont", 10, "bold"), fg="#c08000", anchor="w")
         self.lbl_bolts.pack(side="left", fill="x")
+        # The two alignment visualisations open in their own windows rather
+        # than the aux column: they are read at the mount, in the dark, and
+        # want the space. Both track live through the _draw_* fan-out.
+        tk.Button(r4c, text="Wide field",
+                  command=lambda: self._popout_graph("wide")).pack(
+                      side="right", padx=2)
+        tk.Button(r4c, text="Mount adjustment",
+                  command=lambda: self._popout_graph("mount")).pack(
+                      side="right", padx=2)
 
         # log
         self.txt = tk.Text(self.root, height=7, state="disabled",
@@ -1925,9 +1693,42 @@ class App:
 
     def _on_stack_max_change(self, *a):
         try:
-            self.stack_max_value = max(2, int(self.var_stack_max.get()))
+            self.stack_max_value = max(1, int(self.var_stack_max.get()))
         except (tk.TclError, ValueError):
             pass
+
+    # ------------------------------------------------------------------
+    # Mode-scoped layout
+    #
+    # DARK and LIGHT are genuinely different jobs, and a panel carrying
+    # every control for both is mostly irrelevant whichever one you are
+    # doing: integration depth and plate solving mean nothing with the lens
+    # capped, and the master-dark controls mean nothing once it is off.
+    # Widgets register the modes they belong to and are packed/forgotten as
+    # the mode changes.
+    #
+    # Re-packing rather than toggling `state` because a disabled row still
+    # occupies the space and still has to be read past. Every registered
+    # widget is re-packed in declaration order on each change, which is what
+    # keeps the layout stable -- pack() appends, so a partial re-pack would
+    # shuffle rows around.
+    # ------------------------------------------------------------------
+
+    def _mode_pack(self, widget, modes, **kw):
+        """Register `widget` as belonging to `modes` ("dark", "light", or
+        both) and pack it if the current mode wants it."""
+        self._mode_widgets.append((widget, set(modes), kw))
+        if self.var_mode.get() in modes:
+            widget.pack(**kw)
+
+    def _apply_mode_layout(self):
+        """Show exactly the controls this mode can act on."""
+        mode = self.var_mode.get()
+        for widget, modes, _kw in self._mode_widgets:
+            widget.pack_forget()
+        for widget, modes, kw in self._mode_widgets:
+            if mode in modes:
+                widget.pack(**kw)
 
     def _set_mode_banner(self):
         dark = self.var_mode.get() == "dark"
@@ -2007,12 +1808,86 @@ class App:
         except OSError as e:
             self.dbg.log("error", where="save_prefs", err=str(e))
 
+    def _indi_client(self):
+        """The shared INDI client, connected on first use. indiserver
+        multiplexes all devices over one connection, so the camera source
+        and the mount deliberately share this. Reconnects if the reader
+        thread has died. Raises OSError if indiserver is unreachable."""
+        with self._indi_lock:
+            if self._indi is not None and self._indi.is_alive():
+                return self._indi
+            if self._indi is not None:
+                self.dbg.log("indi", action="reconnect",
+                             err=self._indi.last_error())
+                self._indi.close()
+                self._indi = None
+            c = indi.IndiClient(self.args.indi_host, self.args.indi_port)
+            c.connect()
+            self._indi = c
+            self.dbg.log("indi", action="connected", host=self.args.indi_host,
+                         port=self.args.indi_port)
+            return c
+
+    def _mount(self):
+        """The IndiMount, connected on first use, or None if --indi-mount
+        was not given or the mount will not come up. Never raises: the
+        mount readout is an ADDITION to the star-derived pointing, so
+        losing it must never take a capture down with it. The failure is
+        logged and warned once, not once per burst.
+
+        A failed connect is also BACKED OFF, which matters more than it
+        looks: a mistyped device name leaves indiserver reachable but the
+        property undefined, so the connect burns its full timeout. Retrying
+        that every burst would silently add that stall to every frame
+        forever, and the retry timeout is kept short for the same reason."""
+        if not self.args.indi_mount:
+            return None
+        if self.indi_mount is not None and self.indi_mount.client.is_alive():
+            return self.indi_mount
+        if time.monotonic() < self._indi_retry_at:
+            return None
+        try:
+            m = indi.IndiMount(self._indi_client(), self.args.indi_mount)
+            if not m.connect(timeout=4.0):
+                raise RuntimeError(f"'{self.args.indi_mount}' did not connect"
+                                   f" (device name as indiserver spells it?)")
+        except (OSError, RuntimeError) as e:
+            self._indi_retry_at = time.monotonic() + 30.0
+            if self._indi_warned != str(e):
+                self._indi_warned = str(e)
+                print(f"  [INDI mount unavailable: {e}; retrying in 30s]")
+                self.dbg.log("indi", action="mount_unavailable", err=str(e))
+            self.indi_mount = None
+            return None
+        self._indi_warned = None
+        self._indi_retry_at = 0.0
+        self.indi_mount = m
+        self.dbg.log("indi", action="mount_connected",
+                     device=self.args.indi_mount)
+        return m
+
+    def _read_mount(self):
+        """Refresh self.mount_radec from the mount. Cheap enough to call
+        every burst: the client's reader thread keeps the property store
+        current, so this is a dict read under a lock, not a round trip."""
+        m = self._mount()
+        self.mount_radec = m.radec_deg() if m is not None else None
+        return self.mount_radec
+
     def make_capture(self, dev, w, h):
         """dev/w/h are passed in (snapshotted on the UI thread) rather than
         read from Tk variables here: workers call this, and Tk variables must
         never be touched from a worker thread -- a marshalled Tcl call can
         stall against a blocked main loop."""
-        cap = cc.Capture(dev, w, h, self.fourcc)
+        if self.args.indi_camera:
+            # dev/w/h do not apply: an INDI CCD reports its own geometry via
+            # CCD_INFO, and the driver owns the frame size. Everything
+            # downstream (stacking, solving, pointing) is shape-agnostic.
+            cap = indi.connect_camera(
+                self._indi_client(), self.args.indi_camera,
+                exposure_scale=self.args.indi_exposure_scale)
+        else:
+            cap = cc.Capture(dev, w, h, self.fourcc)
         cap.exposure = self.exp_value
         return cap
 
@@ -2042,6 +1917,16 @@ class App:
         if "pole" in self._popouts:
             self._render_pole(self._popouts["pole"])
 
+    def _draw_mount(self):
+        # popout-only: these are opened at the mount, during alignment, and
+        # the aux column has no room to carry them permanently
+        if "mount" in self._popouts:
+            self._render_mount(self._popouts["mount"])
+
+    def _draw_wide(self):
+        if "wide" in self._popouts:
+            self._render_wide(self._popouts["wide"])
+
     def _draw_noise(self):
         self._render_noise(self.canvas_noise)
         if "noise" in self._popouts:
@@ -2064,10 +1949,14 @@ class App:
             self._raise_popout(win)
             return
         titles = {"pole": "Pole offset (θ = RA)",
-                  "noise": "Stack noise vs √N", "hist": "Histogram (log y)"}
-        init = {"pole": (560, 560), "noise": (720, 420), "hist": (720, 420)}
+                  "noise": "Stack noise vs √N", "hist": "Histogram (log y)",
+                  "mount": "Mount adjustment — which way to turn what",
+                  "wide": "Wide field — where the polar scope is pointing"}
+        init = {"pole": (560, 560), "noise": (720, 420), "hist": (720, 420),
+                "mount": (460, 640), "wide": (620, 660)}
         renderers = {"pole": self._render_pole, "noise": self._render_noise,
-                     "hist": self._render_hist}
+                     "hist": self._render_hist, "mount": self._render_mount,
+                     "wide": self._render_wide}
         desc = {
             "pole":
                 "Polar-alignment scope. Green = the plate-solved FIELD "
@@ -2097,6 +1986,36 @@ class App:
                 "clean subtraction with little signal, while a bright tail "
                 "is stars (or, spread across the frame, leftover structure "
                 "/ stray light).",
+            "mount":
+                "The two mount adjusters and what each one needs, drawn the "
+                "way the mount presents them: azimuth as a rotation seen "
+                "from above, altitude as an elevation seen from the side. "
+                "The highlighted bolt and the amber arrow are the ones to "
+                "move; the green arrow is the polar axis and where it has to "
+                "go. Magnitudes are exaggerated to be readable — read the "
+                "numbers, not the angles. IMPORTANT: the sign is relative to "
+                "whichever direction the bolt-axis calibration folded to "
+                "'positive', because pixel motion alone cannot tell "
+                "clockwise from anticlockwise. Turn a little, re-solve, and "
+                "reverse if the number grows. Until a bolt has been turned "
+                "enough times for cam_skymodel's cluster_move_axes to "
+                "calibrate, the two axes shown are the frame's own X and Y "
+                "and are labelled that way.",
+            "wide":
+                "Wide-angle context: distance from the celestial pole as "
+                "radius, RA as angle, hemisphere handedness matched to the "
+                "sky. Where the bullseye caps at 1° with a √ scale for the "
+                "final approach, this is LINEAR and several degrees across, "
+                "so it answers 'where am I actually pointing' when you are "
+                "not close yet. Grey dots are the polar-cap catalogue "
+                "(brighter = larger) for matching against the eyepiece; the "
+                "dashed green box is the camera's own field of view drawn to "
+                "scale from the plate solve. Its ORIENTATION is indicative — "
+                "it uses the solver's reported roll about the local "
+                "north direction, whose handedness is not independently "
+                "verified here. The span auto-scales to keep the current "
+                "offset on the chart. Stars need catalog_ncp.npy / "
+                "catalog_scp.npy in the data dir (make_catalog.py).",
         }
         w0, h0 = init[kind]
         win = tk.Toplevel(self.root)
@@ -2256,6 +2175,395 @@ class App:
             cv.create_text(cx, size - 9, text="no solves yet",
                            fill="#4a5a6c")
 
+    # ------------------------------------------------------------------
+    # Mount adjustment view
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _alignment_verdict(arcmin):
+        """Plain-language quality band for a polar-axis error, with a colour.
+        The bands are the practical ones for short-exposure guided work, not
+        an absolute standard."""
+        if arcmin is None:
+            return "unknown", "#7a8a9c"
+        if arcmin < 1.0:
+            return "excellent", "#00ff80"
+        if arcmin < 5.0:
+            return "good", "#7ce07c"
+        if arcmin < 15.0:
+            return "usable — worth improving", "#e0c060"
+        if arcmin < 60.0:
+            return "coarse", "#e09040"
+        return "far out", "#ff6040"
+
+    def _render_mount(self, cv):
+        """The mount head, and which way to turn what.
+
+        The numeric readout beside the RA-axis line already says "az +3.2'
+        alt -1.1'", but at the mount in the dark that is the wrong shape of
+        information: you are holding a bolt, not reading a table. This draws
+        the two adjustment axes as the mount actually presents them -- azimuth
+        as a rotation seen from above, altitude as an elevation seen from the
+        side -- with the required motion on each, sized by how far out it is.
+
+        Honesty, carried over from sky.bolt_correction: the SIGN is relative
+        to whichever physical turn direction cluster_move_axes happened to
+        fold to "positive", because pixel motion alone cannot say which way is
+        clockwise. Until a bolt has been turned enough for that calibration,
+        the axes are the frame's own X/Y and are labelled as such. Either way
+        the rule is the same and is printed on the chart: turn a little, and
+        if the number grows, reverse."""
+        cv.delete("all")
+        W = cv.winfo_width()
+        H = cv.winfo_height()
+        W = W if W > 60 else AUX_W          # not yet mapped (or tiny)
+        H = H if H > 60 else 320
+        corr = self.bolt_corr
+        if not corr:
+            cv.create_text(W // 2, H // 2, fill="#4a5a6c", justify="center",
+                           text="no axis fit yet\n\nsolve, rotate the mount "
+                                "≥15° in RA,\nsolve again")
+            return
+
+        az = corr["az"]
+        alt = corr["alt"]
+        cal = corr["calibrated"]
+        total = math.hypot(az["arcmin"], alt["arcmin"])
+        verdict, vcol = self._alignment_verdict(total)
+
+        # header: the one number that says whether to keep adjusting
+        cv.create_text(W // 2, 14, fill=vcol,
+                       font=("TkDefaultFont", 11, "bold"),
+                       text=f"axis → pole: {total:.1f}′  ({verdict})")
+        if not cal:
+            cv.create_text(W // 2, 30, fill="#e0c060",
+                           font=("TkDefaultFont", 8),
+                           text="bolt axes NOT calibrated — showing frame X/Y; "
+                                "turn one bolt a few times to calibrate")
+
+        # footer first: it is fixed-height, and the two panes share what is
+        # left, so nothing can be pushed off the bottom edge
+        foot = 40 if self.args.latitude is not None else 26
+        top = 44 if not cal else 32
+        avail = max(80, H - top - foot - 12)   # 12 = altitude pane's offset
+        pane = avail // 2
+
+        # ---- AZIMUTH: seen from above ----
+        acy = top + pane // 2
+        acx = W // 2
+        R = max(24, min(W // 2 - 46, pane // 2 - 20))
+        cv.create_text(10, top - 2, anchor="nw", fill="#80a0c0",
+                       font=("TkDefaultFont", 8, "bold"),
+                       text=("AZIMUTH — seen from above" if cal
+                             else "FRAME X — seen from above"))
+        # the base ring and its two opposing push bolts
+        cv.create_oval(acx - R, acy - R, acx + R, acy + R,
+                       outline="#3a4a5c", width=2)
+        sgn = 1.0 if az["arcmin"] >= 0 else -1.0
+        for sx in (-1, 1):
+            bx = acx + sx * R
+            if sx == sgn:            # the one to turn
+                cv.create_rectangle(bx - 7, acy - 9, bx + 7, acy + 9,
+                                    fill="#7a5a10", outline="#ffb000",
+                                    width=2)
+                cv.create_text(bx + sx * 13, acy - 16, anchor="w" if sx > 0
+                               else "e", fill="#ffb000",
+                               font=("TkDefaultFont", 8, "bold"),
+                               text="turn this")
+            else:
+                cv.create_rectangle(bx - 5, acy - 7, bx + 5, acy + 7,
+                                    fill="#2a3a4a", outline="#5a6a7c")
+        # Same convention as the altitude pane: grey dashed = the axis where
+        # it points NOW, green = where it has to go. The gap between them is
+        # the correction.
+        tilt = math.radians(max(-55.0, min(55.0, az["arcmin"] * 6.0)))
+        cv.create_line(acx, acy,
+                       acx + R * 0.86 * math.sin(tilt),
+                       acy - R * 0.86 * math.cos(tilt),
+                       fill="#5a6a7c", width=2, dash=(4, 3))
+        cv.create_text(acx + (R + 6) * math.sin(tilt),
+                       acy - (R + 6) * math.cos(tilt),
+                       fill="#5a6a7c", anchor="s",
+                       font=("TkDefaultFont", 7), text="now")
+        cv.create_line(acx, acy, acx, acy - R * 0.86, fill="#00ff60", width=3,
+                       arrow="last")
+        cv.create_text(acx, acy - R - 5, fill="#00ff60", anchor="s",
+                       font=("TkDefaultFont", 7), text="pole")
+        # Rotation arc on the side being pushed, so arc and bolt agree. Drawn
+        # as a polyline rather than create_arc because an arc with no
+        # arrowhead states a magnitude and not a direction, which is the one
+        # thing this glyph exists to say.
+        arc_r = R + 11
+        a0 = math.radians(-30.0 if sgn > 0 else 150.0)
+        sweep = math.radians(56.0 if sgn > 0 else -56.0)
+        pts = []
+        for i in range(13):
+            a = a0 + sweep * i / 12.0
+            pts += [acx + arc_r * math.cos(a), acy - arc_r * math.sin(a)]
+        cv.create_line(*pts, fill="#ffb000", width=3, arrow="last",
+                       arrowshape=(11, 13, 5), smooth=True)
+        cv.create_text(acx, acy + R + 20, fill="#ffb000",
+                       font=("TkDefaultFont", 12, "bold"),
+                       text=f"{az['label'].upper()}  {az['arcmin']:+.1f}′")
+
+        # ---- ALTITUDE: seen from the side ----
+        etop = top + pane + 12          # clear of the AZ value label above
+        ecy = etop + pane // 2
+        cv.create_text(10, etop - 2, anchor="nw", fill="#80a0c0",
+                       font=("TkDefaultFont", 8, "bold"),
+                       text=("ALTITUDE — seen from the side" if cal
+                             else "FRAME Y — seen from the side"))
+        lat = abs(self.args.latitude) if self.args.latitude is not None \
+            else 45.0
+        ang = math.radians(max(8.0, min(80.0, lat)))
+        bw = min(W - 96, 210)
+        x0 = W // 2 - bw // 2
+        base_y = ecy + pane // 4
+        L = min(bw, (pane * 0.55) / max(math.sin(ang), 0.15))
+        ax2 = x0 + L * math.cos(ang)
+        ay2 = base_y - L * math.sin(ang)
+        cv.create_line(x0 - 8, base_y, x0 + bw + 8, base_y, fill="#3a4a5c",
+                       width=3)
+        cv.create_polygon(x0, base_y, ax2, ay2, ax2, base_y,
+                          fill="#1a2430", outline="#3a4a5c")
+        # The wedge edge is the axis WHERE IT IS; the green arrow is where it
+        # has to go. Both are drawn, because the correction is the gap between
+        # them -- a single arrow lying along the edge shows nothing.
+        dv = alt["arcmin"] * 3.0
+        dv = max(-26.0, min(26.0, dv))
+        if 0 < abs(dv) < 9:                    # keep a small move readable
+            dv = 9.0 if dv > 0 else -9.0
+        cv.create_line(x0, base_y, ax2, ay2, fill="#5a6a7c", width=2,
+                       dash=(4, 3))
+        cv.create_text(ax2 + 5, ay2 + 9, anchor="w", fill="#5a6a7c",
+                       font=("TkDefaultFont", 7), text="now")
+        cv.create_line(x0, base_y, ax2, ay2 - dv, fill="#00ff60", width=3,
+                       arrow="last")
+        cv.create_text(ax2 + 6, ay2 - dv - 5, anchor="w", fill="#00ff60",
+                       font=("TkDefaultFont", 7), text="pole")
+        cv.create_text(x0, base_y + 11, anchor="nw", fill="#80a0c0",
+                       font=("TkDefaultFont", 7),
+                       text=(f"lat {lat:.0f}°" if self.args.latitude
+                             is not None else "lat unknown (assuming 45°)"))
+        # the altitude bolt, on the wedge, with the direction to drive it
+        bx = x0 + L * 0.5 * math.cos(ang)
+        by = base_y - L * 0.5 * math.sin(ang) + 13
+        cv.create_rectangle(bx - 7, by - 6, bx + 7, by + 6,
+                            fill="#7a5a10", outline="#ffb000", width=2)
+        up = alt["arcmin"] >= 0
+        cv.create_line(bx + 24, by + (10 if up else -10),
+                       bx + 24, by - (10 if up else -10),
+                       fill="#ffb000", width=3, arrow="last")
+        cv.create_text(bx + 32, by, anchor="w", fill="#ffb000",
+                       font=("TkDefaultFont", 8, "bold"), text="turn this")
+        cv.create_text(W // 2, etop + pane - 12, fill="#ffb000",
+                       font=("TkDefaultFont", 12, "bold"),
+                       text=f"{alt['label'].upper()}  {alt['arcmin']:+.1f}′")
+
+        # ---- the rule that makes the signs usable ----
+        cv.create_text(W // 2, H - foot + 8, fill="#9fb0c4", width=W - 16,
+                       justify="center", font=("TkDefaultFont", 8),
+                       text="Sign is relative, not absolute: turn a little, "
+                            "re-solve, and if the number GROWS, reverse.")
+        if self.args.latitude is not None:
+            refr = sky.refraction_arcmin(abs(self.args.latitude))
+            cv.create_text(W // 2, H - 10, fill="#6a7a8c", width=W - 16,
+                           justify="center", font=("TkDefaultFont", 8),
+                           text=f"refraction at the pole ≈ {refr:.1f}′ — a "
+                                "floor to be aware of, not subtracted")
+
+    # ------------------------------------------------------------------
+    # Wide-field reference view
+    # ------------------------------------------------------------------
+
+    def _wide_catalog(self, south):
+        """Polar-cap catalogue for a hemisphere, cached. Returns None when the
+        catalogue file is absent -- the view still draws, just without stars."""
+        key = "s" if south else "n"
+        if key not in self._wide_cat:
+            try:
+                self._wide_cat[key] = sky.load_catalog(
+                    self.args.data_dir, -1.0 if south else 1.0)
+            except Exception:
+                self._wide_cat[key] = None
+        return self._wide_cat[key]
+
+    def _render_wide(self, cv):
+        """Where the polar scope is actually pointing, at a scale you can
+        recognise the sky at.
+
+        The bullseye beside this one is a precision instrument: it caps at 1°
+        and uses a √ radial scale, so once you are close it shows the last
+        few arcminutes beautifully and tells you nothing about where you are
+        if you are a degree out. This is the opposite view -- a LINEAR
+        projection several degrees wide, with the polar-cap catalogue drawn
+        in, so the field can be matched against what is in the eyepiece and
+        the camera's own footprint can be seen against it.
+
+        Projection is the natural one for a polar scope: distance from the
+        pole as radius, RA as angle, hemisphere handedness matched to the sky
+        (clockwise facing south)."""
+        cv.delete("all")
+        W = cv.winfo_width()
+        H = cv.winfo_height()
+        W = W if W > 60 else AUX_W          # not yet mapped (or tiny)
+        H = H if H > 60 else AUX_W
+        size = min(W, H)
+        cx, cy = W // 2, H // 2
+        R = size // 2 - 18
+
+        field = self.solve_history[-1] if self.solve_history else None
+        axis = self.axis_history[-1] if self.axis_history else None
+        anchor = axis or field
+        if anchor is None:
+            cv.create_text(cx, cy, fill="#4a5a6c", justify="center",
+                           text="no solves yet\n\nthe wide view needs one "
+                                "plate solve\nto know where it is looking")
+            return
+        south = anchor["dec"] < 0
+        ysign = 1.0 if south else -1.0
+
+        # Span: wide enough to always contain the current offset, and never
+        # so tight that the marker sits on the rim.
+        off_deg = max((p["sep_arcmin"] / 60.0)
+                      for p in (x for x in (field, axis) if x))
+        span = 5.0
+        for cand in (0.5, 1.0, 2.0, 5.0, 10.0, 20.0):
+            if cand >= off_deg * 1.6:
+                span = cand
+                break
+        else:
+            span = max(20.0, off_deg * 1.6)
+
+        def project(ra_deg, dec_deg):
+            r = (90.0 - abs(dec_deg)) / span
+            if r > 1.35:
+                return None
+            a = math.radians(ra_deg)
+            return (cx + R * r * math.cos(a),
+                    cy + ysign * R * r * math.sin(a))
+
+        # rings, labelled in degrees (or arcmin when the span is tight)
+        for frac in (0.25, 0.5, 0.75, 1.0):
+            rr = R * frac
+            deg = span * frac
+            cv.create_oval(cx - rr, cy - rr, cx + rr, cy + rr,
+                           outline="#2c3a4c")
+            lab = f"{deg*60:.0f}′" if span <= 1.0 else f"{deg:g}°"
+            cv.create_text(cx + rr - 2, cy - 7, text=lab, fill="#4a5a6c",
+                           font=("TkDefaultFont", 7), anchor="e")
+        # RA spokes every 2h, so the chart can be turned to match the sky
+        for hh in range(0, 12, 2):
+            a = math.radians(hh * 30.0)
+            cv.create_line(cx, cy, cx + R * math.cos(a),
+                           cy + ysign * R * math.sin(a), fill="#1e2836")
+            cv.create_text(cx + (R + 9) * math.cos(a),
+                           cy + ysign * (R + 9) * math.sin(a),
+                           text=f"{hh}h", fill="#3a4a5c",
+                           font=("TkDefaultFont", 7))
+
+        # catalogue stars: the reference the eye actually uses
+        cat = self._wide_catalog(south)
+        n_stars = 0
+        if cat is not None:
+            ra_c, dec_c, mag_c = cat
+            keep = (90.0 - np.abs(dec_c)) <= span * 1.3
+            ra_c, dec_c, mag_c = ra_c[keep], dec_c[keep], mag_c[keep]
+            order = np.argsort(mag_c)[:400]
+            for i in order:
+                p = project(float(ra_c[i]), float(dec_c[i]))
+                if p is None:
+                    continue
+                m = float(mag_c[i])
+                d = max(1.0, 4.2 - 0.45 * m)      # brighter = bigger
+                shade = max(90, min(255, int(255 - 16 * m)))
+                col = f"#{shade:02x}{shade:02x}{shade:02x}"
+                cv.create_oval(p[0] - d, p[1] - d, p[0] + d, p[1] + d,
+                               fill=col, outline="")
+                n_stars += 1
+                if m < 3.0:                        # name the obvious ones
+                    if self._star_names is None:
+                        try:
+                            self._star_names = sky.load_star_names(
+                                self.args.data_dir) or {}
+                        except Exception:
+                            self._star_names = {}
+                    nm = None
+                    if self._star_names:
+                        try:
+                            nm = sky.nearest_name(self._star_names,
+                                                  float(ra_c[i]),
+                                                  float(dec_c[i]),
+                                                  tol_arcmin=6.0)
+                        except Exception:
+                            nm = None
+                    if nm:
+                        cv.create_text(p[0] + d + 3, p[1], anchor="w",
+                                       text=nm, fill="#8fa0b4",
+                                       font=("TkDefaultFont", 7))
+
+        # the pole itself
+        cv.create_line(cx - 6, cy, cx + 6, cy, fill="#80a0c0")
+        cv.create_line(cx, cy - 6, cx, cy + 6, fill="#80a0c0")
+        cv.create_text(cx + 8, cy + 9, text=("SCP" if south else "NCP"),
+                       fill="#80a0c0", anchor="w",
+                       font=("TkDefaultFont", 8, "bold"))
+
+        # the camera's own footprint, to scale, around the field centre --
+        # this is the "where am I looking" the view exists to answer
+        w, h = self.current_size()
+        fp = project(field["ra"], field["dec"]) if field else None
+        if fp and w and self.arcsec_per_px:
+            half_w = (w * self.arcsec_per_px / 3600.0) / 2.0
+            half_h = (h * self.arcsec_per_px / 3600.0) / 2.0
+            sx, sy = R * half_w / span, R * half_h / span
+            # local north points at the pole; the frame is rotated from it by
+            # the solver's reported roll (indicative -- see the caption)
+            nx, ny = cx - fp[0], cy - fp[1]
+            nlen = math.hypot(nx, ny) or 1.0
+            base = math.atan2(ny, nx)
+            th = base + math.radians(self.solve_rot or 0.0)
+            ct, st = math.cos(th), math.sin(th)
+            pts = []
+            for ox, oy in ((-sx, -sy), (sx, -sy), (sx, sy), (-sx, sy)):
+                pts += [fp[0] + ox * st + oy * ct,
+                        fp[1] - ox * ct + oy * st]
+            cv.create_polygon(pts, outline="#00ff60", fill="", width=1,
+                              dash=(4, 3))
+
+        # field centre and RA axis, same colour language as the bullseye
+        if fp:
+            cv.create_oval(fp[0] - 4, fp[1] - 4, fp[0] + 4, fp[1] + 4,
+                           fill="#00ff60", outline="")
+        if axis:
+            ap = project(axis["ra"], axis["dec"])
+            if ap:
+                cv.create_line(ap[0] - 7, ap[1], ap[0] + 7, ap[1],
+                               fill="#ffb000", width=2)
+                cv.create_line(ap[0], ap[1] - 7, ap[0], ap[1] + 7,
+                               fill="#ffb000", width=2)
+                if fp:
+                    cv.create_line(ap[0], ap[1], cx, cy, fill="#7a5a10",
+                                   dash=(2, 4))
+
+        # legend
+        y0 = H - 30
+        cv.create_text(8, y0, anchor="w", fill="#00ff60",
+                       font=("TkDefaultFont", 8),
+                       text="● field centre + FOV")
+        cv.create_text(8, y0 + 12, anchor="w", fill="#ffb000",
+                       font=("TkDefaultFont", 8),
+                       text="✛ RA axis (aim this at the pole)")
+        cv.create_text(W - 8, y0, anchor="e", fill="#6a7a8c",
+                       font=("TkDefaultFont", 8),
+                       text=f"span {span:g}°"
+                            + (f" · {n_stars} stars" if n_stars
+                               else " · no catalogue"))
+        if n_stars == 0:
+            cv.create_text(W - 8, y0 + 12, anchor="e", fill="#6a7a8c",
+                           font=("TkDefaultFont", 8),
+                           text="run make_catalog.py for star reference")
+
     def _render_noise(self, cv):
         """Measured stack noise vs integration depth against the 1/sqrt(N)
         ideal. Where the green curve departs from the grey one is the
@@ -2340,21 +2648,24 @@ class App:
             x += 8 + 6 * len(label)
 
     def _show(self, canvas, img8, which, stars=None, stride=1, vectors=None,
-              cross=None, ghosts=None, cross2=None, pointing_radec=None):
+              cross=None, ghosts=None, cross2=None, pointing_radec=None,
+              mount_radec=None):
         """Draw onto the embedded canvas, and mirror to this view's
         dedicated image window when one is open."""
         self._render_image(canvas, img8, which, stars, stride, vectors,
                            cross, main=True, ghosts=ghosts, cross2=cross2,
-                           pointing_radec=pointing_radec)
+                           pointing_radec=pointing_radec,
+                           mount_radec=mount_radec)
         pop = self._img_popouts.get(which)
         if pop is not None and pop.winfo_exists():
             self._render_image(pop, img8, which, stars, stride, vectors,
                                cross, main=False, ghosts=ghosts,
-                               cross2=cross2, pointing_radec=pointing_radec)
+                               cross2=cross2, pointing_radec=pointing_radec,
+                               mount_radec=mount_radec)
 
     def _render_image(self, canvas, img8, which, stars, stride, vectors,
                       cross, main, ghosts=None, cross2=None,
-                      pointing_radec=None):
+                      pointing_radec=None, mount_radec=None):
         h, w = img8.shape
         cw = canvas.winfo_width()
         ch = canvas.winfo_height()
@@ -2443,6 +2754,20 @@ class App:
                                width=1)
             canvas.create_text(cx, cy + 22, text=radec_text(*pointing_radec),
                                fill="#40d0ff",
+                               font=("TkDefaultFont", 8, "bold"))
+        if mount_radec:
+            # what the MOUNT believes, kept visually distinct from the
+            # star-derived readout above so the two are never confused:
+            # this one is the mount's model, which is the thing that can be
+            # wrong. The delta is the mount's error against sky truth --
+            # what a SYNC at this position would zero out.
+            cx = cw / 2.0
+            cy = ch / 2.0 + (36 if pointing_radec else 22)
+            label = "MNT " + radec_text(*mount_radec)
+            if pointing_radec:
+                sep = 60.0 * ang_sep(*mount_radec, *pointing_radec)
+                label += f"   Δ{sep:.1f}'"
+            canvas.create_text(cx, cy, text=label, fill="#c080ff",
                                font=("TkDefaultFont", 8, "bold"))
         # known-good solve region: record the transform so canvas clicks map
         # back to full-res pixels, and keep the box drawn across frame
@@ -2773,6 +3098,8 @@ class App:
     def on_res_change(self):
         self.master_dark = None
         self.master_exp = None
+        self.master_proc = None          # processing path the dark was built at
+        self.master_proc_mismatch = None  # {ctrl: [then, now]} if it has moved
         self.defects = None
         self.master_flat = None
         self.flat_exp = None
@@ -2819,6 +3146,27 @@ class App:
             try:
                 meta = json.load(open(jp))
                 self.master_exp = meta.get("exposure_units")
+                self.master_proc = meta.get("processing_path") or None
+                # A master dark auto-loaded at a different gamma/brightness
+                # than it was built at is silently wrong. Now that the setting
+                # travels with the file, say so out loud.
+                if self.master_proc:
+                    now = cc.read_processing_path(self.var_dev.get())
+                    diff = {k: [v, now.get(k)]
+                            for k, v in self.master_proc.items()
+                            if k in now and now[k] != v}
+                    # exposure is expected to differ (the dark has its own);
+                    # it is already reported separately
+                    diff.pop("exposure_time_absolute", None)
+                    self.master_proc_mismatch = diff or None
+                    if diff:
+                        self.log("!! master dark was built at a DIFFERENT "
+                                 "processing path than the camera is in now: "
+                                 + ", ".join(f"{k} {a}->{b}"
+                                             for k, (a, b) in sorted(diff.items()))
+                                 + " -- the defect map and dark subtraction "
+                                   "are not valid at these settings; rebuild "
+                                   "the dark or restore the settings")
             except Exception:
                 pass
         fp = os.path.join(d, f"flat_{w}x{h}.npy")
@@ -2849,6 +3197,8 @@ class App:
             master_stats=(frame_stats(self.master_dark)
                           if self.master_dark is not None else None),
             master_exposure_units=self.master_exp,
+            master_processing_path=self.master_proc,
+            master_processing_mismatch=self.master_proc_mismatch,
             defects=0 if self.defects is None else len(self.defects),
             flat_found=self.master_flat is not None,
             flat_stats=(frame_stats(self.master_flat)
@@ -2863,13 +3213,18 @@ class App:
 
     def _update_dark_label(self):
         if self.master_dark is None:
-            self.lbl_dark.configure(text="no master dark")
+            self.lbl_dark.configure(text="no master dark", fg="black")
             self.btn_viewdark.configure(state="disabled")
         else:
             nd = 0 if self.defects is None else len(self.defects)
             exp = f" @ exp {self.master_exp}" if self.master_exp else ""
+            # a dark loaded at the wrong processing path is worse than none:
+            # make that visible in the label, not just the log
+            bad = getattr(self, "master_proc_mismatch", None)
+            warn = f" !! built at different {'/'.join(sorted(bad))}" if bad else ""
             self.lbl_dark.configure(
-                text=f"master dark ready{exp}, {nd} defects")
+                text=f"master dark ready{exp}, {nd} defects{warn}",
+                fg=("#802000" if bad else "black"))
             self.btn_viewdark.configure(state="normal")
 
     def _apply_panel_level(self, *a):
@@ -3254,6 +3609,7 @@ class App:
         if self.busy():
             self.on_stop()
         self._set_mode_banner()
+        self._apply_mode_layout()
         self._update_mode_ui()
 
     def on_reset_stack(self):
@@ -3538,7 +3894,10 @@ class App:
                  "RA, solve again", fg="#c08000")
         self.lbl_bolts.configure(text="Adjust: no axis fit yet",
                                  fg="#c08000")
+        self.bolt_corr = None       # the mount view has nothing to show now
         self._draw_bullseye()
+        self._draw_mount()
+        self._draw_wide()
         self.log("RA-axis calibration cleared; the next two solves "
                  "spanning a rotation will re-derive it")
 
@@ -3641,8 +4000,44 @@ class App:
             # worker_done and the UI buttons come back
             cap = self.make_capture(dev, w, h)
             cc.set_ctrl(dev, "auto_exposure", 1)
+
+            # Short BIAS reference at minimum exposure, before the deep stack.
+            # Without a short-exposure comparison there is no way to tell a
+            # pixel that is always hot from one that merely has steep dark
+            # current, and those need different remedies (interpolate vs let
+            # the scaled dark subtraction handle it). A few frames buys that.
+            bias_px = bias_exp = None
+            try:
+                erng = cc.get_ctrl_range(dev, "exposure_time_absolute")
+                bexp = int(erng.get("min", 1) or 1)
+                if bexp < exp:
+                    cc.set_ctrl(dev, "exposure_time_absolute", bexp)
+                    cap.exposure = bexp
+                    bpath, _, _ = cap.capture_run(8, discard=1, timeout=30.0,
+                                                  verbose=False)
+                    bacc, bn = None, 0
+                    for fr in cap.iter_luma(bpath, 8, discard=1):
+                        bn += 1
+                        if bacc is None:
+                            bacc = np.zeros_like(fr)
+                        bacc += (fr - bacc) / bn
+                    try:
+                        os.remove(bpath)
+                    except OSError:
+                        pass
+                    if bacc is not None:
+                        bias_px = bacc.astype(np.float32)
+                        bias_exp = bexp
+                        self.q.put(("log", f"bias reference: {bn} frames at "
+                                           f"exposure {bexp}"))
+            except Exception as e:
+                self.q.put(("log", f"bias reference skipped: {e}"))
+
             cc.set_ctrl(dev, "exposure_time_absolute", exp)
+            cap.exposure = exp
             mean = None
+            m2 = None       # Welford: per-pixel temporal variance accumulator
+            mx = None       # per-pixel maximum, for intermittent detection
             count = 0
             while count < total and not self.stop_evt.is_set():
                 burst = min(16, total - count)
@@ -3657,7 +4052,12 @@ class App:
                     count += 1
                     if mean is None:
                         mean = np.zeros_like(fr)
-                    mean += (fr - mean) / count
+                        m2 = np.zeros_like(fr)
+                        mx = fr.copy()
+                    delta = fr - mean
+                    mean += delta / count
+                    m2 += delta * (fr - mean)
+                    np.maximum(mx, fr, out=mx)
                     if dd and len(dd_raw) < 8:  # cap the memory cost
                         dd_raw.append(fr.copy())
                     last = fr
@@ -3698,13 +4098,29 @@ class App:
             clipped = floor_frac > 0.5 or ceil_frac > 0.5
             hot = cc.hot_pixel_mask(mean)
             coords = np.argwhere(hot)
+            # Sort the defects by HOW they fail. stuck and intermittent pixels
+            # have to be interpolated (no master dark can subtract something
+            # that is inconsistent frame to frame); hot and dark-current
+            # pixels the subtraction already handles.
+            defects = None
+            if count > 1:
+                try:
+                    defects = cc.classify_defects(
+                        mean, np.sqrt(m2 / (count - 1)), max_px=mx,
+                        bias=bias_px, exposure_max=exp,
+                        exposure_bias=bias_exp)
+                except Exception:
+                    self.dbg.exc("error", where="classify_defects")
             self.dbg.log("dark_done", frames=count, hot_pixels=len(coords),
                          master=frame_stats(mean), exposure_units=exp,
                          clipped=clipped,
                          clip_floor_frac=round(floor_frac, 4),
-                         clip_ceil_frac=round(ceil_frac, 4))
+                         clip_ceil_frac=round(ceil_frac, 4),
+                         defect_counts=((defects or {}).get("counts")
+                                        if (defects or {}).get("ok") else None),
+                         bias_exposure_units=bias_exp)
             self.q.put(("dark_done", mean, coords, exp, count,
-                        (clipped, floor_frac, ceil_frac)))
+                        (clipped, floor_frac, ceil_frac), defects))
         except Exception as e:
             self.dbg.exc("error", where="dark_worker")
             self.q.put(("log", f"dark acquisition failed: {e}"))
@@ -4020,7 +4436,6 @@ class App:
         sub = sub and master is not None
         flt = flt and flat is not None
         fix = fix and defects is not None and len(defects) > 0
-        burst = 6
         # rolling integration: ring buffer of the last N processed frames
         # (float32 to halve memory), running float64 sum for O(1) update
         ring = deque()
@@ -4029,6 +4444,7 @@ class App:
         pause_ref_stars = None
         was_paused = False
         warned_drift = False   # one-shot UI warning for magnitude rejections
+        warned_single = False  # one-shot note that N=1 bypasses alignment
         # static-camera star pipeline: run the detector at an adaptive
         # threshold steered toward the user's "visible stars" count, and
         # let the temporal tracker confirm which candidates persist --
@@ -4058,6 +4474,13 @@ class App:
             while not self.stop_evt.is_set():
                 cap.exposure = self.exp_value  # live-adjustable
                 maxn = self.stack_max_value
+                # At N=1 every frame but the last would be captured, processed
+                # and then immediately evicted from the ring -- six frames of
+                # latency for one displayed. Match the burst to the window so
+                # the single-frame view is actually live. Recomputed each
+                # cycle because the window is adjustable while running.
+                burst = 1 if maxn == 1 else 6
+                single = (maxn == 1)
                 path, _, _ = cap.capture_run(burst, discard=1,
                                              timeout=60.0, verbose=False)
                 paused = self.pause_evt.is_set()
@@ -4105,7 +4528,13 @@ class App:
                             dd_stats.append({"raw": frame_stats(fr),
                                              "proc": frame_stats(proc)})
                         continue          # display only; no integration
-                    if align:
+                    # Alignment is a stacking operation: it exists to put
+                    # frames on top of each other. With a window of one there
+                    # is nothing to align WITH, and shifting the frame to a
+                    # stale reference would resample and edge-fill it for no
+                    # gain -- so a single-frame view shows the frame as
+                    # captured.
+                    if align and not single:
                         small, f = downsample_to_fit(proc, ALIGN_THUMB, ALIGN_THUMB)
                         if align_ref is None:
                             align_ref = small.copy()
@@ -4197,6 +4626,17 @@ class App:
                 elif last_applied:
                     warned_drift = False
 
+                # say once that the align checkbox is inert at N=1, rather
+                # than leaving it ticked and apparently doing something
+                if single and align and not warned_single:
+                    warned_single = True
+                    self.q.put(("log",
+                                "single-frame mode (window = 1): alignment is "
+                                "bypassed -- there is nothing to align to, and "
+                                "the frame is shown as captured"))
+                elif not single:
+                    warned_single = False
+
                 raw_small, stride = downsample_to_fit(
                     last_raw, self.canvas_w, self.canvas_h)
                 raw8 = stretch_to_u8(raw_small)
@@ -4285,6 +4725,21 @@ class App:
                     sender = self.stellarium_sender
                     if sender is not None:
                         sender.send(*self.pointing_radec)
+                # the mount's OWN idea of where it points, read every burst
+                # whether or not a pointing anchor exists (an unsolved field
+                # still has a mount readout). Where both are known their
+                # separation is the interesting number: it is the mount
+                # model's error against sky truth, which is what a SYNC
+                # would zero out.
+                mnt = self._read_mount()
+                if mnt is not None and self.pointing_radec is not None:
+                    self.dbg.log("mount_vs_sky",
+                                 mount_ra=mnt[0], mount_dec=mnt[1],
+                                 sky_ra=self.pointing_radec[0],
+                                 sky_dec=self.pointing_radec[1],
+                                 sep_arcmin=60.0 * ang_sep(
+                                     mnt[0], mnt[1], *self.pointing_radec),
+                                 slewing=self.indi_mount.is_slewing())
                 # sky-prior classification: label confirmed stars with
                 # their catalogue identity, flag the unexpected. The gate
                 # demands position AND (when a response is fitted) flux
@@ -4587,7 +5042,7 @@ class App:
                     text=f"@ {fps:.1f} fps -- no master dark: corrected "
                          "view unavailable (acquire one)")
         elif kind == "dark_done":
-            _, mean, coords, exp, count, clip = msg
+            _, mean, coords, exp, count, clip, defects = msg
             clipped, floor_frac, ceil_frac = clip
             if clipped:
                 # same refusal cam_characterise applies: a rail-pinned master
@@ -4607,14 +5062,39 @@ class App:
                 return
             self.master_dark = mean
             self.master_exp = exp
-            self.defects = coords if len(coords) else None
-            self._save_dark(mean, coords, exp, count)
+            # The repair list is the pixels that CANNOT be calibrated out:
+            # stuck and intermittent, plus stable-hot. Dark-current pixels are
+            # left to the subtraction, which is what they respond to.
+            repair = coords
+            if (defects or {}).get("ok"):
+                pts = []
+                for c in DEFECT_REPAIR_CLASSES:
+                    pts.extend(tuple(p) for p in defects["coords"][c])
+                repair = np.array(sorted(set(pts)), dtype=int) if pts \
+                    else np.empty((0, 2), dtype=int)
+            self.defects = repair if len(repair) else None
+            self._save_dark(mean, repair, exp, count, defects)
             self._update_dark_label()
-            self.log(f"master dark: {count} frames, "
-                     f"{len(coords)} hot pixels")
+            if (defects or {}).get("ok"):
+                c = defects["counts"]
+                self.log(f"master dark: {count} frames, {c['total']} defects "
+                         f"(stuck {c['stuck']}, intermittent "
+                         f"{c['intermittent_hot']}, hot {c['hot']}, "
+                         f"dark-current {c['dark_current']}) — "
+                         f"{len(repair)} written for repair")
+                if "skipped" in (defects.get("dark_current_stats") or {}):
+                    self.log("  dark-current class unavailable: no bias "
+                             "reference was captured")
+                self.set_status(
+                    f"master dark complete: {count} frames, {len(repair)} "
+                    f"repairable defects — saved", fg="#80ff80")
+            else:
+                self.log(f"master dark: {count} frames, "
+                         f"{len(repair)} hot pixels")
+                self.set_status(f"master dark complete: {count} frames, "
+                                f"{len(repair)} hot pixels — saved",
+                                fg="#80ff80")
             self.lf_right.configure(text="Dark-corrected residual")
-            self.set_status(f"master dark complete: {count} frames, "
-                            f"{len(coords)} hot pixels — saved", fg="#80ff80")
         elif kind == "panel_level":
             # the flat worker's illumination servo: setting the Tk variable
             # repaints the panel via its write trace (and mirrors the value
@@ -4702,7 +5182,8 @@ class App:
             self._show(self.canvas_stack, stack8, "stack",
                        stars=stars, stride=stride, cross=self.pole_xy,
                        ghosts=ghosts, cross2=self.axis_xy,
-                       pointing_radec=self.pointing_radec)
+                       pointing_radec=self.pointing_radec,
+                       mount_radec=self.mount_radec)
             self._draw_hist([(hraw, "#7a8aa0", 0.0, 256.0, "raw"),
                              (hstack, "#00d050", 0.0, 256.0, "stack")])
             if not self.noise_hist or n > self.noise_hist[-1][0]:
@@ -4721,8 +5202,10 @@ class App:
             # on is the closed-loop verification the flat works
             flat_note = (f"  ·  corners {f_ratio * 100:.0f}% of centre"
                          if f_ratio is not None else "")
+            depth = ("single frame (no stacking)" if maxn == 1
+                     else f"integrating: {n}/{maxn} frames")
             self.lbl_stack.configure(
-                text=f"integrating: {n}/{maxn} frames @ {fps:.1f} fps  ·  "
+                text=f"{depth} @ {fps:.1f} fps  ·  "
                      f"stretch {st_lo:.2f}..{st_hi:.2f} ADU "
                      f"(span {st_hi - st_lo:.2f}){flat_note}")
             # detection is already scoped to the ROI in the worker, so this
@@ -4763,7 +5246,11 @@ class App:
                     {"t": time.time(), "ra": info["ra"], "dec": info["dec"],
                      "sep_arcmin": (90.0 - abs(info["dec"])) * 60.0})
                 del self.solve_history[:-50]
+                # plate scale and roll feed the wide view's to-scale FOV box
+                self.arcsec_per_px = info.get("arcsec_per_px")
+                self.solve_rot = info.get("rot")
                 self._draw_bullseye()
+                self._draw_wide()
                 self.pole_xy = info.get("pole_xy")
                 # WCS pixels are relative to the solved crop -- shift them
                 # back to full-frame coords so the crosshair lands correctly
@@ -4928,6 +5415,8 @@ class App:
                                          + bolt_correction_text(corr),
                                     fg=("#00c060" if corr["calibrated"]
                                         else "#c08000"))
+                                self.bolt_corr = corr
+                                self._draw_mount()
                                 self.dbg.log("bolt_correction", **corr)
                             if self.axis_xy:
                                 axis_ra, axis_dec = wcs.pix_to_sky(
@@ -4968,6 +5457,7 @@ class App:
                                          + refr_txt,
                                     fg="#00c060")
                                 self._draw_bullseye()
+                                self._draw_wide()
                                 self.dbg.log(
                                     "axis_sky", ra=round(axis_ra, 4),
                                     dec=round(axis_dec, 4),
@@ -5039,7 +5529,7 @@ class App:
             self._set_mode_banner()  # restore right-canvas label
             self.set_status("stopped — ready", fg="#80ff80")
 
-    def _save_dark(self, mean, coords, exp, count):
+    def _save_dark(self, mean, coords, exp, count, defects=None):
         w, h = self.current_size()
         d = self.data_dir()
         os.makedirs(d, exist_ok=True)
@@ -5047,23 +5537,60 @@ class App:
         u16 = np.clip(np.round(mean * 257.0), 0, 65535).astype(np.uint16)
         np.save(mp, u16)
         dp = os.path.join(d, f"defects_{w}x{h}.txt")
+        ok = bool((defects or {}).get("ok"))
         with open(dp, "w") as fh:
             fh.write("# PHD2 Defect Map v1\n")
             fh.write(f"# cam_observe.py {self.var_dev.get()} {w}x{h}\n")
             fh.write(f"# Exposure: {exp} units\n")
+            if ok:
+                fh.write(f"# Classes included: "
+                         f"{','.join(DEFECT_REPAIR_CLASSES)}\n")
+                for c in sorted(defects["counts"]):
+                    if c == "total":
+                        continue
+                    mark = "*" if c in DEFECT_REPAIR_CLASSES else " "
+                    fh.write(f"#  {mark} {c}: {defects['counts'][c]}\n")
+                fh.write("#  (* = written here; unmarked classes are handled "
+                         "by dark subtraction)\n")
             fh.write(f"# Defect count: {len(coords)}\n")
             for y, x in coords:
                 fh.write(f"{x} {y}\n")
+        if ok:
+            # full per-class detail alongside; the map itself stays x-y only
+            # because PHD2 parses it
+            cp = os.path.join(d, f"defect_classes_{w}x{h}.json")
+            with open(cp, "w") as fh:
+                json.dump({"counts": defects["counts"],
+                           "thresholds": defects["thresholds"],
+                           "remedy": defects["remedy"],
+                           "dark_current_stats": defects["dark_current_stats"],
+                           "written_to_map": list(DEFECT_REPAIR_CLASSES),
+                           "exposure_units": exp,
+                           "coords": defects["coords"]}, fh, indent=2)
         jp = os.path.join(d, f"dark_meta_{w}x{h}.json")
+        # The processing path travels with the calibration. gamma alone moved
+        # the defect count 12 -> 1057 on this bridge, so a master dark or
+        # defect map built at one setting is simply wrong at another -- and
+        # without this stamp nothing downstream could tell.
+        proc = cc.read_processing_path(self.var_dev.get())
         with open(jp, "w") as fh:
             json.dump({"exposure_units": exp, "frames": count,
                        "hot_pixels": int(len(coords)),
+                       "defect_counts": (defects["counts"] if ok else None),
+                       "defect_classes_in_map": (list(DEFECT_REPAIR_CLASSES)
+                                                 if ok else None),
+                       "processing_path": proc,
                        "timestamp_utc":
                            datetime.now(timezone.utc).isoformat()}, fh,
                       indent=2)
         self.dbg.log("dark_saved", master=mp, defects=dp, meta=jp,
-                     hot_pixels=int(len(coords)), exposure_units=exp)
+                     hot_pixels=int(len(coords)), exposure_units=exp,
+                     defect_counts=(defects["counts"] if ok else None),
+                     processing_path=proc)
         self.log(f"saved {mp}, {dp}, {jp}")
+        if proc:
+            self.log("  processing path recorded: " + ", ".join(
+                f"{k}={v}" for k, v in sorted(proc.items())))
 
     def _save_flat(self, gain, exp, count, info):
         w, h = self.current_size()
@@ -5159,6 +5686,35 @@ def main():
                     help="destination UDP port for the Stellarium "
                          "position feed (default 5005; not Stellarium's "
                          "own TCP port -- see README for the relay step)")
+    ap.add_argument("--indi-host", default="127.0.0.1",
+                    help="indiserver host for the INDI camera/mount options "
+                         "below (default 127.0.0.1; a remote indiserver "
+                         "works unchanged)")
+    ap.add_argument("--indi-port", type=int, default=indi.INDI_DEFAULT_PORT,
+                    help=f"indiserver port (default "
+                         f"{indi.INDI_DEFAULT_PORT})")
+    ap.add_argument("--indi-camera", default=None,
+                    help="INDI CCD device name (e.g. 'CCD Simulator') to "
+                         "expose frames from instead of the v4l2 --device. "
+                         "An INDI source is a peer of the v4l2 path: the "
+                         "same stacking, solving and pointing pipeline runs "
+                         "on top of it. Omit to use v4l2.")
+    ap.add_argument("--indi-mount", default=None,
+                    help="INDI telescope device name (e.g. 'Telescope "
+                         "Simulator') to read RA/Dec from. Shown alongside "
+                         "the catalogue-free pointing readout with the "
+                         "separation between them -- i.e. how far the "
+                         "mount's own model has drifted from sky truth. "
+                         "Independent of --indi-camera.")
+    ap.add_argument("--indi-exposure-scale", type=float, default=1e-4,
+                    help="seconds per unit of the Exposure field when "
+                         "driving an INDI camera. Default 1e-4 because the "
+                         "UI's Exposure box is in 100us units (it also "
+                         "drives v4l2 exposure_time_absolute, which is "
+                         "defined in those units) -- so the SAME number "
+                         "means the same exposure time on either source. "
+                         "Override for a driver you would rather address "
+                         "in other units.")
     ap.add_argument("--latitude", type=float, default=None,
                     help="observing site latitude in degrees (+N/-S) -- "
                          "the celestial pole sits at exactly this true "

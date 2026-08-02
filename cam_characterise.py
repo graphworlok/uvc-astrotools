@@ -28,6 +28,17 @@ refused for measurement because the codec destroys exactly the noise you are
 trying to quantify). Capture shells out to v4l2-ctl --stream-mmap (see the
 Capture class for why); no OpenCV required.
 
+The ONE exception, and it is not a measurement: the framerate-vs-exposure test
+(--fps-probe, and the probe --dark runs by default) uses MJPEG deliberately.
+That test reads frame TIMESTAMPS, never pixel values, so a lossy codec cannot
+corrupt it -- while the smaller payload lifts the USB bandwidth ceiling far
+enough that the frame period is set by integration rather than by the bus,
+which is the only condition under which the test says anything at all. In an
+uncompressed format at any useful resolution the framerate is pinned flat and
+the verdict is forever "indeterminate (bandwidth-limited)". See FpsProbe: it
+has no decode path, structurally, so nothing it captures can reach a mean, a
+noise figure, a master dark or a defect map.
+
 USAGE (typical, run as root for v4l2 control access):
   # 1. just list + rank formats and pick the measurement format
   sudo ./cam_characterise.py --device /dev/video0 --list
@@ -60,7 +71,6 @@ Notes specific to long exposure:
 
 import argparse
 import ctypes
-import fcntl
 import hashlib
 import json
 import os
@@ -72,6 +82,15 @@ import time
 from datetime import datetime, timezone
 
 import numpy as np
+
+# fcntl is Linux-only and only the format-enumeration ioctl needs it. Importing
+# it at module scope made the whole file unimportable elsewhere -- including the
+# pure-analysis layer (--compare, the fits, the guards), which touches no
+# hardware and is explicitly meant to run on a machine with no camera attached.
+try:
+    import fcntl
+except ImportError:                     # not Linux: capture is unavailable,
+    fcntl = None                        # analysis is not
 
 # ----------------------------------------------------------------------------
 # Minimal V4L2 ioctl layer (avoids depending on python-v4l2 packaging).
@@ -154,6 +173,10 @@ def xioctl(fd, req, arg):
     the struct's own memory in a writable buffer and pass it with
     mutate_flag=True so the kernel's writes land in `arg` directly.
     """
+    if fcntl is None:
+        raise RuntimeError(
+            "V4L2 capture requires Linux (the fcntl module is unavailable on "
+            "this platform). Analysis modes such as --compare still work.")
     buf = (ctypes.c_char * ctypes.sizeof(arg)).from_address(ctypes.addressof(arg))
     while True:
         try:
@@ -438,6 +461,124 @@ class Capture:
 
 
 # ----------------------------------------------------------------------------
+# Framerate probe: MJPEG as a CLOCK, never as a measurement
+#
+# The fps-vs-exposure test is the instrument that separates real integration
+# from synthetic (gain-boost / frame-sum) exposure. It only works where the
+# frame PERIOD is set by integration rather than by bus bandwidth -- and in an
+# uncompressed format at any useful resolution, USB pins the frame rate flat, so
+# the test returns "indeterminate (bandwidth-limited)" and tells you nothing.
+#
+# But that test never looks at a single pixel value. It reads frame TIMESTAMPS.
+# A lossy codec destroys the noise this tool exists to measure, which is why
+# compressed formats are refused everywhere else -- and it does not perturb when
+# frames arrive. So for timing alone, MJPEG is the right instrument: it cuts the
+# per-frame payload by an order of magnitude, lifting the bandwidth ceiling well
+# above the integration knee, and the knee becomes directly observable.
+#
+# The hard rule, enforced by this class having no decode path at all: frames
+# captured here are COUNTED, never READ. Nothing from an MJPEG probe reaches a
+# mean, a noise figure, a master dark or a defect map.
+# ----------------------------------------------------------------------------
+
+class FpsProbe:
+    """Measures effective framerate vs exposure in a low-bandwidth format.
+
+    Deliberately has no _luma_from_frame and never writes frames to disk: it
+    runs v4l2-ctl --stream-mmap WITHOUT --stream-to and reads the per-buffer
+    timestamps off --verbose output. Frame payload is discarded by the kernel;
+    only the clock survives."""
+
+    def __init__(self, device, width, height, pixfmt_str):
+        self.device = device
+        self.w, self.h = width, height
+        self.pixfmt_str = pixfmt_str.strip()
+
+    def measure(self, exposure, frames=30, discard=3, timeout=None):
+        """Set exposure + format and stream `frames` frames, returning
+        (fps, n_timestamps). fps comes from the kernel's buffer timestamps, so
+        it excludes process spawn / S_FMT / STREAMON overhead."""
+        total = frames + discard
+        if timeout is None:
+            per_frame_s = max(0.2, (exposure or 0) * 1e-4 * 2.0)
+            timeout = max(20.0, total * per_frame_s + 10)
+        cmd = ["v4l2-ctl", "-d", self.device,
+               f"--set-fmt-video=width={self.w},height={self.h},"
+               f"pixelformat={self.pixfmt_str}",
+               "--set-ctrl", f"exposure_time_absolute={exposure}",
+               "--stream-mmap", f"--stream-count={total}", "--verbose"]
+        t0 = time.monotonic()
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return 0.0, 0
+        elapsed = time.monotonic() - t0
+        txt = (r.stderr or "") + (r.stdout or "")
+        ts = [float(m) for m in re.findall(r"\bts:\s*([0-9]+\.[0-9]+)", txt)]
+        # drop the settle frames before timing: the first buffers after
+        # STREAMON carry pipeline spin-up, not the steady-state period
+        ts = ts[discard:] if len(ts) > discard + 1 else ts
+        if len(ts) >= 2 and ts[-1] > ts[0]:
+            return (len(ts) - 1) / (ts[-1] - ts[0]), len(ts)
+        return ((total / elapsed) if elapsed > 0 else 0.0), len(ts)
+
+
+def pick_timing_format(ranked, advertised, width, height):
+    """Choose the lowest-bandwidth format available at this resolution.
+
+    Prefers MJPEG: it is the most widely advertised compressed format on UVC
+    bridges and gives the largest bandwidth headroom. Falls back through any
+    other compressed format, then gives up (returning None) so the caller can
+    say plainly that the timing probe cannot help at this resolution rather
+    than silently running it at full bandwidth and reporting a flat curve."""
+    def _advertised_here(fcc):
+        if not advertised:
+            return None          # no mode list -- unknown, allow the attempt
+        return any(m["fourcc"].strip() == fcc
+                   and m["width"] == width and m["height"] == height
+                   for m in advertised)
+
+    have = {f["fourcc"].strip() for f in ranked}
+    for fcc in ("MJPG", "JPEG", "H264", "HEVC", "H265"):
+        if fcc not in have:
+            continue
+        adv = _advertised_here(fcc)
+        if adv is False:
+            continue
+        return {"fourcc": fcc, "advertised_at_size": adv}
+    return None
+
+
+def run_fps_probe(device, width, height, fourcc, ladder, frames=30,
+                  discard=3, verbose=True):
+    """Sweep exposure and measure framerate only, in a low-bandwidth format.
+
+    Returns records shaped exactly like the dark ladder's (exposure_units,
+    eff_fps) so derive_knee and exposure_fidelity_verdict consume them
+    unchanged -- but carrying no mean_adu, because there is none to carry."""
+    probe = FpsProbe(device, width, height, fourcc)
+    if verbose:
+        print(f"\n=== FRAMERATE PROBE ({fourcc} @ {width}x{height}) ===")
+        print("Timing only: frames are counted, never read. A lossy codec "
+              "cannot perturb\nwhen frames arrive, and the reduced payload "
+              "lifts the bandwidth ceiling so the\nintegration knee becomes "
+              "visible. No pixel value from this pass is used.\n")
+    out = []
+    for exp in ladder:
+        fps, nts = probe.measure(exp, frames=frames, discard=discard)
+        rb = get_ctrl(device, "exposure_time_absolute")
+        rec = {"exposure_units": exp, "exposure_readback": rb,
+               "eff_fps": round(fps, 3), "timestamps": nts,
+               "timing_format": fourcc}
+        out.append(rec)
+        if verbose:
+            print(f"   exp={exp:6d} (rb={rb})  {fps:7.2f} fps  "
+                  f"({nts} timestamps)")
+    return out
+
+
+# ----------------------------------------------------------------------------
 # Format enumeration + ranking
 # ----------------------------------------------------------------------------
 
@@ -621,8 +762,19 @@ def _med3(a, b, c):
     return np.maximum(np.minimum(a, b), np.minimum(np.maximum(a, b), c))
 
 
-def hot_pixel_mask(master, nsigma=6.0):
-    """Single-pixel outliers above a locally-smoothed master.
+def _robust_scale(a):
+    """(median, 1.4826*MAD) of an array, with a fallback when the MAD is zero
+    (exactly flat data -- synthetic, clamped, or quantiser-collapsed)."""
+    med = float(np.median(a))
+    mad = float(np.median(np.abs(a - med)))
+    sigma = 1.4826 * mad
+    if sigma <= 0:
+        sigma = float(a.std()) or 1e-6
+    return med, sigma
+
+
+def local_residual(master):
+    """Structure-removed residual of a master frame, plus its robust scale.
 
     Thresholding the RAW master at mean+6*std fails at native resolution: the
     std includes the shading/FPN structure (the LSC gradient), which inflates
@@ -630,22 +782,400 @@ def hot_pixel_mask(master, nsigma=6.0):
     flags whole corners. So: remove structure with a separable median-of-3
     smooth (kills single-pixel spikes, follows gradients), then threshold the
     residual against a robust MAD sigma (so the hot pixels themselves cannot
-    inflate the noise estimate they are tested against)."""
+    inflate the noise estimate they are tested against).
+
+    Returns (resid, smooth, med, sigma). The smoothed frame is handed back so
+    the defect classifier can test other statistics (a per-pixel maximum, say)
+    against the same neighbourhood baseline instead of recomputing it."""
     m = master.astype(np.float32, copy=False)
     pl = np.pad(m, ((0, 0), (1, 1)), mode="edge")
     hsm = _med3(pl[:, :-2], pl[:, 1:-1], pl[:, 2:])
     pv = np.pad(hsm, ((1, 1), (0, 0)), mode="edge")
     smooth = _med3(pv[:-2, :], pv[1:-1, :], pv[2:, :])
     resid = m - smooth
-    med = float(np.median(resid))
-    mad = float(np.median(np.abs(resid - med)))
-    sigma = 1.4826 * mad
-    if sigma <= 0:  # exactly flat residual (synthetic/clamped data)
-        sigma = float(resid.std()) or 1e-6
+    med, sigma = _robust_scale(resid)
+    return resid, smooth, med, sigma
+
+
+def hot_pixel_mask(master, nsigma=6.0):
+    """Single-pixel outliers above a locally-smoothed master."""
+    resid, _smooth, med, sigma = local_residual(master)
     return resid > (med + nsigma * sigma)
 
 
-def build_fps_calibration(ladder_data):
+# ----------------------------------------------------------------------------
+# Defect classification
+#
+# "1057 hot pixels" is not actionable, because the pixels in that list fail in
+# three different ways with three different remedies:
+#
+#   stuck / hot        consistently wrong in every frame. A STUCK pixel has
+#                      zero temporal variance -- it is not responding at all --
+#                      while a HOT one still responds, just from an elevated
+#                      floor. Both are stable, so a master-dark subtraction
+#                      genuinely removes them, until they saturate.
+#
+#   intermittent hot   wrong in SOME frames. This is the one that matters most
+#                      and the one a single-threshold defect map cannot see:
+#                      the pixel's average looks unremarkable, so subtraction
+#                      leaves a residual that flickers frame to frame. It
+#                      cannot be calibrated out -- it has to be interpolated
+#                      over. Random telegraph signal behaves exactly this way.
+#
+#   dark current       fine at short exposure, elevated at long. Not a defect
+#                      so much as a steep pixel: it scales with integration
+#                      time, so a SCALED dark subtraction handles it, and it
+#                      does not belong in an interpolation list at all.
+#
+# Separating them tells you which pixels to interpolate (the first two) and
+# which the dark frame already handles (the last two).
+# ----------------------------------------------------------------------------
+
+def classify_defects(master, temporal_std, max_px=None, bias=None,
+                     exposure_max=None, exposure_bias=None, nsigma=6.0,
+                     unstable_sigma=6.0, excursion_sigma=6.0):
+    """Sort defective pixels into stuck / hot / intermittent / dark-current.
+
+    master        per-pixel mean of the deep stack
+    temporal_std  per-pixel temporal std of the deep stack (sqrt(M2/(n-1)))
+    max_px        per-pixel maximum over the deep stack. Without it the
+                  "hot in some frames but not the average" test cannot run and
+                  intermittents are found by instability alone.
+    bias          per-pixel mean at the SHORTEST ladder exposure. Without it
+                  there is no exposure lever arm and the dark-current category
+                  is not attempted.
+
+    Categories are mutually exclusive, assigned in this precedence: stuck,
+    then intermittent, then hot, then dark current. Instability outranks
+    elevation deliberately -- a pixel that is hot in 60% of frames reads as
+    "hot" on the average, but subtraction will not fix it, so it must land in
+    the intermittent bucket where it gets interpolated instead."""
+    resid, smooth, med, sigma = local_residual(master)
+    hot_thresh = med + nsigma * sigma
+    elevated = resid > hot_thresh
+
+    t = np.asarray(temporal_std, dtype=np.float32)
+    t_med, t_sig = _robust_scale(t)
+
+    # STUCK: never moved across the whole stack. Definitive -- zero variance
+    # over N frames is not something a live pixel does.
+    frozen = (t <= 0)
+    out = {"nsigma": nsigma, "n_pixels": int(master.size)}
+
+    # A collapsed output makes EVERY pixel frozen. That is the quantiser guard's
+    # business, not a defect finding, and mislabelling it as millions of stuck
+    # pixels would be worse than saying nothing.
+    frozen_frac = float(frozen.mean())
+    if frozen_frac > 0.10:
+        out.update({
+            "ok": False,
+            "reason": (f"{frozen_frac*100:.1f}% of pixels have zero temporal "
+                       "variance -- the output is quantiser-collapsed, not "
+                       "covered in stuck pixels. Classification refused; fix "
+                       "the processing path and re-run."),
+            "frozen_fraction": round(frozen_frac, 4)})
+        return out
+
+    stuck = frozen & (elevated | (master <= 0.5) | (master >= 254.5))
+
+    # INTERMITTENT: unstable in time. Two independent detectors --
+    #  (a) temporal std far above the population (switching, not shot noise);
+    #  (b) a maximum that reaches hot while the MEAN never does, which is the
+    #      signature a threshold-on-the-average defect map walks straight past.
+    unstable = t > (t_med + unstable_sigma * t_sig)
+    spike = np.zeros_like(unstable)
+    if max_px is not None:
+        # excursion measured in units of the POPULATION's temporal noise, so a
+        # pixel is only "spiking" if it exceeds what N samples of ordinary
+        # noise would produce
+        excursion = (np.asarray(max_px, dtype=np.float32) - master.astype(
+            np.float32, copy=False))
+        spike = excursion > (excursion_sigma * max(t_med, 1e-6))
+        spike &= (np.asarray(max_px, dtype=np.float32) - smooth) > hot_thresh
+    intermittent = (~stuck) & (unstable | spike)
+
+    hot = elevated & (~stuck) & (~intermittent)
+
+    # DARK CURRENT: needs the exposure lever arm. The two endpoints of the
+    # ladder give the longest baseline available and therefore the best-
+    # conditioned per-pixel slope.
+    dark_current = np.zeros_like(hot)
+    dc_stats = None
+    if bias is not None and exposure_max and exposure_bias is not None \
+            and exposure_max > exposure_bias:
+        dark_signal = master.astype(np.float32, copy=False) - np.asarray(
+            bias, dtype=np.float32)
+        d_med, d_sig = _robust_scale(dark_signal)
+        span = float(exposure_max - exposure_bias)
+        steep = dark_signal > (d_med + nsigma * d_sig)
+        dark_current = steep & (~stuck) & (~intermittent) & (~hot)
+        rate = dark_signal / span
+        dc_stats = {
+            "exposure_span_units": span,
+            "median_dark_signal_adu": round(d_med, 5),
+            "robust_sigma_adu": round(d_sig, 5),
+            "median_rate_adu_per_unit": float(np.median(rate)),
+            "p99_9_rate_adu_per_unit": float(np.percentile(rate, 99.9)),
+            "max_rate_adu_per_unit": float(rate.max()),
+            "threshold_adu": round(d_med + nsigma * d_sig, 5),
+        }
+    else:
+        dc_stats = {"skipped": (
+            "no bias frame or no exposure lever arm: the dark-current category "
+            "needs a short-exposure reference to compare the deep stack "
+            "against. Run a ladder with at least one point well below "
+            "--exposure-max.")}
+
+    def _coords(mask):
+        return np.argwhere(mask).tolist()     # [[y, x], ...]
+
+    cats = {"stuck": stuck, "intermittent_hot": intermittent,
+            "hot": hot, "dark_current": dark_current}
+    out.update({
+        "ok": True,
+        "counts": {k: int(v.sum()) for k, v in cats.items()},
+        "coords": {k: _coords(v) for k, v in cats.items()},
+        "thresholds": {
+            "hot_residual_adu": round(hot_thresh, 5),
+            "residual_robust_sigma_adu": round(sigma, 6),
+            "temporal_median_adu": round(t_med, 5),
+            "temporal_robust_sigma_adu": round(t_sig, 6),
+            "unstable_above_adu": round(t_med + unstable_sigma * t_sig, 5),
+            "excursion_sigma": excursion_sigma,
+            "max_px_available": max_px is not None,
+        },
+        "dark_current_stats": dc_stats,
+        "frozen_fraction": round(frozen_frac, 6),
+    })
+    out["counts"]["total"] = int(sum(out["counts"].values()))
+    # what to do about them, which is the point of splitting them up
+    out["remedy"] = {
+        "stuck": "interpolate -- the pixel carries no signal to correct",
+        "intermittent_hot": ("interpolate -- inconsistent frame to frame, so "
+                             "no master dark can subtract it"),
+        "hot": ("dark subtraction removes it while it stays below "
+                "saturation; interpolate only the extreme ones"),
+        "dark_current": ("scaled dark subtraction handles it; does not belong "
+                         "in an interpolation list"),
+    }
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Quantiser-limited detection
+#
+# The clip guard catches the rails (0 and 255). It does NOT catch the other way
+# a processing path destroys a measurement: collapsing the output onto so few
+# codes that the sensor's noise no longer reaches the least significant bit. A
+# run can sit at mean 18 -- nowhere near a rail -- and still be meaningless.
+#
+# The tell is temporal noise of exactly 0.000 across a deep stack, with the mean
+# identical to three decimals at every ladder point. A real 8-bit path CANNOT do
+# that: read noise alone guarantees a pixel sitting between two codes lands on
+# either side from frame to frame, so any genuine measurement dithers its own
+# LSB. Zero temporal noise is the quantiser's floor being reported as if it were
+# the sensor's.
+#
+# This matters more than it sounds: with the output collapsed, hot_pixel_mask
+# sees a nearly flat residual and finds 12 defects where the true count is 1057.
+# PHD2 auto-loads that defect map at every camera connect, so exporting it is
+# strictly worse than exporting nothing.
+# ----------------------------------------------------------------------------
+
+# Below this, a deep stack is reporting quantisation, not sensor noise.
+QUANTISER_NOISE_FLOOR_ADU = 0.05
+# A master dark holding this few distinct values has no gradient left to
+# threshold against; hot-pixel detection on it is meaningless.
+QUANTISER_MAX_DISTINCT_CODES = 2
+
+
+def code_step_adu(native_bit_depth):
+    """Size of one output code in the report's 0-255 ADU domain.
+
+    Every format is normalised into that domain (Y16 is divided by 257), so an
+    8-bit path steps by 1.0 and a 16-bit path by 1/257."""
+    return 1.0 if (native_bit_depth or 8) <= 8 else 1.0 / 257.0
+
+
+def quantiser_check(distinct_master, temporal, code_step,
+                    distinct_stack=None):
+    """Decide whether a stack is quantiser-limited, and say why.
+
+    Two independent detectors, either one sufficient:
+      * the master dark holds <= 2 distinct values -- there is no structure
+        left to measure, whatever the noise number says;
+      * temporal noise is below the dither floor -- the path is not resolving
+        its own least significant bit.
+    """
+    reasons = []
+    if distinct_master is not None and distinct_master <= QUANTISER_MAX_DISTINCT_CODES:
+        reasons.append(
+            f"master dark holds only {distinct_master} distinct value(s) "
+            f"(<= {QUANTISER_MAX_DISTINCT_CODES})")
+    if temporal == temporal and temporal < QUANTISER_NOISE_FLOOR_ADU:
+        reasons.append(
+            f"temporal noise {temporal:.4f} ADU is below the "
+            f"{QUANTISER_NOISE_FLOOR_ADU} ADU dither floor -- an 8-bit path "
+            "cannot have zero temporal noise")
+    out = {
+        "quantiser_limited": bool(reasons),
+        "distinct_codes_master": distinct_master,
+        "distinct_codes_stack": distinct_stack,
+        "code_step_adu": code_step,
+        "reasons": reasons,
+    }
+    if reasons:
+        out["note"] = (
+            "QUANTISER-LIMITED: the output is collapsed onto too few codes for "
+            "the sensor's noise to reach the LSB. FPN, hot-pixel count and "
+            "dark current from this run describe the processing path, not the "
+            "sensor. Reduce gamma/contrast or raise gain until the deep stack "
+            "shows temporal dither, then re-run.")
+    return out
+
+
+def noise_upper_bound(temporal, code_step):
+    """Turn a floored noise number into an honest upper bound.
+
+    "IRREDUCIBLE temporal dark noise: 0.000 ADU" reads as a result -- a
+    remarkably quiet sensor. It is not one. When the measurement has hit the
+    quantiser floor, all that is known is that the true noise is smaller than
+    the step that would have been needed to register: half a code."""
+    ub = 0.5 * code_step
+    return {
+        "upper_bound_adu": ub,
+        "measured_adu": (float(temporal) if temporal == temporal else None),
+        "statement": (f"< {ub:.3g} ADU, unmeasurable at this bit depth and "
+                      "processing setting"),
+    }
+
+
+def minimum_detectable_slope(xs, ys, code_step, quantiser_limited,
+                             resid_std=None):
+    """The smallest dark-current slope this ladder could have resolved.
+
+    "0.00000 ADU/unit (r2=0.206)" is not a measurement of zero dark current; it
+    is a measurement that found nothing, reported as if it had found zero. What
+    PHD2's dark-scaling decision actually needs is the detection limit: how big
+    would the slope have had to be before this ladder could have seen it?
+
+    Two regimes:
+      * quantiser-limited -- with no temporal dither, nothing below one whole
+        code ever flips a pixel, so the level literally cannot register a change
+        smaller than the code step, no matter how many frames are averaged;
+      * normally noisy -- the limit is the scatter of the ladder means about the
+        fit, taken at 3 sigma.
+    Divide that smallest detectable level change by the exposure span."""
+    if len(xs) < 2:
+        return None
+    span = float(np.max(xs) - np.min(xs))
+    if span <= 0:
+        return None
+    if quantiser_limited or not resid_std or resid_std <= 0:
+        delta = float(code_step)
+        basis = ("one quantiser code -- with no temporal dither, a level change "
+                 "smaller than a full code flips no pixels and is invisible "
+                 "however many frames are stacked")
+    else:
+        delta = 3.0 * float(resid_std)
+        basis = ("3x the residual scatter of the ladder means about the fit")
+    slope = delta / span
+    return {
+        "min_detectable_slope_adu_per_unit": slope,
+        "min_detectable_slope_adu_per_second": slope / 100e-6,
+        "min_detectable_level_change_adu": delta,
+        "exposure_span_units": span,
+        "basis": basis,
+        "statement": (f"< {slope:.3g} ADU/unit "
+                      f"(no level change above {delta:.3g} ADU was detectable "
+                      f"across a {span:.0f}-unit exposure span)"),
+    }
+
+
+def derive_knee(slope_data, tol=0.05):
+    """Find the exposure where integration takes over from bus bandwidth.
+
+    Below the knee the frame period is pinned by USB/pipeline bandwidth and the
+    commanded exposure is clamped inside it, so the level is a bias pedestal
+    carrying no dark-current information. Fitting those points is what drags the
+    dark-current regression down.
+
+    The knee does not need to be supplied -- the ladder already measures it. It
+    is the first exposure at which fps departs from its pinned maximum. Taking
+    it as an argument means inheriting a value from a different firmware: --knee
+    256 was right for a 2047-unit range and wrong for 9411, where fps stayed
+    flat through 256 and only broke at 384.
+
+    Returns None when fps never departs (everything is bandwidth-limited)."""
+    pts = sorted((d["exposure_units"], d["eff_fps"]) for d in slope_data
+                 if d.get("eff_fps", 0) > 0)
+    if len(pts) < 3:
+        return None
+    fps_max = max(f for _, f in pts)
+    limit = (1.0 - tol) * fps_max
+    for i, (e, f) in enumerate(pts):
+        if f >= limit:
+            continue
+        # One point below the line can be a capture hiccup rather than the
+        # knee. Require the departure to persist: every later point must stay
+        # down too (the last point is allowed to stand alone).
+        later = [ff for _, ff in pts[i + 1:]]
+        if later and not all(ff < fps_max for ff in later):
+            continue
+        return {
+            "knee_units": int(e),
+            "fps_pinned_max": round(fps_max, 2),
+            "fps_at_knee": round(f, 2),
+            "departure_tolerance": tol,
+            "last_pinned_exposure": (int(pts[i - 1][0]) if i else None),
+            "detail": (f"fps held ~{fps_max:.1f} up to "
+                       f"{pts[i-1][0] if i else '(first point)'} and fell to "
+                       f"{f:.1f} at {e} -- integration takes over there"),
+        }
+    return None
+
+
+def build_exposure_ladder(exposure_max, ladder=None, knee=None,
+                          ladder_points=7):
+    """The dark run's exposure ladder: two low points for the bias intercept,
+    then ladder_points spaced across the integrating region."""
+    if ladder is None:
+        lo = [max(1, int(exposure_max * f)) for f in (0.05, 0.15)]
+        # The ladder has to be laid out BEFORE the knee can be measured (the
+        # measurement is the ladder), so span a fixed fraction of the range
+        # here and let derive_knee sort out which points were pedestal-only
+        # once the fps data exists.
+        start = (int(exposure_max * 0.30) if knee is None
+                 else max(knee, int(exposure_max * 0.30)))
+        n = max(2, ladder_points)
+        hi = [int(start + (exposure_max - start) * i / (n - 1))
+              for i in range(n)]
+        out = sorted(set(lo + hi))
+    else:
+        out = sorted(set(int(x) for x in ladder))
+    if exposure_max not in out:
+        out.append(exposure_max)
+        out = sorted(set(out))
+    return out
+
+
+def build_timing_ladder(exp_min, exp_max, n=14):
+    """Exposure sweep for the framerate probe: GEOMETRIC, not linear.
+
+    The knee sits low -- 384 units out of a 9411 range in one case -- and the
+    dark ladder's two sub-knee points (5% and 15% of max) would step straight
+    over it. The probe is cheap (no decode, no disk), so it can afford a wide
+    sweep, and geometric spacing puts the resolution where the knee actually
+    lives instead of spreading it evenly across a range that is mostly flat."""
+    lo = max(1, int(exp_min or 1))
+    hi = int(exp_max)
+    if hi <= lo:
+        return [hi]
+    vals = np.unique(np.round(np.geomspace(lo, hi, max(3, n))).astype(np.int64))
+    return [int(v) for v in vals]
+
+
+def build_fps_calibration(ladder_data, fourcc=None, width=None, height=None):
     """From a dark run's per-exposure (exposure, eff_fps) pairs, build a
     monotonic fps->exposure inverse over the INTEGRATION-LIMITED region only.
 
@@ -671,11 +1201,16 @@ def build_fps_calibration(ladder_data):
     if len(mono) < 3:
         return None
     anchors = sorted(((f, e) for e, f in mono))
+    # The fps<->exposure mapping is a property of THIS format at THIS size --
+    # the bandwidth ceiling moves with both. Stamp them so a calibration built
+    # in one mode is never silently applied in another (and in particular so a
+    # compressed timing probe's numbers can never be mistaken for these).
     return {"fps_max_bandwidth": round(fps_max, 2),
             "integration_limited_below_fps": round(thresh, 2),
             "anchors_fps": [round(f, 3) for f, _ in anchors],
             "anchors_exposure": [e for _, e in anchors],
-            "valid_fps_range": [round(anchors[0][0], 2), round(anchors[-1][0], 2)]}
+            "valid_fps_range": [round(anchors[0][0], 2), round(anchors[-1][0], 2)],
+            "fourcc": fourcc, "width": width, "height": height}
 
 
 def fps_to_effective_exposure(calib, fps):
@@ -950,8 +1485,8 @@ def exposure_fidelity_verdict(slope_data, knee):
 
 
 def run_dark(cap, device, dark_frames, exposure_max, slope_points,
-             ladder=None, discard=2, knee=2048, ladder_frames=16,
-             ladder_points=7, verbose=True):
+             ladder=None, discard=2, knee=None, ladder_frames=16,
+             ladder_points=7, timing_ladder=None, verbose=True):
     """Dark characterisation, weighted to the longest exposure.
 
     Most frames are spent at exposure_max to build the master dark and measure
@@ -966,7 +1501,17 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
     ladder_frames: frames captured at each NON-deep ladder point. Default 16.
     dark_frames:   frames in the deep stack at exposure_max. Default 128.
     discard:       frames to skip at the start of each capture (settle). Def 2.
-    knee:          exposure above which real integration begins.
+    knee:          exposure above which real integration begins. None (the
+                   default) DERIVES it from fps measurements after capture --
+                   see derive_knee. Pass a number only to override a bad
+                   detection; a knee carried over from a different firmware's
+                   exposure range is worse than no knee.
+    timing_ladder: optional (exposure, eff_fps) records from a low-bandwidth
+                   FpsProbe pass. When present these drive the knee and the
+                   real-vs-synthetic verdict INSTEAD of this run's own fps,
+                   because an uncompressed stream at any useful resolution is
+                   bandwidth-pinned and its flat fps curve says nothing. Pixel
+                   data still comes only from the uncompressed capture here.
     """
     print("\n=== DARK NOISE CHARACTERISATION ===")
     print("CAP THE LENS / full darkness. Keep temperature stable across the run.")
@@ -974,21 +1519,10 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
     print(f"Ladder points: {ladder_frames} frames each. "
           f"Discarding first {discard} frame(s) per exposure (settle).\n")
 
-    if ladder is None:
-        # Two low points for the bias intercept, then ladder_points evenly
-        # spaced across the integrating region (knee -> exposure_max) so the
-        # dark-current slope is well-determined.
-        lo = [max(1, int(exposure_max * f)) for f in (0.05, 0.15)]
-        start = max(knee, int(exposure_max * 0.30))
-        n = max(2, ladder_points)
-        hi = [int(start + (exposure_max - start) * i / (n - 1))
-              for i in range(n)]
-        ladder = sorted(set(lo + hi))
-    else:
-        ladder = sorted(set(int(x) for x in ladder))
-    if exposure_max not in ladder:
-        ladder.append(exposure_max)
-        ladder = sorted(set(ladder))
+    # Two low points for the bias intercept, then ladder_points evenly spaced
+    # across the integrating region, so the dark-current slope is well
+    # determined.
+    ladder = build_exposure_ladder(exposure_max, ladder, knee, ladder_points)
 
     cap.start()
     started = datetime.now(timezone.utc).isoformat()
@@ -997,9 +1531,16 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
     residual_std = None
     deep_drops = 0
     deep_clipped = False
+    deep_quant = None
     radial = None
     fpn = hot = None
     hot_coords = None
+    defects = None
+    bias_px = None          # per-pixel mean at the shortest ladder exposure
+    bias_exposure = None
+    # one output code, in the 0-255 ADU domain every format is normalised into
+    native_depth = 16 if cap.pixfmt_str == "Y16" else 8
+    code_step = code_step_adu(native_depth)
 
     # Warm-up: the FIRST v4l2-ctl capture of a run pays one-time costs (gadget
     # streaming spin-up, ISP pipeline init, cold-start) that drag its effective
@@ -1028,6 +1569,10 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
             ok, err = set_ctrl(device, "exposure_time_absolute", exp)
             rb = get_ctrl(device, "exposure_time_absolute")
             is_deep = (exp == exposure_max)
+            # the shortest ladder point is the bias reference the dark-current
+            # classifier compares the deep stack against; the ladder is sorted
+            # ascending so it is captured before the deep point needs it
+            is_bias = (exp == ladder[0]) and not is_deep
             nframes = dark_frames if is_deep else max(4, ladder_frames)
             path, total, full = cap.capture_run(
                 nframes, discard=discard,
@@ -1038,15 +1583,31 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
             count = 0
             mean_px = None   # per-pixel running mean (the master dark / FPN)
             m2_px = None     # per-pixel sum of squared deviations
+            # Presence histogram over the whole stack, in native code units
+            # (x257 puts both the 8-bit and the Y16/257 domains on the same
+            # integer grid). Counting distinct codes is what catches a
+            # collapsed output that the mean and the rails both look fine at.
+            code_seen = np.zeros(65536, dtype=bool)
+            # per-pixel maximum, deep stack only: a pixel that reaches hot in a
+            # handful of frames but averages out is invisible to any threshold
+            # on the mean, and that is exactly the intermittent case
+            max_px = None
             for fr in cap.iter_luma(path, nframes, discard=discard):
                 count += 1
                 if mean_px is None:
                     mean_px = np.zeros_like(fr)
                     m2_px = np.zeros_like(fr)
+                    if is_deep:
+                        max_px = fr.copy()
                 delta = fr - mean_px
                 mean_px += delta / count
                 m2_px += delta * (fr - mean_px)
-                del fr, delta
+                if max_px is not None:
+                    np.maximum(max_px, fr, out=max_px)
+                codes = np.rint(fr * 257.0).astype(np.int32)
+                np.clip(codes, 0, 65535, out=codes)
+                code_seen[codes.ravel()] = True
+                del fr, delta, codes
             try:
                 os.remove(path)
             except OSError:
@@ -1060,9 +1621,16 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
             # mean over pixels of sqrt(variance). This is read+dark-shot.
             if count > 1:
                 var_px = m2_px / (count - 1)
-                temporal = float(np.sqrt(var_px).mean())
+                std_px = np.sqrt(var_px)
+                temporal = float(std_px.mean())
             else:
+                std_px = None
                 temporal = float("nan")
+            if is_bias:
+                # float32: this is a reference level, not an accumulator, and
+                # it has to survive until the deep point at the end
+                bias_px = mean_px.astype(np.float32)
+                bias_exposure = exp
 
             # clip guard: if the processing path (brightness/contrast/gamma) has
             # driven the output against the floor or ceiling, the frame is not a
@@ -1078,6 +1646,18 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
                              "pinned -- measurement INVALID (processing path "
                              "saturated; reduce brightness/contrast/gamma)")
 
+            # quantiser guard: the other way the processing path invalidates a
+            # run, and the one the clip guard cannot see (a collapsed output
+            # sitting at mean 18 is nowhere near a rail).
+            n_stack_codes = int(code_seen.sum())
+            n_master_codes = int(np.unique(mean_px).size)
+            qcheck = quantiser_check(n_master_codes, temporal, code_step,
+                                     distinct_stack=n_stack_codes)
+            quant_note = ""
+            if qcheck["quantiser_limited"]:
+                quant_note = ("  !! QUANTISER-LIMITED: " +
+                              "; ".join(qcheck["reasons"]))
+
             slope_data.append({"exposure_units": exp, "exposure_readback": rb,
                                "mean_adu": mean_level,
                                "temporal_noise_adu": temporal,
@@ -1086,16 +1666,22 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
                                "eff_fps": round(cap.last_fps, 2),
                                "clipped": clipped,
                                "clip_floor_frac": round(floor_frac, 4),
-                               "clip_ceil_frac": round(ceil_frac, 4)})
+                               "clip_ceil_frac": round(ceil_frac, 4),
+                               "distinct_codes_stack": n_stack_codes,
+                               "distinct_codes_master": n_master_codes,
+                               "quantiser_limited":
+                                   qcheck["quantiser_limited"]})
             if verbose:
                 print(f"   exp={exp:5d} (rb={rb})  mean={mean_level:7.3f} ADU  "
                       f"temporal_noise={temporal:6.3f} ADU  "
                       f"{cap.last_fps:5.1f}fps  "
+                      f"codes={n_stack_codes:3d}/{n_master_codes:<3d}  "
                       f"n={count}" + (f"  drops={drops}" if drops else "")
-                      + clip_note)
+                      + clip_note + quant_note)
             if is_deep:
                 deep_drops = drops
                 deep_clipped = clipped
+                deep_quant = qcheck
                 master = mean_px                 # FIXED-PATTERN part (per-pixel)
                 # irreducible temporal noise after master-dark subtraction is
                 # exactly the temporal std we already computed per-pixel:
@@ -1105,10 +1691,45 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
                 hot = int(_hot_mask.sum())
                 _yx = np.argwhere(_hot_mask)
                 hot_coords = _yx.tolist()        # [[y, x], ...] numpy row-major convention
-                if clipped:
-                    radial = {"shape": "N/A - output clipped", "clipped": True}
+                # A flat count of defects is not actionable: the pixels in it
+                # fail in three different ways needing three different
+                # remedies. Split them.
+                if std_px is not None:
+                    defects = classify_defects(
+                        master, std_px, max_px=max_px, bias=bias_px,
+                        exposure_max=exp, exposure_bias=bias_exposure)
                     if verbose:
-                        print("   radial: skipped (deep stack CLIPPED -- "
+                        if defects.get("ok"):
+                            c = defects["counts"]
+                            print(f"   defects: {c['total']} total  "
+                                  f"stuck={c['stuck']}  "
+                                  f"intermittent={c['intermittent_hot']}  "
+                                  f"hot={c['hot']}  "
+                                  f"dark-current={c['dark_current']}")
+                            if not defects["thresholds"]["max_px_available"]:
+                                print("     (no per-pixel maximum: "
+                                      "intermittents found by instability "
+                                      "alone)")
+                            if "skipped" in (defects["dark_current_stats"] or {}):
+                                print("     dark-current category skipped: "
+                                      "no bias reference in this ladder")
+                        else:
+                            print(f"   defects: not classified -- "
+                                  f"{defects['reason']}")
+                del max_px
+                max_px = None
+                if qcheck["quantiser_limited"] and verbose:
+                    print(f"   !! deep stack QUANTISER-LIMITED "
+                          f"({n_stack_codes} distinct codes across {count} "
+                          f"frames, {n_master_codes} in the master). The "
+                          f"hot-pixel count below ({hot}) is what survives a "
+                          "collapsed output, not the sensor's defect count.")
+                if clipped or qcheck["quantiser_limited"]:
+                    why = "clipped" if clipped else "quantiser-limited"
+                    radial = {"shape": f"N/A - output {why}", "clipped": clipped,
+                              "quantiser_limited": qcheck["quantiser_limited"]}
+                    if verbose:
+                        print(f"   radial: skipped (deep stack {why.upper()} -- "
                               "FPN/noise/hot-pixel numbers below are meaningless)")
                 else:
                     radial = radial_profile(master)
@@ -1125,6 +1746,63 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
     # Real long integration forces the framerate down once exposure exceeds the
     # frame period; faked exposure (gain-boost / frame-sum) holds fps flat.
     # And in darkness mean should track exposure if dark current integrates.
+    # --- the knee, derived from fps measurements ---
+    # Prefer the low-bandwidth timing probe when there is one: the uncompressed
+    # stream's fps is pinned by USB, so its knee is the BANDWIDTH ceiling, not
+    # the integration knee, and using it over-excludes perfectly good points
+    # (below a bandwidth-pinned frame period the integration still tracks the
+    # commanded exposure -- the frame merely waits).
+    if timing_ladder:
+        knee_src = timing_ladder
+        knee_src_name = (f"{timing_ladder[0].get('timing_format', '?')} timing "
+                         "probe")
+    else:
+        knee_src = slope_data
+        knee_src_name = f"{cap.pixfmt_str} dark ladder"
+    knee_auto = derive_knee(knee_src)
+    if knee is not None:
+        knee_used = int(knee)
+        knee_info = {"knee_units": knee_used, "source": "user override (--knee)",
+                     "auto_detected": knee_auto}
+        if knee_auto and knee_auto["knee_units"] != knee_used:
+            knee_info["disagreement"] = (
+                f"--knee {knee_used} overrides the measured knee of "
+                f"{knee_auto['knee_units']} ({knee_auto['detail']}). A knee "
+                "inherited from a different exposure range excludes good "
+                "points or admits pedestal-only ones.")
+    elif knee_auto:
+        knee_used = knee_auto["knee_units"]
+        knee_info = dict(knee_auto,
+                         source=f"auto-detected from fps departure "
+                                f"({knee_src_name})")
+    else:
+        # fps never left its pinned maximum: nothing here is integration-
+        # limited, so there is no integrating region to restrict the fit to.
+        knee_used = 0
+        knee_info = {
+            "knee_units": 0,
+            "source": (f"not detectable -- fps never departed its pinned "
+                       f"maximum ({knee_src_name})"),
+            "auto_detected": None,
+            "note": ("every ladder point is bandwidth-limited, so the dark-"
+                     "current fit runs over the whole ladder and is not an "
+                     "integration-limited measurement. Extend --exposure-max "
+                     "or drop to a smaller resolution to push past the "
+                     "bandwidth-limited frame period."
+                     + ("" if timing_ladder else
+                        " A low-bandwidth timing probe (MJPEG) would lift the "
+                        "ceiling and expose the knee -- it is on by default "
+                        "with --dark unless --no-timing-probe was passed."))}
+    knee_info["measured_from"] = knee_src_name
+    if verbose:
+        print(f"\n   knee: {knee_used} units ({knee_info['source']})")
+        if knee_auto:
+            print(f"     {knee_auto['detail']}")
+        if "disagreement" in knee_info:
+            print(f"     !! {knee_info['disagreement']}")
+        if "note" in knee_info:
+            print(f"     {knee_info['note']}")
+
     expo = [d["exposure_units"] for d in slope_data]
     fpss = [d["eff_fps"] for d in slope_data]
     expfid = {"by_step": []}
@@ -1144,18 +1822,32 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
             for s in expfid["by_step"]:
                 print(f"     {s['expo_ratio']:6.2f}  {s['fps_drop_ratio']:9.2f}  "
                       f"{s['mean_ratio']:7.2f}")
-        expfid.update(exposure_fidelity_verdict(slope_data, knee))
+        # The verdict comes from the timing probe when there is one. In an
+        # uncompressed stream the frame rate is pinned by USB, so fps cannot
+        # respond to exposure and the honest answer there is always
+        # "indeterminate (bandwidth-limited)" -- which is a statement about the
+        # bus, not about the firmware's exposure handling.
+        expfid["verdict_source"] = knee_src_name
+        if timing_ladder:
+            expfid["timing_probe"] = {
+                "format": timing_ladder[0].get("timing_format"),
+                "points": timing_ladder,
+                "why": ("fps measured in a low-bandwidth format so the frame "
+                        "period is set by integration rather than by the bus. "
+                        "Timing only -- no pixel value from this pass is used "
+                        "in any noise, FPN or defect figure.")}
+        expfid.update(exposure_fidelity_verdict(knee_src, knee_used))
         if verbose:
-            print(f"   -> {expfid['verdict']}")
+            print(f"   -> [{knee_src_name}] {expfid['verdict']}")
 
     # dark current slope: fit ONLY the integrating region (exposure >= knee).
     # Below the knee the level is the clamped pedestal and carries no dark-
     # current information; including it corrupts the slope (the r2=0.82 problem).
-    integ_pts = [d for d in slope_data if d["exposure_units"] >= knee]
+    integ_pts = [d for d in slope_data if d["exposure_units"] >= knee_used]
     if len(integ_pts) >= 2:
         xs = np.array([d["exposure_units"] for d in integ_pts], float)
         ys = np.array([d["mean_adu"] for d in integ_pts], float)
-        fit_region = f"integrating (>= {knee})"
+        fit_region = f"integrating (>= {knee_used})"
     else:
         xs = np.array([d["exposure_units"] for d in slope_data], float)
         ys = np.array([d["mean_adu"] for d in slope_data], float)
@@ -1177,12 +1869,38 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
             "fit_region": fit_region,
             "n_points": int(len(xs)),
         }
+        # A slope of 0.00000 with r2=0.206 is not a dark current of zero, it is
+        # a null result. Report the detection limit alongside it: the smallest
+        # slope this ladder could have resolved. That is the number PHD2's
+        # dark-scaling decision actually needs.
+        deep_quant_limited = bool(deep_quant and deep_quant["quantiser_limited"])
+        mds = minimum_detectable_slope(
+            xs, ys, code_step, deep_quant_limited,
+            resid_std=float(np.sqrt(ss_res / max(1, len(xs) - 2))))
+        if mds:
+            linfit["detection_limit"] = mds
+            # the ladder is "flat" when the whole span moved less than the
+            # smallest change that could have registered
+            span_change = float(abs(slope) * (np.max(xs) - np.min(xs)))
+            linfit["flat_within_detection_limit"] = bool(
+                span_change < mds["min_detectable_level_change_adu"])
+            if linfit["flat_within_detection_limit"]:
+                linfit["dark_current_statement"] = (
+                    "NOT DETECTED: " + mds["statement"])
+            else:
+                linfit["dark_current_statement"] = (
+                    f"{slope:.5g} ADU/unit (detection limit "
+                    f"{mds['min_detectable_slope_adu_per_unit']:.3g})")
         if not linfit["linear"]:
             print(f"   !! note: dark level vs exposure fit is weak (r2={r2:.3f}, "
                   f"{len(xs)} pts, {fit_region}). Either too few integrating-region "
                   "points to fit a slope, or thermal drift across the run. The "
                   "exposure-fidelity verdict above (from fps vs exposure) is the "
                   "reliable real-vs-synthetic indicator, not this fit.")
+        if linfit.get("flat_within_detection_limit"):
+            print(f"   !! dark level is FLAT across the whole ladder to within "
+                  f"the detection limit -- reporting an upper bound, not a "
+                  f"slope: {mds['statement']}")
 
     result = {
         "exposure_max_units": exposure_max,
@@ -1197,9 +1915,17 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
         "deep_stack_frames": dark_frames,
         "deep_stack_drops": deep_drops,
         "deep_stack_clipped": deep_clipped,
+        "deep_stack_quantiser_limited": bool(
+            deep_quant and deep_quant["quantiser_limited"]),
+        "quantiser_check": deep_quant,
+        "knee": knee_info,
         "master_dark_fpn_adu": fpn if master is not None else None,
         "hot_pixels_6sigma": hot if master is not None else None,
         "hot_pixel_coords": hot_coords,  # [[y, x], ...] — x y when writing PHD2 defect file
+        # the same pixels, sorted by HOW they fail: stuck / intermittent hot /
+        # hot / dark current. See classify_defects for why that matters.
+        "defect_classes": defects,
+        "bias_reference_exposure_units": bias_exposure,
         "irreducible_temporal_dark_noise_adu": residual_std,
         "radial_profile": radial if master is not None else None,
         "dark_current_fit": linfit,
@@ -1208,6 +1934,12 @@ def run_dark(cap, device, dark_frames, exposure_max, slope_points,
         "stack_started_utc": started,
         "stack_finished_utc": finished,
     }
+    # When the noise measurement has hit the quantiser floor, the measured
+    # number is a floor, not a value. Carry the bound alongside it so nothing
+    # downstream can read 0.000 as "remarkably quiet sensor".
+    if deep_quant and deep_quant["quantiser_limited"]:
+        result["irreducible_temporal_dark_noise_bound"] = noise_upper_bound(
+            residual_std, code_step)
     return result, (master if master is not None else None)
 
 
@@ -1395,6 +2127,429 @@ def _ensure_dir(path):
         os.makedirs(d, exist_ok=True)
 
 
+# ----------------------------------------------------------------------------
+# Processing path provenance
+#
+# Every one of these reshapes the output, and the defect map moved 12 -> 1057 on
+# gamma alone. A master dark or defect map built at one setting and auto-loaded
+# at another is silently wrong, so the settings travel with the data.
+# ----------------------------------------------------------------------------
+
+PROCESSING_CTRLS = ("gamma", "brightness", "contrast", "sharpness",
+                    "saturation", "hue", "gain", "backlight_compensation",
+                    "auto_exposure", "exposure_time_absolute")
+
+
+def read_processing_path(device):
+    """Current value of every control that reshapes the output, read back from
+    the device. Absent controls are simply omitted; the key set is therefore
+    also a record of what this camera exposes.
+
+    Shared with cam_observe (which stamps it into dark_meta_WxH.json) so both
+    tools record provenance in exactly the same vocabulary."""
+    out = {}
+    try:
+        txt = list_controls(device)
+    except Exception:
+        return out
+    for line in txt.splitlines():
+        m = re.match(r"\s*(\w+)\s+0x[0-9a-f]+\s+\(\w+\)\s*:\s*(.*)", line)
+        if not m:
+            continue
+        name, rest = m.group(1), m.group(2)
+        if name not in PROCESSING_CTRLS:
+            continue
+        mm = re.search(r"value=(-?\d+)", rest)
+        if mm:
+            out[name] = int(mm.group(1))
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Report comparison (--compare)
+#
+# Reflashing firmware is routine here, so before/after diffing is the most-used
+# operation there is. The gamma result sat in two reports and took a manual read
+# to spot; that is exactly the comparison this automates.
+# ----------------------------------------------------------------------------
+
+def _report_processing(report):
+    """Processing path of a report, preferring the recorded readback and
+    falling back to parsing argv for reports written before it was stamped."""
+    proc = dict(report.get("processing_path") or {})
+    if proc:
+        return proc, "readback"
+    argv = report.get("argv") or []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--"):
+            name = a[2:]
+            if "=" in name:
+                name, val = name.split("=", 1)
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                val = argv[i + 1]
+                i += 1
+            else:
+                val = "(set)"
+            key = name.replace("-", "_")
+            if key in PROCESSING_CTRLS or key in (
+                    "gamma", "brightness", "contrast", "sharpness",
+                    "saturation", "hue", "gain"):
+                proc[key] = val
+        i += 1
+    return proc, "argv"
+
+
+def _fmt_delta(a, b, width=9, prec=3):
+    """b - a, rendered so a zero delta is visibly zero and a missing side is
+    visibly missing."""
+    if a is None or b is None:
+        return " " * (width - 1) + "-"
+    d = b - a
+    return f"{d:+{width}.{prec}f}"
+
+
+def compare_reports(path_a, path_b, verbose=True):
+    """Per-point deltas between two characterisation reports.
+
+    Ladder points are matched on exposure_units; anything present in only one
+    report is listed separately rather than silently dropped, because a changed
+    ladder is itself a difference worth seeing."""
+    with open(path_a) as fh:
+        ra = json.load(fh)
+    with open(path_b) as fh:
+        rb = json.load(fh)
+
+    da = ra.get("dark") or {}
+    db = rb.get("dark") or {}
+    la = {d["exposure_units"]: d for d in (da.get("ladder") or [])}
+    lb = {d["exposure_units"]: d for d in (db.get("ladder") or [])}
+    common = sorted(set(la) & set(lb))
+    only_a = sorted(set(la) - set(lb))
+    only_b = sorted(set(lb) - set(la))
+
+    pa, sa = _report_processing(ra)
+    pb, sb = _report_processing(rb)
+    proc_keys = sorted(set(pa) | set(pb))
+    proc_diff = {k: [pa.get(k), pb.get(k)] for k in proc_keys
+                 if str(pa.get(k)) != str(pb.get(k))}
+
+    def _summary(r, d):
+        dcf = d.get("dark_current_fit") or {}
+        return {
+            "label": os.path.basename(r.get("_path", "")),
+            "timestamp_utc": r.get("timestamp_utc"),
+            "device_name": r.get("device_name"),
+            "resolution": f"{r.get('width')}x{r.get('height')}",
+            "format": r.get("measurement_format"),
+            "hot_pixels": d.get("hot_pixels_6sigma"),
+            "fpn_adu": d.get("master_dark_fpn_adu"),
+            "temporal_noise_adu": d.get("irreducible_temporal_dark_noise_adu"),
+            "dark_current_adu_per_unit": dcf.get("dark_current_adu_per_unit"),
+            "r2": dcf.get("r2"),
+            "knee_units": (d.get("knee") or {}).get("knee_units"),
+            "clipped": d.get("deep_stack_clipped"),
+            "quantiser_limited": d.get("deep_stack_quantiser_limited"),
+            "distinct_codes_master":
+                (d.get("quantiser_check") or {}).get("distinct_codes_master"),
+        }
+
+    ra["_path"], rb["_path"] = path_a, path_b
+    sum_a, sum_b = _summary(ra, da), _summary(rb, db)
+
+    per_point = []
+    for e in common:
+        A, B = la[e], lb[e]
+        per_point.append({
+            "exposure_units": e,
+            "mean_adu": [A.get("mean_adu"), B.get("mean_adu")],
+            "temporal_noise_adu": [A.get("temporal_noise_adu"),
+                                   B.get("temporal_noise_adu")],
+            "eff_fps": [A.get("eff_fps"), B.get("eff_fps")],
+            "distinct_codes_stack": [A.get("distinct_codes_stack"),
+                                     B.get("distinct_codes_stack")],
+        })
+
+    result = {"a": sum_a, "b": sum_b,
+              "processing_path": {"a": pa, "b": pb, "a_source": sa,
+                                  "b_source": sb, "differs": proc_diff},
+              "per_point": per_point,
+              "exposures_only_in_a": only_a,
+              "exposures_only_in_b": only_b}
+
+    if not verbose:
+        return result
+
+    print("=== COMPARE ===")
+    print(f"  A: {path_a}")
+    print(f"     {sum_a['timestamp_utc']}  {sum_a['device_name'] or '(unnamed)'}"
+          f"  {sum_a['resolution']} {sum_a['format']}")
+    print(f"  B: {path_b}")
+    print(f"     {sum_b['timestamp_utc']}  {sum_b['device_name'] or '(unnamed)'}"
+          f"  {sum_b['resolution']} {sum_b['format']}")
+    if sum_a["resolution"] != sum_b["resolution"]:
+        print("  !! different resolutions -- per-pixel numbers are not "
+              "comparable across a resolution change")
+
+    print(f"\n--- processing path (A from {sa}, B from {sb}) ---")
+    if proc_diff:
+        for k, (va, vb) in sorted(proc_diff.items()):
+            print(f"  {k:24s} {str(va):>10s} -> {str(vb):>10s}   <== CHANGED")
+    else:
+        print("  identical")
+    for k in proc_keys:
+        if k not in proc_diff:
+            print(f"  {k:24s} {str(pa.get(k)):>10s}     (same)")
+
+    print("\n--- per ladder point (B - A) ---")
+    print("   exposure      mean_A    mean_B     d_mean   "
+          "noise_A  noise_B    d_noise    fps_A   fps_B     d_fps  codes A/B")
+    for p in per_point:
+        ma, mb = p["mean_adu"]
+        na, nbv = p["temporal_noise_adu"]
+        fa, fb = p["eff_fps"]
+        ca, cb = p["distinct_codes_stack"]
+        print(f"   {p['exposure_units']:8d}  {ma:8.3f}  {mb:8.3f}  "
+              f"{_fmt_delta(ma, mb)}  {na:7.4f}  {nbv:7.4f}  "
+              f"{_fmt_delta(na, nbv, 9, 4)}  {fa:6.1f}  {fb:6.1f}  "
+              f"{_fmt_delta(fa, fb, 8, 2)}  "
+              f"{'-' if ca is None else ca}/{'-' if cb is None else cb}")
+    if only_a:
+        print(f"   exposures only in A: {only_a}")
+    if only_b:
+        print(f"   exposures only in B: {only_b}")
+
+    print("\n--- deep-stack summary (B - A) ---")
+    rows = [("hot pixels (>6sigma)", "hot_pixels", 0),
+            ("master FPN (ADU)", "fpn_adu", 3),
+            ("temporal noise (ADU)", "temporal_noise_adu", 4),
+            ("dark current (ADU/unit)", "dark_current_adu_per_unit", 6),
+            ("dark-current fit r2", "r2", 3),
+            ("integration knee (units)", "knee_units", 0),
+            ("distinct codes in master", "distinct_codes_master", 0)]
+    for label, key, prec in rows:
+        va, vb = sum_a.get(key), sum_b.get(key)
+        if va is None and vb is None:
+            continue
+        sva = "-" if va is None else f"{va:.{prec}f}"
+        svb = "-" if vb is None else f"{vb:.{prec}f}"
+        print(f"  {label:26s} {sva:>12s} -> {svb:>12s}   "
+              f"{_fmt_delta(va, vb, 12, prec)}")
+    for label, key in (("deep stack CLIPPED", "clipped"),
+                       ("QUANTISER-LIMITED", "quantiser_limited")):
+        va, vb = bool(sum_a.get(key)), bool(sum_b.get(key))
+        if va or vb:
+            print(f"  {label:26s} {str(va):>12s} -> {str(vb):>12s}"
+                  + ("   <== CHANGED" if va != vb else ""))
+
+    # The headline: a defect-count swing with a processing change behind it is
+    # the whole reason this mode exists.
+    ha, hb = sum_a["hot_pixels"], sum_b["hot_pixels"]
+    if ha is not None and hb is not None and ha != hb and proc_diff:
+        print(f"\n  -> hot-pixel count moved {ha} -> {hb} across a processing "
+              f"change ({', '.join(sorted(proc_diff))}). The defect map is a "
+              "function of the processing path, not just the sensor: a map "
+              "built at one setting is wrong at the other.")
+    return result
+
+
+# ----------------------------------------------------------------------------
+# Lit transfer curve (--transfer)
+# ----------------------------------------------------------------------------
+
+def _stack_stats(cap, path, n, discard):
+    """Streaming per-pixel mean + temporal noise + distinct-code count over a
+    capture file. Same Welford accumulation the dark ladder uses, so transfer
+    points and dark points are measured identically."""
+    count = 0
+    mean_px = m2_px = None
+    code_seen = np.zeros(65536, dtype=bool)
+    for fr in cap.iter_luma(path, n, discard=discard):
+        count += 1
+        if mean_px is None:
+            mean_px = np.zeros_like(fr)
+            m2_px = np.zeros_like(fr)
+        delta = fr - mean_px
+        mean_px += delta / count
+        m2_px += delta * (fr - mean_px)
+        codes = np.rint(fr * 257.0).astype(np.int32)
+        np.clip(codes, 0, 65535, out=codes)
+        code_seen[codes.ravel()] = True
+        del fr, delta, codes
+    if count == 0:
+        return None
+    temporal = (float(np.sqrt(m2_px / (count - 1)).mean()) if count > 1
+                else float("nan"))
+    return {"count": count, "mean_px": mean_px, "temporal": temporal,
+            "distinct_codes": int(code_seen.sum())}
+
+
+def fit_transfer_curve(points, code_step=1.0):
+    """Classify the ISP transfer function from a panel-level sweep.
+
+    Two competing descriptions of what a gamma control does: it either SCALES
+    the output (a straight line through the pedestal, slope changes) or it
+    RESHAPES the tone curve (a power law, curvature changes). Fit both over the
+    unclipped region and let the residuals decide.
+
+    The exponent is the product of the display's transfer and the ISP's, since
+    the stimulus is an 8-bit grey on an uncalibrated screen. That confound
+    CANCELS when two sweeps taken on the same display are compared, which is
+    what --compare is for -- so the absolute exponent is indicative and the
+    difference between two settings is the measurement."""
+    usable = [p for p in points
+              if not p.get("clipped") and p["mean_adu"] < 250.0]
+    if len(usable) < 4:
+        return {"ok": False, "reason": "need >=4 unclipped sweep points"}
+    lv = np.array([p["level"] for p in usable], float)
+    my = np.array([p["mean_adu"] for p in usable], float)
+
+    def _r2(y, pred):
+        ss_res = float(np.sum((y - pred) ** 2))
+        ss_tot = float(np.sum((y - y.mean()) ** 2)) or 1e-12
+        return 1.0 - ss_res / ss_tot
+
+    A = np.vstack([lv, np.ones(len(lv))]).T
+    slope, intercept = np.linalg.lstsq(A, my, rcond=None)[0]
+    r2_lin = _r2(my, A @ np.array([slope, intercept]))
+
+    # pedestal: the output with the panel black, which is the offset the power
+    # law sits on top of
+    black = float(min(p["mean_adu"] for p in points
+                      if p["level"] == min(p["level"] for p in points)))
+    m = (lv > 0) & ((my - black) > 0)
+    fit_pow = {"ok": False, "reason": "not enough positive points above the "
+                                      "pedestal for a log-log fit"}
+    if m.sum() >= 4:
+        lx = np.log(lv[m])
+        ly = np.log(my[m] - black)
+        Ap = np.vstack([lx, np.ones(len(lx))]).T
+        expo, cpow = np.linalg.lstsq(Ap, ly, rcond=None)[0]
+        r2_pow = _r2(ly, Ap @ np.array([expo, cpow]))
+        fit_pow = {"ok": True, "exponent": float(expo),
+                   "log_intercept": float(cpow), "r2_loglog": float(r2_pow),
+                   "n_points": int(m.sum())}
+
+    out = {"ok": True,
+           "n_points_used": len(usable),
+           "pedestal_adu": black,
+           "linear_fit": {"slope_adu_per_level": float(slope),
+                          "intercept_adu": float(intercept),
+                          "r2": float(r2_lin)},
+           "power_fit": fit_pow,
+           "display_gamma_caveat": (
+               "the panel is an 8-bit grey on an uncalibrated display, so the "
+               "exponent below is (display transfer) x (ISP transfer). Compare "
+               "two sweeps taken on the SAME display with --compare to cancel "
+               "the display term; the difference is the ISP's contribution.")}
+
+    if fit_pow.get("ok"):
+        e = fit_pow["exponent"]
+        if abs(e - 1.0) < 0.08 and r2_lin > 0.985:
+            out["verdict"] = (
+                f"LINEAR within measurement: exponent {e:.3f}, straight-line "
+                f"r2 {r2_lin:.4f}. At this setting the path SCALES the signal; "
+                "it does not reshape the tone curve.")
+        elif fit_pow["r2_loglog"] > r2_lin:
+            out["verdict"] = (
+                f"POWER LAW: exponent {e:.3f} (log-log r2 "
+                f"{fit_pow['r2_loglog']:.4f} beats straight-line r2 "
+                f"{r2_lin:.4f}). The path RESHAPES the tone curve -- this is a "
+                "LUT, not a gain.")
+        else:
+            out["verdict"] = (
+                f"mixed: exponent {e:.3f} but the straight line fits at least "
+                f"as well (r2 {r2_lin:.4f} vs log-log "
+                f"{fit_pow['r2_loglog']:.4f}). Sweep more levels, especially "
+                "in the bottom quarter where a LUT bends hardest.")
+    return out
+
+
+def run_transfer(cap, device, levels, frames=8, settle_s=0.8, port=8088,
+                 discard=2, wait_client=120.0, verbose=True):
+    """Sweep the software flat panel and record mean output at each level.
+
+    This is the measurement that settles what a processing control actually
+    does. The PTC needs a controllable source and the flat panel already is
+    one, so stepping its level and reading the sensor gives the ISP transfer
+    function directly -- and it is the only way to put a measured curve next to
+    a firmware LUT and compare entry for entry.
+
+    The panel is served over HTTP; point any browser at the printed URL. Each
+    level waits for the browser to ACK that it is painted before capturing, so
+    a slow display cannot leave the previous level in the frame."""
+    import cam_panel
+
+    print("\n=== LIT TRANSFER CURVE ===")
+    print("Aim the camera at the panel display, slightly defocused, filling "
+          "the frame.")
+    print("Keep EXPOSURE and GAIN fixed; only the panel level moves.\n")
+
+    holder = {"level": int(levels[0])}
+    panel = cam_panel.PanelServer(lambda: holder["level"], None, port)
+    points = []
+    try:
+        for u in cam_panel.panel_urls(port):
+            print(f"   open the panel at: {u}")
+        print(f"   waiting up to {wait_client:.0f}s for a browser to connect...")
+        if not panel.wait_for_client(timeout=wait_client):
+            raise RuntimeError(
+                f"no browser connected to the panel on port {port}. Open one "
+                "of the URLs above on the display you want to use as the "
+                "source, then re-run.")
+        print("   panel client connected.\n")
+
+        for lv in levels:
+            lv = int(max(0, min(255, lv)))
+            holder["level"] = lv
+            acked = panel.wait_shown(lv, timeout=10.0)
+            time.sleep(settle_s)
+            path, total, full = cap.capture_run(
+                frames, discard=discard, timeout=30.0, verbose=False)
+            st = _stack_stats(cap, path, frames, discard)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            if st is None:
+                print(f"   level {lv:3d}: no frames -- skipped")
+                continue
+            mean_px = st["mean_px"]
+            mean_level = float(mean_px.mean())
+            floor_frac = float((mean_px <= 0.5).mean())
+            ceil_frac = float((mean_px >= 254.5).mean())
+            clipped = (floor_frac > 0.5 or ceil_frac > 0.5)
+            rec = {"level": lv,
+                   "mean_adu": mean_level,
+                   "temporal_noise_adu": st["temporal"],
+                   "distinct_codes": st["distinct_codes"],
+                   "frames": st["count"],
+                   "eff_fps": round(cap.last_fps, 2),
+                   "clipped": clipped,
+                   "clip_floor_frac": round(floor_frac, 4),
+                   "clip_ceil_frac": round(ceil_frac, 4),
+                   "panel_ack": bool(acked)}
+            points.append(rec)
+            if verbose:
+                flag = ""
+                if clipped:
+                    flag = ("  !! CLIPPED at "
+                            + ("floor" if floor_frac > ceil_frac else "ceiling"))
+                if not acked:
+                    flag += "  (no panel ACK -- level may not have been painted)"
+                print(f"   level={lv:3d}  mean={mean_level:7.3f} ADU  "
+                      f"noise={st['temporal']:6.3f}  "
+                      f"codes={st['distinct_codes']:3d}{flag}")
+    finally:
+        panel.stop()
+
+    fit = fit_transfer_curve(points)
+    return {"points": points, "fit": fit,
+            "panel_port": port, "frames_per_level": frames,
+            "settle_s": settle_s}
+
+
 def main():
     ap = argparse.ArgumentParser(description="UVC camera noise/codec characteriser")
     ap.add_argument("--device", default="/dev/video0")
@@ -1410,6 +2565,47 @@ def main():
                     help="enumerate + rank formats and pick measurement format")
     ap.add_argument("--ptc", action="store_true", help="run photon transfer curve")
     ap.add_argument("--dark", action="store_true", help="run dark characterisation")
+    ap.add_argument("--fps-probe", action="store_true",
+                    help="framerate-vs-exposure sweep only, in a low-bandwidth "
+                    "format (MJPEG by default). Timing is all this measures, "
+                    "so the lossy codec is harmless and its reduced payload "
+                    "lifts the bandwidth ceiling until the integration knee "
+                    "becomes visible. No pixel data is read.")
+    ap.add_argument("--timing-format", default=None,
+                    help="fourcc to use for the framerate probe (default: "
+                    "MJPG if the device offers it, else the most compressed "
+                    "format available). Never used for pixel measurements.")
+    ap.add_argument("--no-timing-probe", action="store_true",
+                    help="do NOT run the MJPEG timing probe before --dark; "
+                    "derive the knee and the real-vs-synthetic verdict from "
+                    "the uncompressed ladder's own fps instead (usually "
+                    "bandwidth-pinned and therefore indeterminate)")
+    ap.add_argument("--timing-frames", type=int, default=30,
+                    help="frames per exposure in the framerate probe "
+                    "(default 30; more = tighter fps estimate)")
+    ap.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"),
+                    default=None,
+                    help="diff two reports: per-ladder-point deltas in mean, "
+                    "temporal noise, fps and distinct codes, plus the "
+                    "deep-stack summary and the processing path behind it. "
+                    "Touches no hardware.")
+    ap.add_argument("--transfer", action="store_true",
+                    help="lit transfer curve: sweep the software flat panel's "
+                    "level and record mean output, giving the ISP transfer "
+                    "function. Serves the panel over HTTP -- open the printed "
+                    "URL on the display you are using as the source.")
+    ap.add_argument("--transfer-levels", default=None,
+                    help="comma-separated 8-bit panel levels to sweep "
+                    "(default: 17 points, denser at the bottom where a LUT "
+                    "bends hardest)")
+    ap.add_argument("--transfer-frames", type=int, default=8,
+                    help="frames captured at each panel level (default 8)")
+    ap.add_argument("--transfer-settle", type=float, default=0.8,
+                    help="extra settle seconds after the panel ACKs a level, "
+                    "for the camera's own pipeline (default 0.8)")
+    ap.add_argument("--panel-port", type=int, default=8088,
+                    help="port for the HTTP flat panel used by --transfer "
+                    "(default 8088)")
     ap.add_argument("--auto", action="store_true",
                     help="auto-exposure observation: leave AE on, cap the lens, "
                     "log AE-chosen exposure/gain and framerate over time")
@@ -1463,14 +2659,26 @@ def main():
     ap.add_argument("--discard", type=int, default=2,
                     help="frames to skip at the start of each exposure (settle). "
                     "Default 2.")
-    ap.add_argument("--knee", type=int, default=2048,
-                    help="exposure (raw units) above which real integration "
-                    "begins; points below only set the bias and are excluded "
-                    "from the dark-current slope fit. Default 2048.")
+    ap.add_argument("--knee", type=int, default=None,
+                    help="OVERRIDE the exposure (raw units) above which real "
+                    "integration begins; points below only set the bias and "
+                    "are excluded from the dark-current slope fit. Default is "
+                    "to DERIVE it from the ladder's own fps measurements (the "
+                    "knee is where fps first departs its pinned maximum). Only "
+                    "pass this to override a bad detection -- a knee carried "
+                    "over from a different firmware's exposure range excludes "
+                    "good points or admits pedestal-only ones.")
     ap.add_argument("--save-master", default=None,
                     help="write master dark as uint16 .npy (scaled 0-65535 for PHD2)")
     ap.add_argument("--save-defects", default=None,
                     help="write hot pixel coordinates in PHD2 defect map format (x y per line)")
+    ap.add_argument("--defect-classes", default="stuck,intermittent_hot,hot",
+                    help="which defect classes go into the PHD2 defect map. "
+                    "Default writes the pixels that need INTERPOLATION and "
+                    "omits dark_current, which a scaled dark subtraction "
+                    "already handles. Known classes: stuck, intermittent_hot, "
+                    "hot, dark_current. The full per-class breakdown is always "
+                    "written alongside as <file>.classes.json.")
     ap.add_argument("--save-dark-model", default=None,
                     help="write dark current model JSON for PHD2 auto-import at camera connect")
     ap.add_argument("--report", default=None, help="write json report here")
@@ -1478,6 +2686,13 @@ def main():
                     help="directory to auto-write a timestamped JSON report into "
                     "(filename encodes mode/resolution/timestamp)")
     args = ap.parse_args()
+
+    # --compare reads two files and touches no hardware, so it runs before any
+    # device probing (which would fail on a machine that has no camera attached
+    # -- exactly where you want to diff two reports).
+    if args.compare:
+        compare_reports(args.compare[0], args.compare[1])
+        return
 
     report = {"device": args.device,
               "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -1510,7 +2725,8 @@ def main():
             print(f"\nreport written to {args.report}")
         if args.report_dir:
             os.makedirs(args.report_dir, exist_ok=True)
-            mode = ("auto" if args.auto else "ptc" if args.ptc
+            mode = ("auto" if args.auto else "transfer" if args.transfer
+                    else "ptc" if args.ptc
                     else "dark" if args.dark else "list")
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             tag_part = f"{_dev_tag}_" if _dev_tag else ""
@@ -1581,9 +2797,45 @@ def main():
             "Re-run at an advertised native resolution.")
         print(f"\n!! {_nonnative_warn}")
 
-    if args.list and not (args.ptc or args.dark or args.auto):
+    if args.list and not (args.ptc or args.dark or args.auto or args.transfer
+                          or args.fps_probe):
         _write_report()
         return
+
+    def _timing_ladder(exp_ladder):
+        """Run the low-bandwidth framerate probe over `exp_ladder`, or explain
+        why it could not run. Returns (records_or_None, note)."""
+        if args.timing_format:
+            pick = {"fourcc": args.timing_format.strip(),
+                    "advertised_at_size": None}
+        else:
+            pick = pick_timing_format(ranked, _adv, args.width, args.height)
+        if not pick:
+            note = ("no compressed format available at "
+                    f"{args.width}x{args.height}: the framerate probe cannot "
+                    "lift the bandwidth ceiling here, so the exposure-fidelity "
+                    "verdict falls back to the uncompressed ladder and will "
+                    "likely be indeterminate. Try a smaller resolution.")
+            print(f"\n!! {note}")
+            return None, note
+        fcc = pick["fourcc"]
+        if pick.get("advertised_at_size") is False:
+            print(f"   note: {fcc} is not advertised at {args.width}x"
+                  f"{args.height}; attempting anyway")
+        try:
+            recs = run_fps_probe(args.device, args.width, args.height, fcc,
+                                 exp_ladder, frames=args.timing_frames,
+                                 discard=args.discard)
+        except Exception as e:
+            note = f"framerate probe failed ({fcc}): {e}"
+            print(f"\n!! {note}")
+            return None, note
+        if not any(r["eff_fps"] > 0 for r in recs):
+            note = (f"framerate probe in {fcc} returned no usable timestamps; "
+                    "falling back to the uncompressed ladder's fps")
+            print(f"\n!! {note}")
+            return None, note
+        return recs, f"framerate measured in {fcc} (timing only)"
 
     # --- auto-exposure observation mode (do NOT force manual) ---
     if args.auto:
@@ -1594,6 +2846,22 @@ def main():
                 calib = json.load(open(args.calib))
                 print(f"   loaded fps<->exposure calibration from {args.calib} "
                       f"(valid fps {calib.get('valid_fps_range')})")
+                # A calibration is only valid in the mode it was built in: the
+                # bandwidth ceiling moves with format and frame size, so
+                # inverting AE's fps through the wrong one yields a confident
+                # wrong exposure.
+                cf, cw, ch = (calib.get("fourcc"), calib.get("width"),
+                              calib.get("height"))
+                if cf and (cf.strip() != meas_fmt.strip()
+                           or cw != args.width or ch != args.height):
+                    print(f"   !! calibration was built for {cf} {cw}x{ch} but "
+                          f"this run is {meas_fmt} {args.width}x{args.height}. "
+                          "The fps<->exposure mapping is format- and size-"
+                          "specific; rebuild it in this mode or the implied "
+                          "exposures below are wrong.")
+                elif not cf:
+                    print("   note: calibration predates format stamping -- "
+                          "confirm it was built in this same mode")
             except Exception as e:
                 print(f"   could not load calibration {args.calib}: {e}")
         cap = Capture(args.device, args.width, args.height, meas_fmt)
@@ -1634,6 +2902,13 @@ def main():
     if _nonnative_warn:
         _manual_notes.insert(0, _nonnative_warn)
     report["manual_notes"] = _manual_notes
+    # Read the processing path BACK from the device rather than trusting what
+    # was asked for: a control that silently refused the write would otherwise
+    # be recorded as if it had taken. This is what --compare diffs.
+    report["processing_path"] = read_processing_path(args.device)
+    if report["processing_path"]:
+        print("   processing path: " + ", ".join(
+            f"{k}={v}" for k, v in sorted(report["processing_path"].items())))
 
     # --- PTC ---
     if args.ptc:
@@ -1653,12 +2928,106 @@ def main():
                   f"= {fit['read_noise_e']:.2f} e-")
             print(f"  full well (approx): {fit['full_well_e_approx']:.0f} e-")
 
+    # --- framerate probe (standalone) ---
+    if args.fps_probe:
+        _rng = get_ctrl_range(args.device, "exposure_time_absolute")
+        tl = build_timing_ladder(_rng.get("min", 1),
+                                 _rng.get("max", args.exposure_max))
+        recs, note = _timing_ladder(tl)
+        probe = {"note": note, "exposure_range": _rng, "points": recs or []}
+        if recs:
+            kn = derive_knee(recs)
+            probe["knee"] = kn
+            probe["exposure_fidelity"] = exposure_fidelity_verdict(
+                recs, kn["knee_units"] if kn else 0)
+            print("\n--- FRAMERATE PROBE RESULT ---")
+            if kn:
+                print(f"  integration knee : {kn['knee_units']} units "
+                      f"({kn['knee_units'] * 0.1:.1f}ms)")
+                print(f"    {kn['detail']}")
+            else:
+                print("  integration knee : not detectable -- fps never "
+                      "departed its pinned maximum even in a compressed "
+                      "format. Either exposure is synthetic, or the range "
+                      "tested never exceeds the frame period.")
+            print(f"  -> {probe['exposure_fidelity']['verdict']}")
+        report["fps_probe"] = probe
+        _write_report()
+        return
+
+    # --- lit transfer curve ---
+    if args.transfer:
+        if args.transfer_levels:
+            levels = [int(x) for x in
+                      args.transfer_levels.replace(" ", "").split(",") if x]
+        else:
+            # denser at the bottom: a tone-curve LUT bends hardest in the
+            # first quarter, and a uniform sweep walks straight past it
+            levels = [0, 4, 8, 12, 16, 24, 32, 48, 64, 80, 96, 112, 128,
+                      160, 192, 224, 255]
+        cap = Capture(args.device, args.width, args.height, meas_fmt)
+        cap.exposure = args.exposure
+        try:
+            tr = run_transfer(cap, args.device, levels,
+                              frames=args.transfer_frames,
+                              settle_s=args.transfer_settle,
+                              port=args.panel_port,
+                              discard=args.discard)
+        except RuntimeError as e:
+            print(f"\n!! transfer sweep aborted: {e}")
+            _write_report()
+            return
+        finally:
+            cap.close()
+        tr["exposure_units"] = args.exposure
+        tr["processing_path"] = report.get("processing_path")
+        report["transfer"] = tr
+        fit = tr["fit"]
+        print("\n--- TRANSFER CURVE RESULT ---")
+        if fit.get("ok"):
+            lf = fit["linear_fit"]
+            print(f"  pedestal (panel black)     : {fit['pedestal_adu']:.3f} ADU")
+            print(f"  straight line              : "
+                  f"{lf['slope_adu_per_level']:.4f} ADU/level, "
+                  f"intercept {lf['intercept_adu']:.3f}, r2 {lf['r2']:.4f}")
+            pf = fit["power_fit"]
+            if pf.get("ok"):
+                print(f"  power law                  : exponent "
+                      f"{pf['exponent']:.3f}, log-log r2 {pf['r2_loglog']:.4f}")
+            print(f"  -> {fit['verdict']}")
+            print(f"\n  NOTE: {fit['display_gamma_caveat']}")
+        else:
+            print(f"  no fit: {fit.get('reason')}")
+        _write_report()
+        return
+
     # --- dark ---
     if args.dark:
-        cap = Capture(args.device, args.width, args.height, meas_fmt)
         ladder = None
         if args.ladder:
             ladder = [int(x) for x in args.ladder.replace(" ", "").split(",") if x]
+
+        # Framerate probe FIRST, in a low-bandwidth format. It is the only way
+        # to see the integration knee at a useful resolution, and it must run
+        # before the uncompressed capture so the knee is available to filter
+        # the dark-current fit. Timing only -- nothing it captures is read.
+        timing = None
+        if not args.no_timing_probe:
+            _rng = get_ctrl_range(args.device, "exposure_time_absolute")
+            tl = build_timing_ladder(_rng.get("min", 1),
+                                     _rng.get("max", args.exposure_max))
+            timing, _tnote = _timing_ladder(tl)
+            report["timing_probe_note"] = _tnote
+            # the probe leaves the device in a compressed format and at the
+            # last swept exposure; put the processing path back before the
+            # real capture starts
+            prepare_manual(args.device, exposure=args.exposure,
+                           gain=args.gain, gamma=args.gamma,
+                           brightness=args.brightness, contrast=args.contrast,
+                           sharpness=args.sharpness,
+                           saturation=args.saturation, verbose=False)
+
+        cap = Capture(args.device, args.width, args.height, meas_fmt)
         try:
             dark, master = run_dark(cap, args.device,
                                     dark_frames=args.dark_frames,
@@ -1668,7 +3037,8 @@ def main():
                                     discard=args.discard,
                                     knee=args.knee,
                                     ladder_frames=args.ladder_frames,
-                                    ladder_points=args.ladder_points)
+                                    ladder_points=args.ladder_points,
+                                    timing_ladder=timing)
         finally:
             cap.close()
         report["dark"] = dark
@@ -1676,11 +3046,29 @@ def main():
         # and dark-current fit are all meaningless, and writing them anyway
         # means PHD2 silently auto-loads garbage at every camera connect.
         deep_clipped = bool(dark.get("deep_stack_clipped"))
-        if deep_clipped and (args.save_master or args.save_defects
-                             or args.save_dark_model):
+        deep_quantised = bool(dark.get("deep_stack_quantiser_limited"))
+        # Either failure mode invalidates the same three exports. Writing them
+        # anyway means PHD2 silently auto-loads garbage at every camera
+        # connect -- and a 12-pixel defect map where the truth is 1057 is worse
+        # than no defect map at all, because it looks like it worked.
+        refuse_export = deep_clipped or deep_quantised
+        _want_export = (args.save_master or args.save_defects
+                        or args.save_dark_model)
+        if deep_clipped and _want_export:
             print("   !! deep stack CLIPPED -- refusing to write master/defects/"
                   "dark-model (fix the processing path: reduce brightness/"
                   "contrast/gamma, then rerun)")
+        if deep_quantised and _want_export:
+            qc = dark.get("quantiser_check") or {}
+            print("   !! deep stack QUANTISER-LIMITED -- refusing to write "
+                  "master/defects/dark-model:")
+            for r in qc.get("reasons", []):
+                print(f"        - {r}")
+            print("      The output is collapsed onto too few codes for the "
+                  "sensor's noise to reach the LSB, so the defect map and FPN "
+                  "describe the processing path, not the sensor. Reduce "
+                  "gamma/contrast (or raise gain) until the deep stack shows "
+                  "temporal dither, then rerun.")
         # Non-native resolution: still write if asked (the user may want it for a
         # matching guide resolution), but stamp the artefact warning so the files
         # are never mistaken for a true sensor defect map.
@@ -1689,15 +3077,33 @@ def main():
             print(f"   !! writing calibration from a NON-NATIVE mode -- "
                   f"{args.width}x{args.height} is bridge-scaled; these are "
                   "rescaling artefacts, not the sensor's true defects/FPN")
-        if args.save_master and master is not None and not deep_clipped:
+        if args.save_master and master is not None and not refuse_export:
             # Scale float64 luma (0-255) to uint16 (0-65535) for direct PHD2 import.
             # 257 * 255 = 65535 exactly; np.round preserves sub-ADU precision.
             master_u16 = np.clip(np.round(master * 257.0), 0, 65535).astype(np.uint16)
             _ensure_dir(args.save_master)
             np.save(args.save_master, master_u16)
             print(f"   master dark (uint16) written to {args.save_master}")
-        if args.save_defects and master is not None and not deep_clipped:
-            coords = dark.get("hot_pixel_coords") or []
+        if args.save_defects and master is not None and not refuse_export:
+            dcls = dark.get("defect_classes") or {}
+            want = [c.strip() for c in args.defect_classes.split(",") if c.strip()]
+            coords = []
+            per_class = {}
+            if dcls.get("ok"):
+                for c in want:
+                    got = dcls["coords"].get(c)
+                    if got is None:
+                        print(f"   !! unknown defect class '{c}' -- known: "
+                              + ", ".join(sorted(dcls["coords"])))
+                        continue
+                    per_class[c] = got
+                    coords.extend(got)
+                coords = sorted({tuple(p) for p in coords})
+                coords = [list(p) for p in coords]
+            else:
+                # classification unavailable (single-frame stack, or refused):
+                # fall back to the flat 6-sigma list rather than writing nothing
+                coords = dark.get("hot_pixel_coords") or []
             _ensure_dir(args.save_defects)
             with open(args.save_defects, "w") as fh:
                 fh.write("# PHD2 Defect Map v1\n")
@@ -1710,12 +3116,38 @@ def main():
                 if _nonnative_warn:
                     fh.write("# WARNING: non-native (bridge-scaled) mode -- "
                              "these defects are rescaling artefacts\n")
+                if dcls.get("ok"):
+                    fh.write(f"# Classes included: {','.join(want)}\n")
+                    for c in sorted(dcls["counts"]):
+                        if c == "total":
+                            continue
+                        mark = "*" if c in per_class else " "
+                        fh.write(f"#  {mark} {c}: {dcls['counts'][c]}\n")
+                    fh.write("#  (* = written to this map; unmarked classes "
+                             "are handled by dark subtraction)\n")
+                else:
+                    fh.write("# Classes: unavailable -- flat 6-sigma list\n")
                 fh.write(f"# Defect count: {len(coords)}\n")
                 for y, x in coords:  # PHD2 format is x y (screen coords)
                     fh.write(f"{x} {y}\n")
             print(f"   defect map written to {args.save_defects} "
-                  f"({len(coords)} hot pixels)")
-        if args.save_dark_model and master is not None and not deep_clipped:
+                  f"({len(coords)} pixels"
+                  + (f", classes: {','.join(want)}" if dcls.get("ok") else "")
+                  + ")")
+            # full per-class detail alongside, for anything that wants to treat
+            # the classes differently (the map itself must stay x-y only, since
+            # PHD2 parses it)
+            if dcls.get("ok"):
+                side = args.save_defects + ".classes.json"
+                with open(side, "w") as fh:
+                    json.dump({"counts": dcls["counts"],
+                               "thresholds": dcls["thresholds"],
+                               "remedy": dcls["remedy"],
+                               "dark_current_stats": dcls["dark_current_stats"],
+                               "written_to_map": want,
+                               "coords": dcls["coords"]}, fh, indent=2)
+                print(f"   defect classes written to {side}")
+        if args.save_dark_model and master is not None and not refuse_export:
             dcf = dark.get("dark_current_fit") or {}
             model = {
                 "exposure_max_units": args.exposure_max,
@@ -1732,7 +3164,8 @@ def main():
                 json.dump(model, fh, indent=2)
             print(f"   dark current model written to {args.save_dark_model}")
         if args.save_calib:
-            calib = build_fps_calibration(dark.get("ladder", []))
+            calib = build_fps_calibration(dark.get("ladder", []), meas_fmt,
+                                          args.width, args.height)
             if calib:
                 _ensure_dir(args.save_calib)
                 with open(args.save_calib, "w") as fh:
@@ -1746,27 +3179,87 @@ def main():
                       "fps-falling range, e.g. up to the switch at ~4096)")
 
         print("\n--- DARK RESULT (at max exposure) ---")
+        if refuse_export:
+            why = "CLIPPED" if deep_clipped else "QUANTISER-LIMITED"
+            print(f"  *** deep stack {why}: every number below describes the "
+                  "processing path, not the sensor ***")
+        qc = dark.get("quantiser_check") or {}
+        print(f"  distinct output codes (stack/master): "
+              f"{qc.get('distinct_codes_stack')}/"
+              f"{qc.get('distinct_codes_master')}")
         print(f"  fixed-pattern (subtractable) FPN : "
               f"{dark['master_dark_fpn_adu']:.3f} ADU")
-        print(f"  hot pixels (>6sigma)             : {dark['hot_pixels_6sigma']}")
-        print(f"  IRREDUCIBLE temporal dark noise  : "
-              f"{dark['irreducible_temporal_dark_noise_adu']:.3f} ADU")
+        print(f"  hot pixels (>6sigma)             : {dark['hot_pixels_6sigma']}"
+              + ("  <-- collapsed output: NOT the sensor's defect count"
+                 if deep_quantised else ""))
+        _dc = dark.get("defect_classes") or {}
+        if _dc.get("ok"):
+            _c = _dc["counts"]
+            print(f"  defects by failure mode          : {_c['total']} total")
+            print(f"    stuck (no response)            : {_c['stuck']:6d}   "
+                  "-> interpolate")
+            print(f"    intermittent hot               : "
+                  f"{_c['intermittent_hot']:6d}   -> interpolate "
+                  "(subtraction cannot fix it)")
+            print(f"    hot (stable, elevated)         : {_c['hot']:6d}   "
+                  "-> dark subtraction handles it")
+            print(f"    dark current (exposure-scaled) : "
+                  f"{_c['dark_current']:6d}   -> scaled dark subtraction")
+            _ds = _dc.get("dark_current_stats") or {}
+            if "median_rate_adu_per_unit" in _ds:
+                print(f"    per-pixel dark current: median "
+                      f"{_ds['median_rate_adu_per_unit']:.3g}, p99.9 "
+                      f"{_ds['p99_9_rate_adu_per_unit']:.3g}, max "
+                      f"{_ds['max_rate_adu_per_unit']:.3g} ADU/unit "
+                      f"(vs bias at exp "
+                      f"{dark.get('bias_reference_exposure_units')})")
+        elif _dc:
+            print(f"  defects by failure mode          : not classified -- "
+                  f"{_dc.get('reason')}")
+        # 0.000 ADU is not a quiet sensor, it is an unmeasurable one. Say so.
+        nb = dark.get("irreducible_temporal_dark_noise_bound")
+        if nb:
+            print(f"  IRREDUCIBLE temporal dark noise  : {nb['statement']}"
+                  f"  (measured {dark['irreducible_temporal_dark_noise_adu']:.3f}, "
+                  "which is the quantiser's floor, not the sensor's)")
+        else:
+            print(f"  IRREDUCIBLE temporal dark noise  : "
+                  f"{dark['irreducible_temporal_dark_noise_adu']:.3f} ADU")
+        kn = dark.get("knee") or {}
+        print(f"  integration knee                 : {kn.get('knee_units')} units "
+              f"({kn.get('source')})")
         dcf = dark["dark_current_fit"]
         if dcf:
-            print(f"  dark current                     : "
-                  f"{dcf['dark_current_adu_per_unit']:.5f} ADU/unit "
-                  f"(linear: {dcf['linear']}, r2={dcf['r2']:.3f})")
+            if dcf.get("flat_within_detection_limit"):
+                print(f"  dark current                     : NOT DETECTED -- "
+                      f"{dcf['detection_limit']['statement']}")
+                print(f"                                     (r2={dcf['r2']:.3f} "
+                      "is meaningless on a flat ladder; use the bound above for "
+                      "PHD2 dark scaling)")
+            else:
+                print(f"  dark current                     : "
+                      f"{dcf['dark_current_adu_per_unit']:.5f} ADU/unit "
+                      f"(linear: {dcf['linear']}, r2={dcf['r2']:.3f})")
+                if dcf.get("detection_limit"):
+                    print(f"    detection limit                : "
+                          f"{dcf['detection_limit']['min_detectable_slope_adu_per_unit']:.3g}"
+                          " ADU/unit")
 
         # combined floor at the operating point, if we also have gain
         if report.get("ptc", {}).get("fit", {}).get("ok"):
             g = report["ptc"]["fit"]["gain_e_per_adu"]
             rn_e = report["ptc"]["fit"]["read_noise_e"]
-            dn_e = dark["irreducible_temporal_dark_noise_adu"] * g
+            # a quantiser-limited dark term is an upper bound, so the combined
+            # floor built from it is an upper bound too -- never a measurement
+            dn_adu = (nb["upper_bound_adu"] if nb
+                      else dark["irreducible_temporal_dark_noise_adu"])
+            dn_e = dn_adu * g
             floor = float(np.sqrt(rn_e**2 + dn_e**2))
             report["operating_point_floor_e"] = floor
+            report["operating_point_floor_is_upper_bound"] = bool(nb)
             print(f"\n  COMBINED single-frame floor @ max exposure : "
-                  f"{floor:.2f} e-  (read {rn_e:.2f} + dark-shot {dn_e:.2f} in "
-                  "quadrature)")
+                  f"{'< ' if nb else ''}{floor:.2f} e-  (read {rn_e:.2f} + "
+                  f"dark-shot {'<' if nb else ''}{dn_e:.2f} in quadrature)")
 
     _write_report()
 
